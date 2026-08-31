@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>HL2 Wideband — Panadapter &amp; Waterfall</title>
+    <link rel="stylesheet" href="/app-569a6eed22c88284.css" integrity="sha384-dR+wK8Lz+AGmM1snvX8TT+IG7SLAx9UDxSX9yWuEqb7WECKSaAJBhODm5Jowk7qw"/>
+    
+<script type="module">
+import init, * as bindings from '/hl2-ui-86dcd00b93837672.js';
+const wasm = await init({ module_or_path: '/hl2-ui-86dcd00b93837672_bg.wasm' });
+
+
+window.wasmBindings = bindings;
+
+
+dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
+
+</script>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB" crossorigin="anonymous">
+<link rel="modulepreload" href="/hl2-ui-86dcd00b93837672.js" crossorigin="anonymous" integrity="sha384-6AbIpYBvLbMpp8pU+7k8oq8ytcqXxEwnXQ1qHAXzB3jq17yCMLTMHNvqpgdJRMYx"><link rel="preload" href="/hl2-ui-86dcd00b93837672_bg.wasm" crossorigin="anonymous" integrity="sha384-KWkPr5K+bFh/b2zGSLouhNviH2deT0f8I2SmuJMZOlljJgmD9qscuWfkevgB3mfr" as="fetch" type="application/wasm"></head>
+<body>
+    <div id="app">Loading…</div>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js" integrity="sha384-FKyoEForCGlyvwx9Hj09JcYn3nv7wiPVlz7YYwJrWVcXK/BmnVDxM+D2scQbITxI" crossorigin="anonymous"></script>
+</body>
+</html>

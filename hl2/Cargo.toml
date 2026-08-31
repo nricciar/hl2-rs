@@ -1,0 +1,21 @@
+[package]
+name = "hl2"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { version = "0.7", features = ["net", "codec"] }
+num-complex = "0.4"
+rustfft = "6"
+mfsk-core = "0.9.1"
+[dependencies.cpal]
+version = "0.15"
+optional = true
+
+[features]
+js8_trace = []
+default = []
+# ALSA sink via `cpal`.
+alsa = ["dep:cpal"]
+integration-tests = []

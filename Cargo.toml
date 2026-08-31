@@ -1,0 +1,36 @@
+[workspace]
+members = [
+    "hl2",
+    "common",
+    "api",
+    "ui",
+    "pskrep"
+]
+# The Teensy firmware is a standalone `no_std` crate that compiles for
+# `thumbv7em-none-eabihf`, so it stays out of the x86 workspace.
+exclude = ["teensy"]
+resolver = "2"
+
+[workspace.dependencies.pskrep]
+path = "pskrep"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+serde_json = "1"
+# Single-producer / single-consumer ring buffer (the EP6 baseband fan-out).
+[workspace.dependencies.hl2]
+path = "hl2"
+
+[workspace.dependencies.hl2-common]
+path = "common"
+
+[workspace.dependencies.serde]
+version = "1"
+features = ["derive"]
+
+[workspace.dependencies.tokio]
+version = "1"
+features = ["full"]

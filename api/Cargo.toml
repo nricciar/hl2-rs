@@ -1,0 +1,22 @@
+[package]
+name = "hl2-api"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "hl2-api"
+path = "src/main.rs"
+
+[dependencies]
+num-complex = "0.4"
+hl2 = { workspace = true }
+hl2-common = { workspace = true }
+pskrep = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rocket = { version = "0.5", features = ["json"] }
+rocket_ws = "0.1"
+rustfft = "6"
+tracing = "0.1"
+tracing-subscriber = "0.3"

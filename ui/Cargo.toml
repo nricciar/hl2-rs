@@ -1,0 +1,49 @@
+[package]
+name = "hl2-ui"
+version.workspace = true
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+yew = { version = "0.23", features = ["csr"] }
+web-sys = { version = "0.3", features = [
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "HtmlInputElement",
+    "HtmlSelectElement",
+    "CanvasRenderingContext2d",
+    "Window",
+    "Location",
+    "WebSocket",
+    "BinaryType",
+    "MessageEvent",
+    "ImageData",
+    "Event",
+    "EventTarget",
+    "AudioContext",
+    "AudioNode",
+    "AudioDestinationNode",
+    "AudioBuffer",
+    "AudioBufferSourceNode",
+    "AudioListener",
+    "AudioParam",
+    "GainNode",
+    "Performance",
+] }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+hl2-common = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[profile.release]
+opt-level = "s"
+lto = true
