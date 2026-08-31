@@ -706,8 +706,9 @@ pub async fn discover_single(hl2_addr: IpAddr) -> Option<(SocketAddr, DiscoveryI
     None
 }
 
-/// The receive + keep-alive loop. Runs until the receiver drops (client
-/// disconnect) or the socket errors.
+/// The receive + keep-alive loop. Runs until the event channel closes (the
+/// consumer dropped the receiver, e.g. `hl2-api` aborted the spectrum task on
+/// Stop), or the socket errors.
 ///
 /// For every decoded EP6 baseband chunk the pump de-interleaves the payload
 /// against the **current active-slot set** (from the [`BasebandFanout`]) and
@@ -733,6 +734,16 @@ async fn run_loop(hl2: Hl2, tx: mpsc::UnboundedSender<Hl2Event>) {
     loop {
         tokio::select! {
             biased;
+
+            // Exit as soon as the event receiver is dropped — the `tx.send(..)`
+            // `is_err()` checks below cover the *next* branch that fires, but a
+            // `select!` without this arm never woken by a closed channel keeps
+            // the loop (and its keep-alive ticks) alive for the life of the
+            // runtime. Without this, the pump outlives the spectrum pipeline
+            // that Stop/Start aborts, and a stale keep-alive with the old
+            // session's `oc_bits` races the new pump's keep-alives (filter
+            // relays chattering).
+            _ = tx.closed() => break,
 
             _ = keepalive.tick() => {
                 let seq = hl2.inner.next_send_seq().await;
