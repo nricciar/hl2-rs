@@ -7,6 +7,11 @@ edition.workspace = true
 name = "hl2-api"
 path = "src/main.rs"
 
+[features]
+# Embed the pre-built UI (ui/dist) into the binary and serve it over HTTP.
+# Requires `trunk build --release` to have been run first (ui/dist must exist).
+embed-ui = ["dep:rust-embed"]
+
 [dependencies]
 num-complex = "0.4"
 hl2 = { workspace = true }
@@ -17,6 +22,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 rocket = { version = "0.5", features = ["json"] }
 rocket_ws = "0.1"
+rust-embed = { version = "8", optional = true }
 rustfft = "6"
 tracing = "0.1"
 tracing-subscriber = "0.3"

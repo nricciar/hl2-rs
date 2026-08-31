@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+# One in-flight release build per tag; keep the latest.
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  # Target triple for the distributed Linux binary.
+  TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain + wasm target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+
+      # Trunk must build the UI to ui/dist *before* hl2-api is compiled,
+      # because rust-embed inlines those files at hl2-api compile time.
+      - name: Install Trunk
+        run: cargo install trunk --locked
+
+      - name: Build UI (Trunk)
+        working-directory: ui
+        run: trunk build --release
+
+      - name: Build hl2-api (with embedded UI)
+        run: cargo build --release --target $TARGET -p hl2-api --features embed-ui
+
+      - name: Assemble release tarball
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          arch="x86_64-unknown-linux-gnu"
+          staging="dist/hl2-api-${version}-${arch}"
+          # Cargo may place the host-triple binary under target/release/ or
+          # target/<triple>/release/ depending on its internal decision; use
+          # whichever exists.
+          bin="target/${TARGET}/release/hl2-api"
+          [ -f "$bin" ] || bin="target/release/hl2-api"
+          echo "Using binary: $bin"
+          rm -rf dist
+          mkdir -p "$staging"
+          cp "$bin" "$staging/hl2-api"
+          cp README.md "$staging/"
+          printf 'hl2-api %s\n\nA single self-contained binary: SDR control server + embedded web UI.\nRun it and open http://localhost:8000/\n' "$version" > "$staging/README.txt"
+          tar czf "hl2-api-${version}-${arch}.tar.gz" -C dist "$(basename "$staging")"
+          ls -lh "hl2-api-${version}-${arch}.tar.gz"
+          tar tzf "hl2-api-${version}-${arch}.tar.gz"
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            hl2-api-*.tar.gz
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

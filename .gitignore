@@ -1,1 +1,3 @@
 /target
+# Trunk build output for the WASM UI (built by CI before hl2-api embeds it).
+/ui/dist

@@ -8,6 +8,9 @@ mod pskrep_hook;
 mod spectrum;
 mod ws;
 
+#[cfg(feature = "embed-ui")]
+mod web;
+
 #[macro_use]
 extern crate rocket;
 
@@ -43,7 +46,10 @@ fn rocket() -> _ {
 
     let hub = hub::RadioHub::new(hub::HubConfig::default(), hint, pskrep);
 
-    rocket::build()
-        .manage(std::sync::Arc::new(hub))
-        .mount("/", routes![ws::ws_route])
+    let rocket = rocket::build().manage(std::sync::Arc::new(hub));
+
+    #[cfg(feature = "embed-ui")]
+    let rocket = rocket.mount("/", routes![web::index_page, web::asset]);
+
+    rocket.mount("/", routes![ws::ws_route])
 }

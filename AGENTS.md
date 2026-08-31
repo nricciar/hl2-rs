@@ -55,7 +55,24 @@ cargo test -p hl2 --features integration-tests
 
 # build + serve the WASM UI
 cd ui && trunk build --release    # (or: cargo build for a quick check)
+
+# build a SELF-CONTAINED hl2-api binary that serves the UI from the same port.
+# Trunk must build ui/dist FIRST (rust-embed inlines it at compile time);
+# the `embed-ui` feature adds the `GET /` + `GET /<path>` routes in
+# api/src/web.rs. Default builds are unchanged (WS-only).
+cd ui && trunk build --release
+cargo build --release -p hl2-api --features embed-ui
+# then: ./target/release/hl2-api  →  open http://localhost:8000/
 ```
+
+## Releases
+
+- A `v*` tag (e.g. `v0.1.0`) triggers `.github/workflows/release.yml`,
+  which builds the UI with Trunk, compiles `hl2-api` with `--features
+  embed-ui`, and publishes a
+  `hl2-api-<ver>-x86_64-unknown-linux-gnu.tar.gz` to the GitHub Release.
+- `embed-ui` is **opt-in**; the ordinary `hl2-api` build stays WS-only so
+  dev builds never require Trunk or a pre-existing `ui/dist`.
 
 ## Key environment variables
 
@@ -86,5 +103,5 @@ cd ui && trunk build --release    # (or: cargo build for a quick check)
 - Do not add protocol logic to `hl2-api/` or `hl2-ui/` — keep it in `hl2/`.
 - Do not add `std`-only types to `hl2-common/`.
 - Do not change wire byte layouts without updating PROTOCOL.md and the tests.
-- `.gitignore` covers `/target`; keep `ui/dist/` (build artifacts) out of
-  commits. `Cargo.lock` **is** committed — keep it committed.
+- `.gitignore` covers `/target` and `/ui/dist` (build artifacts); keep them
+  out of commits. `Cargo.lock` **is** committed — keep it committed.
