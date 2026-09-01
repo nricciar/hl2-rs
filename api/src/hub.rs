@@ -218,6 +218,18 @@ impl std::fmt::Debug for AutoTask {
 }
 
 impl AutoTask {
+    /// Stop the pipeline: signal the shared stop flag, then join the decode
+    /// thread (long-lived, ~1-3 s at worst if mid-burst) and the demod
+    /// thread (short — bounded by one `rx.process` + one 500 µs sleep
+    /// iteration, plus the final `rx.flush`).
+    ///
+    /// **Callers must not be holding the `tokio::sync::Mutex` session lock
+    /// while this joins.** The decode-thread join can block for up to one
+    /// burst (~1-3 s) plus the next tick cycle. The two-phase pattern in
+    /// each `*_cmd` (extract-under-lock → stop-outside-lock) exists to keep
+    /// this off the hot path. `Drop` is a backstop for the unexpected
+    /// (e.g. `Session` being dropped without an explicit stop) and accepts
+    /// the risk of joining there.
     fn stop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         self.decode.stop();
@@ -258,14 +270,26 @@ impl std::fmt::Debug for VrxTask {
 }
 
 impl VrxTask {
+    /// Stop the pipeline: signal the shared stop flag, then stop the
+    /// mode-decoder threads (long-lived — up to ~1-3 s at worst if one of
+    /// them is mid-burst at the moment of teardown), then abort the audio
+    /// fan-out tokio task, then finally join the demod std thread (short —
+    /// bounded by one `rx.process` + one 500 µs sleep iteration, plus the
+    /// final `rx.flush`).
+    ///
+    /// The ordering is deliberate: stop the decoders **before** the demod so
+    /// the decoder isn't mid-window when the input stops arriving (matches
+    /// [`AutoTask::stop`]), and stop the demod **last** so that if the decode
+    /// thread is sleeping between ticks it still exits promptly instead of
+    /// outliving the demod by up to a tick.
+    ///
+    /// **Callers must not be holding the `tokio::sync::Mutex` session lock
+    /// while this runs.** The decode-thread join can block for up to one
+    /// burst (~1-3 s) at a time per mode. The two-phase pattern in each
+    /// `*_cmd` (extract-under-lock → stop-outside-lock) keeps this off the
+    /// hot path. `Drop` is a backstop for the unexpected.
     fn stop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(t) = self.demod.take() {
-            let _ = t.join();
-        }
-        if let Some(t) = self.fanout.take() {
-            t.abort();
-        }
         if let Some(mut t) = self.ft8.take() {
             t.stop();
         }
@@ -274,6 +298,12 @@ impl VrxTask {
         }
         if let Some(mut t) = self.ft4.take() {
             t.stop();
+        }
+        if let Some(t) = self.fanout.take() {
+            t.abort();
+        }
+        if let Some(t) = self.demod.take() {
+            let _ = t.join();
         }
     }
 }
@@ -637,32 +667,65 @@ impl RadioHub {
             if let Err(e) = ctrl.stop().await {
                 eprintln!("stop failed: {e}");
             }
-            // Mark stopped, clear the session, abort the spectrum task, and
-            // tear down the virtual-receiver pipelines
+            // Phase 1 — under the session lock, mark stopped + extract the
+            // vrx/auto pipelines out of the maps. Holding the lock while we
+            // do this is the same as before, but we do NOT call `.stop()`
+            // (which joins std threads — a decode thread mid-burst can be
+            // 1-3 s) on this phase.
+            //
+            // Phase 2 — outside the lock, call `.stop()` on each extracted
+            // pipeline. Between phases the session lock is released, so
+            // other commands (tune, mute, start, another vrx stop) can make
+            // progress while we join threads. `snapshot()` re-acquires it
+            // once we're done.
+            //
+            // The extracted pipelines are dropped at the end of the
+            // `if let Some(ctrl)` scope; the `Drop` impls for VrxTask /
+            // AutoTask are a backstop (idempotent — they `take()` the
+            // handles so a double-stop is harmless).
+            let mut vrx_drained: Vec<VrxTask> = Vec::new();
+            let mut auto_drained: Vec<Vec<AutoTask>> = Vec::new();
             {
                 let mut guard = self.session.lock().await;
                 if let Some(s) = guard.as_mut() {
                     s.started = false;
-                    let torn = s.vrx.len();
-                    while let Some((_, mut vrx)) = s.vrx.pop_first() {
-                        vrx.stop();
-                    }
-                    if torn > 0 && std::env::var("HL2_DEBUG").is_ok() {
-                        eprintln!("[HUB] {torn} vrx pipeline(s) torn down (Stop)");
-                    }
-                    let auto_torn = s.auto.values().map(|v| v.len()).sum::<usize>();
-                    while let Some((_, mut v)) = s.auto.pop_first() {
-                        for t in v.iter_mut() {
-                            t.stop();
-                        }
-                    }
-                    if auto_torn > 0 && std::env::var("HL2_DEBUG").is_ok() {
-                        eprintln!("[HUB] {auto_torn} auto pipeline(s) torn down (Stop)");
-                    }
+                    vrx_drained = std::mem::take(&mut s.vrx).into_values().collect();
+                    auto_drained = std::mem::take(&mut s.auto).into_values().collect();
                 }
             }
+            let vrx_torn = vrx_drained.len();
+            let auto_torn = auto_drained.iter().map(|v| v.len()).sum::<usize>();
+
+            // Abort the spectrum task BEFORE phase 2 — it's the pump's
+            // consumer; once the pump notices the channel is closed it
+            // exits (see `hl2::Hl2::run_loop`), which stops the write-side
+            // of every slot's `BasebandRing`. Demod threads see that as a
+            // silent ring (0 peeks) and exit on the stop flag's next 500 µs
+            // check. (Ordering doesn't matter here — the stop flags below
+            // are independent of the pump — but aborting first lets the
+            // ring's write side close out before we join the demods.)
             if let Some(t) = self.task.lock().unwrap().take() {
                 t.abort();
+            }
+
+            // Phase 2 — outside the session lock. Stop each vrx pipeline
+            // (each stops its decode threads + demod thread) and then each
+            // auto pipeline. Order is vrx-first then auto — purely cosmetic,
+            // each pipeline is independent.
+            for v in vrx_drained.iter_mut() {
+                v.stop();
+            }
+            for vec in auto_drained.iter_mut() {
+                for t in vec.iter_mut() {
+                    t.stop();
+                }
+            }
+
+            if vrx_torn > 0 && std::env::var("HL2_DEBUG").is_ok() {
+                eprintln!("[HUB] {vrx_torn} vrx pipeline(s) torn down (Stop)");
+            }
+            if auto_torn > 0 && std::env::var("HL2_DEBUG").is_ok() {
+                eprintln!("[HUB] {auto_torn} auto pipeline(s) torn down (Stop)");
             }
         }
         let (state, _) = self.snapshot().await;
@@ -685,6 +748,18 @@ impl RadioHub {
         match ctrl {
             Some(c) => match c.tune(slot, freq_hz).await {
                 Ok(()) => {
+                    // Phase 1 — under the session lock, update the tuning map
+                    // and (if auto-decode is on for this slot) extract the
+                    // auto pipelines out of the map. Holding the lock here is
+                    // fine — we don't do any thread joins inside.
+                    //
+                    // Phase 2 — outside the lock, stop (join threads) the
+                    // extracted pipelines. Without this split a Tune on a
+                    // slot with auto-decode on would hold the session lock
+                    // for the duration of up to 3 * ~1-3 s decode-thread
+                    // joins (one per mode, one per in-window frequency),
+                    // blocking every other command.
+                    let mut auto_drained: Vec<AutoTask> = Vec::new();
                     {
                         let mut guard = self.session.lock().await;
                         if let Some(s) = guard.as_mut() {
@@ -695,18 +770,17 @@ impl RadioHub {
                             // against. Tear the slot's auto pipelines down;
                             // the UI re-enables (its checkbox mirrors
                             // `auto_monitors`, which now lacks the slot).
-                            if let Some(mut v) = s.auto.remove(&slot) {
-                                let torn = v.len();
-                                for t in v.iter_mut() {
-                                    t.stop();
-                                }
-                                if std::env::var("HL2_DEBUG").is_ok() {
-                                    eprintln!(
-                                        "[HUB] {torn} auto pipeline(s) torn down (Tune slot={slot})"
-                                    );
-                                }
+                            if let Some(v) = s.auto.remove(&slot) {
+                                auto_drained = v;
                             }
                         }
+                    }
+                    let torn = auto_drained.len();
+                    for t in auto_drained.iter_mut() {
+                        t.stop();
+                    }
+                    if torn > 0 && std::env::var("HL2_DEBUG").is_ok() {
+                        eprintln!("[HUB] {torn} auto pipeline(s) torn down (Tune slot={slot})");
                     }
                     let (state, _) = self.snapshot().await;
                     ServerResponse::ok(id, &state)
@@ -798,15 +872,19 @@ impl RadioHub {
         match cfg.as_ref() {
             // Global off: tear down every slot's pipeline.
             None => {
-                let mut torn = 0usize;
+                // Phase 1 — extract all vrx pipelines under the lock. Phase 2
+                // — stop (join threads) them outside the lock, so other
+                // commands aren't blocked while we join decode/demod threads.
+                let mut vrx_drained: Vec<VrxTask> = Vec::new();
                 {
                     let mut guard = self.session.lock().await;
                     if let Some(s) = guard.as_mut() {
-                        while let Some((_, mut vrx)) = s.vrx.pop_first() {
-                            vrx.stop();
-                            torn += 1;
-                        }
+                        vrx_drained = std::mem::take(&mut s.vrx).into_values().collect();
                     }
+                }
+                let torn = vrx_drained.len();
+                for v in vrx_drained.iter_mut() {
+                    v.stop();
                 }
                 if std::env::var("HL2_DEBUG").is_ok() {
                     eprintln!("[HUB] vrx off — {torn} slot(s) torn down");
@@ -819,14 +897,18 @@ impl RadioHub {
                     return ServerResponse::err(id, &state0, "HL2 not started");
                 }
                 // Rebuild only *this* slot's pipeline (other slots keep
-                // streaming).
+                // streaming). Extract-under-lock, stop-outside-lock (see
+                // `VrxTask::stop` doc): the decode-thread join can block for
+                // up to one burst, so keep the session lock free of it.
+                let mut old_vrx: Option<VrxTask> = None;
                 {
                     let mut guard = self.session.lock().await;
                     if let Some(s) = guard.as_mut() {
-                        if let Some(mut vrx) = s.vrx.remove(&c.slot) {
-                            vrx.stop();
-                        }
+                        old_vrx = s.vrx.remove(&c.slot);
                     }
+                }
+                if let Some(mut v) = old_vrx {
+                    v.stop();
                 }
                 // Fetch the per-slot ring for the receiver we are about to
                 // demodulate.
@@ -894,15 +976,17 @@ impl RadioHub {
         if std::env::var("HL2_DEBUG").is_ok() {
             eprintln!("[HUB] set vrx off → slot={slot}");
         }
+        let mut old_vrx: Option<VrxTask> = None;
         {
             let mut guard = self.session.lock().await;
             if let Some(s) = guard.as_mut() {
-                if let Some(mut vrx) = s.vrx.remove(&slot) {
-                    vrx.stop();
-                    if std::env::var("HL2_DEBUG").is_ok() {
-                        eprintln!("[HUB] vrx {slot} torn down (off)");
-                    }
-                }
+                old_vrx = s.vrx.remove(&slot);
+            }
+        }
+        if let Some(mut v) = old_vrx {
+            v.stop();
+            if std::env::var("HL2_DEBUG").is_ok() {
+                eprintln!("[HUB] vrx {slot} torn down (off)");
             }
         }
         let (state, _) = self.snapshot().await;
@@ -935,17 +1019,19 @@ impl RadioHub {
         }
 
         if !enabled {
-            let mut torn = 0usize;
+            // Phase 1 — extract under the lock; phase 2 — stop (join threads)
+            // outside it. See `VrxTask::stop` / `AutoTask::stop` for why the
+            // join must not run under the session lock.
+            let mut auto_drained: Vec<AutoTask> = Vec::new();
             {
                 let mut guard = self.session.lock().await;
                 if let Some(s) = guard.as_mut() {
-                    if let Some(mut v) = s.auto.remove(&slot) {
-                        for t in v.iter_mut() {
-                            t.stop();
-                        }
-                        torn = v.len();
-                    }
+                    auto_drained = s.auto.remove(&slot).unwrap_or_default();
                 }
+            }
+            let torn = auto_drained.len();
+            for t in auto_drained.iter_mut() {
+                t.stop();
             }
             if std::env::var("HL2_DEBUG").is_ok() {
                 eprintln!("[HUB] auto slot={slot}: {torn} pipeline(s) torn down");
@@ -967,16 +1053,20 @@ impl RadioHub {
         let half_span = spectrum_span(&self.spectrum_source.lock().unwrap()) / 2;
 
         // Tear down the slot's existing auto pipelines (if any), so the
-        // rebuilt set is exactly the in-window set.
+        // rebuilt set is exactly the in-window set. Extract-under-lock,
+        // stop-outside-lock (same two-phase pattern as elsewhere): a torn
+        // auto set can be up to 3 * (in-window freqs) pipelines, each with
+        // a decode-thread join of up to one burst, so don't hold the session
+        // lock through it.
+        let mut auto_drained: Vec<AutoTask> = Vec::new();
         {
             let mut guard = self.session.lock().await;
             if let Some(s) = guard.as_mut() {
-                if let Some(mut v) = s.auto.remove(&slot) {
-                    for t in v.iter_mut() {
-                        t.stop();
-                    }
-                }
+                auto_drained = s.auto.remove(&slot).unwrap_or_default();
             }
+        }
+        for t in auto_drained.iter_mut() {
+            t.stop();
         }
 
         let ring = {
@@ -1568,7 +1658,8 @@ fn spawn_ft8_decode(
                     return;
                 }
                 // Park ~1 s between wall-clock checks (250 ms resolution so
-                // `stop` joins quickly).
+                // `stop` joins quickly — the worst-case join while parked is
+                // one 250 ms sleep + the top-of-loop check).
                 let now = std::time::Instant::now();
                 if now - last_tick < std::time::Duration::from_secs(1) {
                     std::thread::sleep(std::time::Duration::from_millis(250));
@@ -1583,6 +1674,14 @@ fn spawn_ft8_decode(
                 let slot = closed_slot_for(now_ms);
                 if slot == last_decoded_slot {
                     continue;
+                }
+                // Defensive: if stop was set between the park and here (a
+                // teardown racing the 1 s tick), skip the burst. The burst
+                // (mfsk-core's `req.decode()`) is 1-3 s of CPU and cannot be
+                // interrupted cheaply, so catching stop *before* we enter it
+                // is the only cheap way to keep the join bounded.
+                if stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
                 }
                 let res = decode_closed_slot(&shared, slot);
                 if res.is_ok() {
@@ -1726,6 +1825,12 @@ fn spawn_ft4_decode(
                 if slot == last_decoded_slot {
                     continue;
                 }
+                // Defensive: skip the burst if stop was set since the park
+                // (see the FT8 loop for the full rationale) so the join stays
+                // bounded to one park slice, not one burst.
+                if stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
                 let res = ft4_decode_closed_slot(&shared, slot);
                 if res.is_ok() {
                     last_decoded_slot = slot;
@@ -1836,6 +1941,13 @@ fn spawn_js8_decode(
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
 
+                // Defensive: skip the burst if stop was set since the last
+                // slice check — see the FT8/FT4 loops for the full
+                // rationale. `js8_step` is lighter than the FT8/FT4 bursts
+                // but can still take a few hundred ms for four speeds.
+                if stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
