@@ -39,6 +39,8 @@ use mfsk_core::engine::protocol::ProtocolId;
 use mfsk_core::ft8::Ft8;
 use mfsk_core::msg::decode_request::DecodeRequest;
 
+use hl2_common::{DecodedMessage, SpotFields, SpotStation};
+
 use super::demod::RawSampleTap;
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -108,6 +110,30 @@ pub struct Ft8Message {
     pub dt_sec: f32,
     pub snr_db: f32,
     pub slot_ms: u64,
+}
+
+impl DecodedMessage for Ft8Message {
+    fn freq_hz(&self) -> f32 {
+        self.freq_hz
+    }
+    fn dt_sec(&self) -> f32 {
+        self.dt_sec
+    }
+    fn snr_db(&self) -> f32 {
+        self.snr_db
+    }
+    fn slot_ms(&self) -> u64 {
+        self.slot_ms
+    }
+    fn mode(&self) -> &'static str {
+        "FT8"
+    }
+    fn display(&self) -> &str {
+        &self.text
+    }
+    fn spot_fields(&self, st: &SpotStation) -> Option<SpotFields> {
+        super::spot::wsjt_spot_fields(&self.text, st)
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────

@@ -888,6 +888,7 @@ name = "hl2"
 version = "0.1.0"
 dependencies = [
  "cpal",
+ "hl2-common",
  "mfsk-core",
  "num-complex",
  "rustfft",

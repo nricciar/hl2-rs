@@ -9,6 +9,7 @@ tokio-util = { version = "0.7", features = ["net", "codec"] }
 num-complex = "0.4"
 rustfft = "6"
 mfsk-core = "0.9.1"
+hl2-common = { workspace = true }
 [dependencies.cpal]
 version = "0.15"
 optional = true

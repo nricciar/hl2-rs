@@ -84,12 +84,10 @@ struct Shared {
     vrx_sideband: RefCell<String>,
     vrx_bw_hz: RefCell<u32>,
     vrx_gain_db: RefCell<f32>,
-    /// Decoded FT8 rows, newest-first, capped (see [`FT8_LOG_CAP`]).
-    ft8_log: RefCell<Vec<hl2_common::Ft8Decode>>,
-    /// Decoded JS8 rows, newest-first, capped (see [`FT8_LOG_CAP`]).
-    js8_log: RefCell<Vec<hl2_common::Js8Decode>>,
-    /// Decoded FT4 rows, newest-first, capped (see [`FT8_LOG_CAP`]).
-    ft4_log: RefCell<Vec<hl2_common::Ft4Decode>>,
+    /// Decoded digital-mode rows (FT8 / FT4 / JS8), newest-first, capped
+    /// (see [`FT8_LOG_CAP`]). All modes share one buffer + one wire
+    /// envelope; the mode of each row is read from its `vrx` snapshot.
+    decode_log: RefCell<Vec<hl2_common::DecodeRow>>,
     vrx_play_gain: RefCell<f32>,
     started_prev: RefCell<bool>,
     started_local: RefCell<bool>,
@@ -131,9 +129,7 @@ impl Shared {
             vrx_sideband: RefCell::new("usb".into()),
             vrx_bw_hz: RefCell::new(2_600),
             vrx_gain_db: RefCell::new(0.0),
-            ft8_log: RefCell::new(Vec::new()),
-            js8_log: RefCell::new(Vec::new()),
-            ft4_log: RefCell::new(Vec::new()),
+            decode_log: RefCell::new(Vec::new()),
             vrx_play_gain: RefCell::new(0.8),
         })
     }
@@ -145,53 +141,19 @@ impl Shared {
     }
 
     fn on_text(sh: &Rc<Self>, json: &str) {
-        if json.trim_start().contains("\"cmd\":\"ft8log\"")
-            || json.trim_start().contains("\"cmd\": \"ft8log\"")
+        // One shared decode-log envelope for every digital mode (FT8 / FT4 /
+        // JS8): `{"cmd":"log","data":[{…}, …]}`. The mode of each row is
+        // carried in its `vrx` snapshot, so the client never branches on
+        // mode to receive a decode.
+        if json.trim_start().contains("\"cmd\":\"log\"")
+            || json.trim_start().contains("\"cmd\": \"log\"")
         {
             #[derive(serde::Deserialize)]
             struct Envelope {
-                data: Vec<hl2_common::Ft8Decode>,
+                data: Vec<hl2_common::DecodeRow>,
             }
             if let Ok(env) = serde_json::from_str::<Envelope>(json) {
-                let mut log = sh.ft8_log.borrow_mut();
-                log.extend(env.data);
-                if log.len() > FT8_LOG_CAP {
-                    let excess = log.len() - FT8_LOG_CAP;
-                    log.drain(..excess);
-                }
-            }
-            sh.notify();
-            return;
-        }
-
-        if json.trim_start().contains("\"cmd\":\"js8log\"")
-            || json.trim_start().contains("\"cmd\": \"js8log\"")
-        {
-            #[derive(serde::Deserialize)]
-            struct Envelope {
-                data: Vec<hl2_common::Js8Decode>,
-            }
-            if let Ok(env) = serde_json::from_str::<Envelope>(json) {
-                let mut log = sh.js8_log.borrow_mut();
-                log.extend(env.data);
-                if log.len() > FT8_LOG_CAP {
-                    let excess = log.len() - FT8_LOG_CAP;
-                    log.drain(..excess);
-                }
-            }
-            sh.notify();
-            return;
-        }
-
-        if json.trim_start().contains("\"cmd\":\"ft4log\"")
-            || json.trim_start().contains("\"cmd\": \"ft4log\"")
-        {
-            #[derive(serde::Deserialize)]
-            struct Envelope {
-                data: Vec<hl2_common::Ft4Decode>,
-            }
-            if let Ok(env) = serde_json::from_str::<Envelope>(json) {
-                let mut log = sh.ft4_log.borrow_mut();
+                let mut log = sh.decode_log.borrow_mut();
                 log.extend(env.data);
                 if log.len() > FT8_LOG_CAP {
                     let excess = log.len() - FT8_LOG_CAP;
@@ -1107,6 +1069,17 @@ fn vrx_mode_str_sideband(v: &hl2_common::VrxState) -> String {
     }
 }
 
+/// Uppercase label for a receiver's mode, for the decode-log `Mode` column.
+fn vrx_mode_label(m: &hl2_common::VrxMode) -> String {
+    match m {
+        hl2_common::VrxMode::Ft8 => "FT8".to_string(),
+        hl2_common::VrxMode::Js8 => "JS8".to_string(),
+        hl2_common::VrxMode::Ft4 => "FT4".to_string(),
+        hl2_common::VrxMode::Usb => "USB".to_string(),
+        hl2_common::VrxMode::Lsb => "LSB".to_string(),
+    }
+}
+
 #[function_component(App)]
 pub fn app() -> Html {
     let sh = use_state(|| Shared::new());
@@ -1246,31 +1219,23 @@ pub fn app() -> Html {
         .flatten()
         .map(|m| m.mode)
         .collect();
-    let ft8_on: bool = sh13
-        .vrx
-        .borrow()
-        .values()
-        .any(|v| matches!(v.mode, hl2_common::VrxMode::Ft8))
-        || auto_modes.contains(&hl2_common::VrxMode::Ft8);
-    let js8_on: bool = sh13
-        .vrx
-        .borrow()
-        .values()
-        .any(|v| matches!(v.mode, hl2_common::VrxMode::Js8))
-        || auto_modes.contains(&hl2_common::VrxMode::Js8);
-    let ft4_on: bool = sh13
-        .vrx
-        .borrow()
-        .values()
-        .any(|v| matches!(v.mode, hl2_common::VrxMode::Ft4))
+    // The single decode-log table shows while *any* slot is demodulating a
+    // digital mode (FT8 / FT4 / JS8) — including headless auto-decode
+    // monitors. Which mode produced a given row is read from that row's
+    // `vrx` snapshot, so no per-mode gate is needed here.
+    let digital_on: bool = sh13.vrx.borrow().values().any(|v| {
+        matches!(
+            v.mode,
+            hl2_common::VrxMode::Ft8 | hl2_common::VrxMode::Js8 | hl2_common::VrxMode::Ft4
+        )
+    }) || auto_modes.contains(&hl2_common::VrxMode::Ft8)
+        || auto_modes.contains(&hl2_common::VrxMode::Js8)
         || auto_modes.contains(&hl2_common::VrxMode::Ft4);
     let vrx_sideband_cur: String = sh14.vrx_sideband.borrow().clone();
     let vrx_bw_cur: u32 = *sh15.vrx_bw_hz.borrow();
     let vrx_gain_cur: f32 = *sh16.vrx_gain_db.borrow();
     let vrx_play_gain_cur: f32 = *sh17.vrx_play_gain.borrow();
-    let ft8_log: Vec<hl2_common::Ft8Decode> = sh17.ft8_log.borrow().clone();
-    let js8_log: Vec<hl2_common::Js8Decode> = sh17.js8_log.borrow().clone();
-    let ft4_log: Vec<hl2_common::Ft4Decode> = sh17.ft4_log.borrow().clone();
+    let decode_log: Vec<hl2_common::DecodeRow> = sh17.decode_log.borrow().clone();
     let vrx_desc: Html = if vrx_sideband_cur == "ft8" {
         html! {
             <p class="muted">
@@ -1297,17 +1262,19 @@ pub fn app() -> Html {
         }
     };
 
-    // The FT8 decode-log table; rendered only while *any* slot is in FT8
-    // mode — the newest-first list of 15 s-slot decodes pushed by the
-    // server. Each row is stamped with the RX slot (from the decode's
-    // `vrx` snapshot) that demodulated it.
-    let ft8_log_html: Html = if ft8_on {
-        let rows: Html = ft8_log
+    // The decode-log table; rendered while *any* slot demodulates a digital
+    // mode (FT8 / FT4 / JS8) — the newest-first list of decoded messages
+    // pushed by the server across all modes. Each row is stamped with the RX
+    // slot (from the decode's `vrx` snapshot) that demodulated it and the
+    // mode of that receiver, so the single table mixes FT8 / FT4 / JS8 rows.
+    let decode_log_html: Html = if digital_on {
+        let rows: Html = decode_log
             .iter()
             .map(|m| {
                 html! {
                     <tr>
                         <td class="ft8-rx">{format!("RX{}", m.vrx.slot)}</td>
+                        <td>{vrx_mode_label(&m.vrx.mode)}</td>
                         <td>{format!("{:.1}", m.freq_hz)}</td>
                         <td>{format!("{:+.2}", m.dt_sec)}</td>
                         <td>{format!("{:.1}", m.snr_db)}</td>
@@ -1319,10 +1286,10 @@ pub fn app() -> Html {
             .collect();
         html! {
             <div class="ft8-log">
-                <h4>{"FT8 decode log"}</h4>
-                {if ft8_log.is_empty() {
+                <h4>{"decode log"}</h4>
+                {if decode_log.is_empty() {
                     html! {
-                        <p class="muted">{"Waiting for a completed 15 s slot…"}</p>
+                        <p class="muted">{"Waiting for a decoded message…"}</p>
                     }
                 } else {
                     html! {
@@ -1330,113 +1297,7 @@ pub fn app() -> Html {
                             <thead>
                                 <tr>
                                     <th>{"Rx"}</th>
-                                    <th>{"Freq (Hz)"}</th>
-                                    <th>{"Δt (s)"}</th>
-                                    <th>{"SNR dB"}</th>
-                                    <th>{"Slot (ms)"}</th>
-                                    <th>{"Text"}</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {rows}
-                            </tbody>
-                        </table>
-                    }
-                }}
-            </div>
-        }
-    } else {
-        Html::default()
-    };
-
-    // The JS8 decode-log table; rendered only while *any* slot is in JS8
-    // mode — the newest-first list of 15 s-slot decodes pushed by the
-    // server. Each row is stamped with the RX slot (from the decode's
-    // `vrx` snapshot) that demodulated it, and shows the decoded frame's
-    // display string.
-    let js8_log_html: Html = if js8_on {
-        let rows: Html = js8_log
-            .iter()
-            .map(|m| {
-                html! {
-                    <tr>
-                        <td class="ft8-rx">{format!("RX{}", m.vrx.slot)}</td>
-                        <td>{m.submode.to_string()}</td>
-                        <td>{format!("{:.1}", m.freq_hz)}</td>
-                        <td>{format!("{:+.2}", m.dt_sec)}</td>
-                        <td>{format!("{:.1}", m.snr_db)}</td>
-                        <td>{m.slot_ms.to_string()}</td>
-                        <td class="ft8-text">{m.message.as_str()}</td>
-                    </tr>
-                }
-            })
-            .collect();
-        html! {
-            <div class="ft8-log">
-                <h4>{"JS8 decode log"}</h4>
-                {if js8_log.is_empty() {
-                    html! {
-                        <p class="muted">{"Waiting for a decoded JS8 frame…"}</p>
-                    }
-                } else {
-                    html! {
-                        <table class="ft8-table">
-                            <thead>
-                                <tr>
-                                    <th>{"Rx"}</th>
-                                    <th>{"Speed"}</th>
-                                    <th>{"Freq (Hz)"}</th>
-                                    <th>{"Δt (s)"}</th>
-                                    <th>{"SNR dB"}</th>
-                                    <th>{"Slot (ms)"}</th>
-                                    <th>{"Frame"}</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {rows}
-                            </tbody>
-                        </table>
-                    }
-                }}
-            </div>
-        }
-    } else {
-        Html::default()
-    };
-
-    // The FT4 decode-log table; rendered only while *any* slot is in FT4
-    // mode — the newest-first list of 7.5 s-slot decodes pushed by the
-    // server. Each row is stamped with the RX slot (from the decode's
-    // `vrx` snapshot) that demodulated it.
-    let ft4_log_html: Html = if ft4_on {
-        let rows: Html = ft4_log
-            .iter()
-            .map(|m| {
-                html! {
-                    <tr>
-                        <td class="ft8-rx">{format!("RX{}", m.vrx.slot)}</td>
-                        <td>{format!("{:.1}", m.freq_hz)}</td>
-                        <td>{format!("{:+.2}", m.dt_sec)}</td>
-                        <td>{format!("{:.1}", m.snr_db)}</td>
-                        <td>{m.slot_ms.to_string()}</td>
-                        <td class="ft8-text">{m.text.as_str()}</td>
-                    </tr>
-                }
-            })
-            .collect();
-        html! {
-            <div class="ft8-log">
-                <h4>{"FT4 decode log"}</h4>
-                {if ft4_log.is_empty() {
-                    html! {
-                        <p class="muted">{"Waiting for a completed 7.5 s slot…"}</p>
-                    }
-                } else {
-                    html! {
-                        <table class="ft8-table">
-                            <thead>
-                                <tr>
-                                    <th>{"Rx"}</th>
+                                    <th>{"Mode"}</th>
                                     <th>{"Freq (Hz)"}</th>
                                     <th>{"Δt (s)"}</th>
                                     <th>{"SNR dB"}</th>
@@ -1808,9 +1669,7 @@ pub fn app() -> Html {
                         </button>
                     </div>
 
-                    {ft8_log_html}
-                    {js8_log_html}
-                    {ft4_log_html}
+                    {decode_log_html}
                 </div>
 
                 <footer class="hint">

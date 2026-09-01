@@ -204,105 +204,191 @@ pub struct VrxState {
     pub muted: bool,
 }
 
-/// A single decoded FT8 message, as pushed by the server to every connected
-/// client on a successful 15 s slot decode (one per slot that decodes).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Ft8Decode {
-    pub text: String,
-    pub freq_hz: f32,
-    pub dt_sec: f32,
-    pub snr_db: f32,
-    /// The wall-clock slot anchor (ms since Unix epoch)
-    pub slot_ms: u64,
-    /// The virtual receiver that produced this decode
-    pub vrx: VrxState,
-}
-
-/// A batch of decoded FT8 messages, pushed over the WebSocket as a JSON text
-/// frame with envelope `{"cmd":"ft8log","data":[{"text":…, …}, …]}`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Ft8Log {
-    pub decodes: Vec<Ft8Decode>,
-}
-
-/// A single decoded JS8Call frame, as pushed by the server to every connected
-/// client on a successful decode.
+/// One decoded digital-mode message (a **row** of the decode log), as pushed
+/// by the server to every connected client.
 ///
-/// JS8 frames are structured (compound / directed / heartbeat / data), so the
-/// fields mirror the decoder's `DecodedFrame` (in the `hl2` crate): `kind` is
-/// the frame class, `callsign` the station (or directed `from`), `to` the
-/// destination (directed frames), `grid` the locator, `cmd`/`num` the
-/// command, and `text`/`message` the decoded text + display string. The
-/// decoder runs all four JS8 speeds (A/B/C/E) continuously; `submode`
-/// identifies which speed produced the decode.
+/// This is the *mode-agnostic* wire shape shared by every digital decoder
+/// (FT8 / FT4 / JS8 today). `text` is the human-readable row: FT8/FT4 carry
+/// the resolved 77-bit WSJT payload, JS8 carries the decoder's display
+/// string. `vrx` attributes the row to the exact receiver (slot, NCO
+/// offset, mode) that demodulated and decoded it — it is the only place the
+/// mode of the producing receiver is visible on the wire; the UI reads it
+/// from `vrx.mode`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Js8Decode {
-    /// JS8 speed the frame was decoded as: `A` / `B` / `C` / `E`
-    /// (default `A` for pre-multi-speed peers).
-    #[serde(default = "default_js8_submode")]
-    pub submode: char,
-    /// Frame class (heartbeat / compound / directed / data).
-    pub kind: u8,
-    /// Station (compound or directed `from`). Empty for data frames.
+pub struct DecodeRow {
+    /// The decoded message text / display string (mode-dependent).
+    pub text: String,
+    /// Decoded tone-0 offset (Hz) in the audio passband — the column
+    /// wsjtx/js8call show as the signal's offset, not absolute RF.
+    pub freq_hz: f32,
+    /// Signal start offset relative to the slot anchor, signed seconds
+    /// (`+` = late).
+    pub dt_sec: f32,
+    /// Estimated SNR (dB, wsjtx reference-bandwidth convention).
+    pub snr_db: f32,
+    /// The wall-clock slot anchor this decode belongs to (ms since Unix
+    /// epoch). FT8 is a multiple of 15 000, FT4 of 7 500, JS8 is the cycle
+    /// window start.
+    pub slot_ms: u64,
+    /// The virtual receiver that produced this decode (slot / mode / offset).
+    pub vrx: VrxState,
+}
+
+/// A batch of decoded messages from one slot / cycle window, pushed over the
+/// WebSocket as a JSON text frame with envelope
+/// `{"cmd":"log","data":[{"text":…, …}, …]}`.
+///
+/// There is exactly one envelope for all digital modes — the server maps
+/// every mode's decoded rows to [`DecodeRow`] before broadcasting, so the
+/// client never branches on mode to receive a log row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DecodeLog {
+    pub decodes: Vec<DecodeRow>,
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Decoded-message product + spot sink (the mode-agnostic junction shared by
+// hl2 (impls), hl2-api (the sink) and — indirectly — the hl2-ui row shape.
+// The `hl2` crate implements [`DecodedMessage`] per mode; `hl2-api`
+// implements [`SpotSink`] for its PSK Reporter sender. See PROTOCOL.md /
+// AGENTS.md "Refactor: Spotting".
+
+/// Our own spot station ("us"): the callsign + grid of the local rig,
+/// supplied to [`DecodedMessage::spot_fields`] so it can decide whether a
+/// decode is a self-spot and suppress it. Mode-agnostic: the caller is
+/// whatever the message says it is, the locator is whatever the message
+/// says it is; the station is only used to *reject* self-spots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpotStation {
+    /// Our callsign, e.g. `"K9ABC"`. May be empty (no station configured) in
+    /// which case self-spot suppression is a no-op.
     pub callsign: String,
-    /// Directed frames: destination callsign.
-    #[serde(default)]
-    pub to: Option<String>,
-    /// Grid locator, if present.
-    #[serde(default)]
-    pub grid: Option<String>,
-    /// Command name (no leading space), if present.
-    #[serde(default)]
-    pub cmd: Option<String>,
-    /// Command number / SNR value, if present.
-    #[serde(default)]
-    pub num: Option<i16>,
-    /// Decode free text (data frames).
-    pub text: String,
-    /// The display string (the decoder's `message`).
-    pub message: String,
-    /// Decoded frequency (Hz) in the audio passband.
-    pub freq_hz: f32,
-    /// Signal start offset relative to the slot anchor, signed seconds.
-    pub dt_sec: f32,
-    /// Estimated SNR (dB).
-    pub snr_db: f32,
-    /// The wall-clock slot anchor (ms since Unix epoch).
-    pub slot_ms: u64,
-    /// The virtual receiver that produced this decode.
-    pub vrx: VrxState,
+    /// Our grid (Maidenhead), e.g. `"FN31pq"`. May be empty.
+    pub grid: String,
 }
 
-const fn default_js8_submode() -> char {
-    'A'
+impl SpotStation {
+    pub fn new(callsign: impl Into<String>, grid: impl Into<String>) -> Self {
+        Self {
+            callsign: callsign.into(),
+            grid: grid.into(),
+        }
+    }
 }
 
-/// A batch of decoded JS8 frames, pushed over the WebSocket as a JSON text
-/// frame with envelope `{"cmd":"js8log","data":[{…}, …]}`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Js8Log {
-    pub decodes: Vec<Js8Decode>,
+/// The extracted identifying "who / where" of a decoded message that is
+/// worth spotting. `caller` is the callsign, `locator` the grid square (or
+/// empty when the message carried none).
+///
+/// Everything else in a wire spot (absolute frequency, SNR, epoch, mode)
+/// is derived from the [`DecodedMessage`] envelope + the local tune by the
+/// sink, which is mode-agnostic — so it lives here, not in each impl.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpotFields {
+    pub caller: String,
+    pub locator: String,
 }
 
-/// A single decoded FT4 message, as pushed by the server to every connected
-/// client on a successful 7.5 s slot decode (one per slot that decodes).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Ft4Decode {
-    pub text: String,
-    pub freq_hz: f32,
-    pub dt_sec: f32,
-    pub snr_db: f32,
-    /// The wall-clock slot anchor (ms since Unix epoch)
-    pub slot_ms: u64,
-    /// The virtual receiver that produced this decode
-    pub vrx: VrxState,
+/// The mode-agnostic decoded-message product: the shared interface over
+/// every digital decoder (FT8 / FT4 / JS8 / …).
+///
+/// Implemented by each mode's concrete message type in the `hl2` crate
+/// (`Ft8Message`, `Ft4Message`, `Js8Message`). A consumer (e.g. `hl2-api`)
+/// only ever sees this trait — never the concrete types — and thus never
+/// branches on mode to log or spot a decode. The *only* mode-specific
+/// surface is [`spot_fields`]: each impl knows how to pull a
+/// callsign + locator out of its own message shape (FT8/FT4 token-parsing,
+/// JS8 structured fields), and how to suppress self-spots against the
+/// supplied station.
+///
+/// Object-safe: `dyn DecodedMessage` is the unit of the decode pipeline.
+pub trait DecodedMessage {
+    /// Decoded tone-0 offset (Hz) in the audio passband.
+    fn freq_hz(&self) -> f32;
+    /// Signal start offset relative to the slot anchor (signed seconds).
+    fn dt_sec(&self) -> f32;
+    /// Estimated SNR (dB, wsjtx reference-bandwidth convention).
+    fn snr_db(&self) -> f32;
+    /// The wall-clock slot anchor this decode belongs to (ms since Unix).
+    fn slot_ms(&self) -> u64;
+    /// The ADIF mode tag for this message's mode, e.g. `"FT8"` / `"FT4"` /
+    /// `"JS8"`. The sink uses this as the wire mode field.
+    fn mode(&self) -> &'static str;
+    /// The human-readable text of this message: FT8/FT4 → the 77-bit
+    /// resolved payload (`"CQ DE W1AW"`); JS8 → the decoder's display
+    /// string. This becomes the [`DecodeRow::text`] shown in the UI log.
+    fn display(&self) -> &str;
+    /// Extract the spot fields (who / where) from this message, or `None`
+    /// if it is not worth spotting (no sender, or a self-spot against
+    /// `st`). Each impl bakes in its mode's own message grammar *and* its
+    /// self-spot rule, so callers are never `if ft8 … if js8`.
+    fn spot_fields(&self, st: &SpotStation) -> Option<SpotFields>;
 }
 
-/// A batch of decoded FT4 messages, pushed over the WebSocket as a JSON text
-/// frame with envelope `{"cmd":"ft4log","data":[{"text":…, …}, …]}`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Ft4Log {
-    pub decodes: Vec<Ft4Decode>,
+/// A place to send a decoded message that qualifies as a spot. The sink is
+/// mode-agnostic: given any [`DecodedMessage`] + the local RF tune
+/// (`rf_hz`, the passband centre it was decoded against — `rf_hz == 0` means
+/// "not tuned, do not spot") it derives a full wire spot (caller, locator,
+/// absolute frequency, SNR, epoch, mode) and accepts or rejects it
+/// (e.g. per `(caller, band)` dedup / queue cap).
+///
+/// The only sink today is the PSK Reporter sender in `hl2-api`; more may be
+/// added (e.g. a log file, an internal database) without changing the
+/// pipeline.
+pub trait SpotSink {
+    /// Report one decoded message as a spot, if worth posting.
+    /// `rf_hz` is the passband centre the message was decoded against
+    /// (absolute-RF reference); `rf_hz == 0` means "tune unknown, skip".
+    /// Returns `true` if the spot is now pending in the sink.
+    fn spot(&mut self, m: &dyn DecodedMessage, rf_hz: u32) -> bool;
+}
+
+/// Shared helpers for the spot-selection grammar (Maidenhead validation,
+/// mobile-portable base-callsign stripping) — used by the `DecodedMessage`
+/// impls in `hl2` and tested in `hl2` / `hl2-api`.
+pub mod spot {
+    /// Strip a mobile / portable prefix from a callsign: the base call to
+    /// the right of the last `/` (e.g. `"W1AW/K9ABC"` → `"K9ABC"`,
+    /// `"K9ABC"` → `"K9ABC"`). Used for self-spot comparison so a message
+    /// from a base call with a POTA suffix still suppresses.
+    pub fn base_callsign(call: &str) -> &str {
+        match call.rfind('/') {
+            Some(j) => &call[j + 1..],
+            None => call,
+        }
+    }
+
+    /// True if `g` is a valid Maidenhead **grid square** (4- or 6-char):
+    /// `[A-R]{2}[0-9]{2}` with optional `[A-X]{2}` suffix, case-insensitive,
+    /// excluding the well-known `"RR73"` (a 73 / "best regards" greeting,
+    /// not a locator). Mirrors wsjtx's `grid_regexp`
+    /// (widgets/mainwindow.cpp:308) — this is the locator gate for the
+    /// WSJT-family (`"CQ R7IW LN35"` style) messages and the *usable*
+    /// locator gate for JS8 frames (a non-square grid becomes an empty
+    /// locator on the wire spot, but the callsign still posts).
+    pub fn grid_is_square(g: &str) -> bool {
+        let b = g.as_bytes();
+        if b.len() != 4 && b.len() != 6 {
+            return false;
+        }
+        let sq =
+            |c: u8| c.to_ascii_uppercase().is_ascii_uppercase() && c.to_ascii_uppercase() <= b'R';
+        if !sq(b[0]) || !sq(b[1]) || !b[2].is_ascii_digit() || !b[3].is_ascii_digit() {
+            return false;
+        }
+        if b.len() == 6 {
+            let sub = |c: u8| {
+                c.to_ascii_uppercase().is_ascii_uppercase() && c.to_ascii_uppercase() <= b'X'
+            };
+            if !sub(b[4]) || !sub(b[5]) {
+                return false;
+            }
+        }
+        !(b[0].to_ascii_uppercase() == b'R'
+            && b[1].to_ascii_uppercase() == b'R'
+            && b[2].to_ascii_uppercase() == b'7'
+            && b[3].to_ascii_uppercase() == b'3')
+    }
 }
 
 /// Choose which per-adapter stream the server's spectrum pipeline (panadapter
@@ -735,8 +821,11 @@ mod tests {
     }
 
     #[test]
-    fn ft8_decode_roundtrip() {
-        let vrx = VrxState {
+    fn decode_row_roundtrip() {
+        // One unified row: FT8-shaped (mode visible only via `vrx.mode`) and
+        // a JS8-shaped row in the same batch — proving the wire carries both
+        // under one type.
+        let vrx_ft8 = VrxState {
             slot: 1,
             offset_hz: 0,
             mode: VrxMode::Ft8,
@@ -745,95 +834,167 @@ mod tests {
             rate_hz: 12_000,
             muted: false,
         };
-        let d = Ft8Decode {
+        let vrx_js8 = VrxState {
+            slot: 2,
+            offset_hz: 1_500,
+            mode: VrxMode::Js8,
+            bw_hz: 2_600,
+            gain_db: 0.0,
+            rate_hz: 12_000,
+            muted: true,
+        };
+        let ft8 = DecodeRow {
             text: "CQ DE W1AW".into(),
             freq_hz: 1512.0,
             dt_sec: 0.48,
             snr_db: -3.0,
             slot_ms: 85_000_000_000,
-            vrx,
+            vrx: vrx_ft8,
         };
-        assert_eq!(
-            serde_json::from_str::<Ft8Decode>(&serde_json::to_string(&d).unwrap()).unwrap(),
-            d
-        );
-        let l = Ft8Log {
-            decodes: vec![d.clone(), d],
-        };
-        assert_eq!(
-            serde_json::from_str::<Ft8Log>(&serde_json::to_string(&l).unwrap()).unwrap(),
-            l
-        );
-    }
-
-    #[test]
-    fn ft4_decode_roundtrip() {
-        let vrx = VrxState {
-            slot: 1,
-            offset_hz: 0,
-            mode: VrxMode::Ft4,
-            bw_hz: 2_600,
-            gain_db: 0.0,
-            rate_hz: 12_000,
-            muted: false,
-        };
-        let d = Ft4Decode {
-            text: "CQ DE W1AW".into(),
-            freq_hz: 1512.0,
-            dt_sec: 0.19,
-            snr_db: -3.0,
-            slot_ms: 85_000_000_000,
-            vrx,
-        };
-        assert_eq!(
-            serde_json::from_str::<Ft4Decode>(&serde_json::to_string(&d).unwrap()).unwrap(),
-            d
-        );
-        let l = Ft4Log {
-            decodes: vec![d.clone(), d],
-        };
-        assert_eq!(
-            serde_json::from_str::<Ft4Log>(&serde_json::to_string(&l).unwrap()).unwrap(),
-            l
-        );
-    }
-
-    #[test]
-    fn js8_decode_roundtrip() {
-        let vrx = VrxState {
-            slot: 1,
-            offset_hz: 0,
-            mode: VrxMode::Js8,
-            bw_hz: 2_600,
-            gain_db: 0.0,
-            rate_hz: 12_000,
-            muted: false,
-        };
-        let d = Js8Decode {
-            submode: 'E',
-            kind: 0,
-            callsign: "N1MM".into(),
-            to: None,
-            grid: Some("FN42".into()),
-            cmd: Some("SNR".into()),
-            num: Some(20),
+        let js8 = DecodeRow {
             text: "N1MM: SNR +20".into(),
-            message: "N1MM: SNR +20 ".into(),
             freq_hz: 1500.0,
             dt_sec: 0.5,
             snr_db: 9.8,
-            slot_ms: 85_000_000_000,
-            vrx,
+            slot_ms: 85_000_001_000,
+            vrx: vrx_js8,
         };
         assert_eq!(
-            serde_json::from_str::<Js8Decode>(&serde_json::to_string(&d).unwrap()).unwrap(),
-            d
+            serde_json::from_str::<DecodeRow>(&serde_json::to_string(&ft8).unwrap()).unwrap(),
+            ft8.clone()
         );
-        let l = Js8Log { decodes: vec![d] };
+        let l = DecodeLog {
+            decodes: vec![ft8, js8],
+        };
+        let l2: DecodeLog = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
+        assert_eq!(l2, l);
+    }
+
+    #[test]
+    fn decoded_message_trait_is_object_safe() {
+        // The pipeline (`hl2-api` / `hl2`) handles decodes as `dyn
+        // DecodedMessage` — this proves the trait object compiles and that
+        // every method routes through the vtable, not a concrete type.
+        struct W1Aw {
+            caller: String,
+            grid: String,
+        }
+        impl DecodedMessage for W1Aw {
+            fn freq_hz(&self) -> f32 {
+                1_500.0
+            }
+            fn dt_sec(&self) -> f32 {
+                0.48
+            }
+            fn snr_db(&self) -> f32 {
+                6.0
+            }
+            fn slot_ms(&self) -> u64 {
+                85_000_000_000
+            }
+            fn mode(&self) -> &'static str {
+                "FT8"
+            }
+            fn display(&self) -> &str {
+                "CQ DE W1AW"
+            }
+            fn spot_fields(&self, st: &SpotStation) -> Option<SpotFields> {
+                if !st.callsign.is_empty() && st.callsign == self.caller {
+                    return None;
+                }
+                Some(SpotFields {
+                    caller: self.caller.clone(),
+                    locator: self.grid.clone(),
+                })
+            }
+        }
+        let m: &dyn DecodedMessage = &W1Aw {
+            caller: "W1AW".into(),
+            grid: "FN42".into(),
+        };
+        assert_eq!(m.mode(), "FT8");
+        assert_eq!(m.display(), "CQ DE W1AW");
+        let st = SpotStation::new("K9ABC", "FN31");
         assert_eq!(
-            serde_json::from_str::<Js8Log>(&serde_json::to_string(&l).unwrap()).unwrap(),
-            l
+            m.spot_fields(&st),
+            Some(SpotFields {
+                caller: "W1AW".into(),
+                locator: "FN42".into()
+            }),
+            "a foreign call spots"
         );
+        let self_m: &dyn DecodedMessage = &W1Aw {
+            caller: "K9ABC".into(),
+            grid: "FN31".into(),
+        };
+        assert_eq!(self_m.spot_fields(&st), None, "a self-spot is suppressed");
+
+        // And a sink sees only the trait — never the concrete type.
+        struct S {
+            accepted: std::cell::Cell<usize>,
+            station: SpotStation,
+        }
+        impl SpotSink for S {
+            fn spot(&mut self, m: &dyn DecodedMessage, rf_hz: u32) -> bool {
+                if rf_hz != 0 && m.spot_fields(&self.station).is_some() {
+                    self.accepted.set(self.accepted.get() + 1);
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+        let mut sink = S {
+            accepted: std::cell::Cell::new(0usize),
+            station: st.clone(),
+        };
+        {
+            let s: &mut dyn SpotSink = &mut sink;
+            assert!(s.spot(m, 7_074_000));
+        }
+        assert_eq!(sink.accepted.get(), 1);
+        {
+            let s: &mut dyn SpotSink = &mut sink;
+            assert!(!s.spot(self_m, 7_074_000), "self-spot");
+        }
+        assert_eq!(sink.accepted.get(), 1);
+        {
+            let s: &mut dyn SpotSink = &mut sink;
+            assert!(!s.spot(m, 0), "no tune");
+        }
+
+        const _: fn() = || {
+            let _ = spot::grid_is_square("LN35PQ");
+            let _ = spot::base_callsign("W1AW/K9ABC");
+        };
+    }
+
+    #[test]
+    fn spot_helpers() {
+        // grid square gates
+        use crate::spot::grid_is_square;
+        assert!(grid_is_square("LN35"));
+        assert!(grid_is_square("ln35"));
+        assert!(grid_is_square("FN42UR"));
+        assert!(!grid_is_square("RR73"));
+        assert!(!grid_is_square("12"));
+        assert!(!grid_is_square("LN3"));
+        assert!(!grid_is_square("S1"));
+        assert!(!grid_is_square("LN35Y"));
+        assert!(!grid_is_square("+10"));
+        assert!(!grid_is_square("RR73AB"));
+        assert!(grid_is_square("RR74")); // starts RR but is a square
+        // base-call stripping
+        use crate::spot::base_callsign;
+        assert_eq!(base_callsign("K9ABC"), "K9ABC");
+        assert_eq!(base_callsign("W1AW/K9ABC"), "K9ABC");
+        assert_eq!(base_callsign("A1/AB2"), "AB2");
+        assert_eq!(base_callsign(""), "");
+        assert_eq!(base_callsign("/"), "");
+        // SpotStation
+        let s = SpotStation::new("K9ABC", "FN31pq");
+        assert_eq!(s.callsign, "K9ABC");
+        assert!(s.grid.starts_with("FN31"));
     }
 
     #[test]

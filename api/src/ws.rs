@@ -55,61 +55,26 @@ fn to_message(ev: &WsEvent) -> Message {
             };
             Message::Binary(encode_ws_binary(CH_AUDIO, &frame.to_bytes()))
         }
-        WsEvent::Ft8Log(log) => {
-            // `{"cmd":"ft8log","data":[{…}, …]}` — at most one per 15 s
-            // FT8 slot, `data` = every CRC-passing decode from that slot.
+        WsEvent::Log(log) => {
+            // `{"cmd":"log","data":[{…}, …]}` — one per decode burst, for
+            // whichever digital mode (FT8 / FT4 / JS8) produced it. The
+            // mode is carried per-row in `data[..].vrx.mode`, so the UI
+            // does not need a mode-specific envelope. `data` = every
+            // CRC-passing decode from that slot.
             // JSON text frame (not a binary channel — rows are sparse and
             // human-readable, so text keeps the log visible in any WS
             // client / browser devtools).
             #[derive(serde::Serialize)]
-            struct Ft8LogEnvelope<'a> {
+            struct LogEnvelope<'a> {
                 cmd: &'static str,
-                data: &'a [hl2_common::Ft8Decode],
+                data: &'a [hl2_common::DecodeRow],
             }
-            let env = Ft8LogEnvelope {
-                cmd: "ft8log",
+            let env = LogEnvelope {
+                cmd: "log",
                 data: &log.decodes,
             };
             Message::Text(
-                serde_json::to_string(&env)
-                    .unwrap_or_else(|_| r#"{"cmd":"ft8log","data":[]}"#.into()),
-            )
-        }
-        WsEvent::Js8Log(log) => {
-            // `{"cmd":"js8log","data":[{…}, …]}` — at most one per 15 s
-            // JS8 slot, `data` = every CRC-passing frame from that slot.
-            #[derive(serde::Serialize)]
-            struct Js8LogEnvelope<'a> {
-                cmd: &'static str,
-                data: &'a [hl2_common::Js8Decode],
-            }
-            let env = Js8LogEnvelope {
-                cmd: "js8log",
-                data: &log.decodes,
-            };
-            Message::Text(
-                serde_json::to_string(&env)
-                    .unwrap_or_else(|_| r#"{"cmd":"js8log","data":[]}"#.into()),
-            )
-        }
-        WsEvent::Ft4Log(log) => {
-            // `{"cmd":"ft4log","data":[{…}, …]}` — at most one per 7.5 s
-            // FT4 slot, `data` = every CRC-passing decode from that slot.
-            // JSON text frame (not a binary channel — rows are sparse and
-            // human-readable, so text keeps the log visible in any WS
-            // client / browser devtools).
-            #[derive(serde::Serialize)]
-            struct Ft4LogEnvelope<'a> {
-                cmd: &'static str,
-                data: &'a [hl2_common::Ft4Decode],
-            }
-            let env = Ft4LogEnvelope {
-                cmd: "ft4log",
-                data: &log.decodes,
-            };
-            Message::Text(
-                serde_json::to_string(&env)
-                    .unwrap_or_else(|_| r#"{"cmd":"ft4log","data":[]}"#.into()),
+                serde_json::to_string(&env).unwrap_or_else(|_| r#"{"cmd":"log","data":[]}"#.into()),
             )
         }
     }
