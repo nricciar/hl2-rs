@@ -42,6 +42,7 @@ pub mod ft8;
 pub mod js8;
 pub mod sink;
 pub mod source;
+pub mod spot;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 

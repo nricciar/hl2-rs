@@ -1104,7 +1104,7 @@ Verified against a live HL2: ` iq:audio ` tracks ` rate/2 : 4800 ` exactly
    | `VrxCfg { slot, offset_hz, mode, bw_hz, gain_db }` | Requested settings (offset shifts the demod NCO off the tune; `mode` is `usb`/`lsb`/`ft8`/`js8`). | `lib.rs:201` |
   | `SharedState.vrx: BTreeMap<u8, VrxState>` | Per-slot active receivers (keyed by RX slot). Mirrored into **every** connected tab, like `oc_bits`. | `lib.rs:146` |
   | `AudioFrame { slot, seq, rate_hz, samples }` | `CH_AUDIO` payload (slot byte-pair first, then seq/rate). | `lib.rs:470` |
-  | `Ft8Decode { text, freq_hz, dt_sec, snr_db, slot_ms, vrx }` | One decoded WSJT message; `vrx` is the full [`VrxState`] of the receiver that demodulated it (slot, offset, mode, bw, gain). | `lib.rs:256` |
+   | `Ft8Decode { text, freq_hz, dt_sec, snr_db, slot_ms, vrx }` | One decoded digital-mode message (`DecodeRow` since the FT8/FT4/JS8 wire collapse, §16.10/§16.11); `vrx` is the full [`VrxState`] of the receiver that demodulated it (slot, offset, **mode**, bw, gain). | `lib.rs:218` |
 
   **Server pipeline** (`hl2-api`, `api/src/hub.rs`):
 
@@ -1136,12 +1136,12 @@ Verified against a live HL2: ` iq:audio ` tracks ` rate/2 : 4800 ` exactly
        without broadcasting — the demod and the FT8 decoder (if FT8) keep
        running. Otherwise it broadcasts a
        `WsEvent::Audio { slot, seq, rate_hz, samples }` to every subscriber.
-    4. (FT8 mode only) build a `shared()` decoder, wrap it as
-       `Ft8Tap` → `Arc<dyn RawSampleTap>`, and spawn
-       `spawn_ft8_decode_task` — a 1 s ticker that stamps the slot's
-       [`VrxState` snapshot`] (slot / offset / mode / bw / gain) onto each
-       [`Ft8Decode`] before broadcasting, and appends any spot-able rows to
-       the PSK Reporter queue (→ §16.12).
+     4. (FT8 / FT4 / JS8 mode only) build the mode's decoder, wrap it as a
+        `RawSampleTap`, and spawn that mode's decode task — a ticker that
+        stamps the slot's [`VrxState` snapshot`] (slot / offset / **mode** /
+        bw / gain) onto each [`DecodeRow`] (via `on_decodes`, §16.10) before
+        broadcasting, and appends any spot-able rows to
+        the PSK Reporter queue (`SpotSink`, §16.12).
   * `ClientCmd::SetVrxMute` → `set_vrx_mute_cmd` (`hub.rs`) — flips the
      shared `muted` flag on the slot's `VrxTask` (no rebuild), echoed as
      `vrx[slot].muted` in the next `SharedState`.
@@ -1149,7 +1149,7 @@ Verified against a live HL2: ` iq:audio ` tracks ` rate/2 : 4800 ` exactly
      slot's entry from the map (other slots untouched).
   * `VrxTask::stop()` (called from `set_vrx_cmd` when the receiver is rebuilt,
     from `set_vrx_off_cmd`, or from `stop_cmd`) signals the demod thread,
-    joins it, then aborts the fan-out + (FT8) decode task handles. A manual
+    joins it, then aborts the fan-out + (FT8 / FT4 / JS8) decode task handles. A manual
     `impl Debug` exists because the atomics aren't `Debug`
     (`hub.rs`).
   * `api/src/ws.rs` converts `WsEvent::Audio { slot, … }` to
@@ -1306,7 +1306,7 @@ the `slot` byte (§16.7 audio layout).
   (`push`), but any number of readers follow the *same* ring from their own
   cursor (`peek(cursor, &mut out, max)` — non-destructive, copies the
   window instead of consuming it). This is what lets auto-decode attach a
-  headless FT8 and JS8 decode pipeline per known in-window frequency to a
+   headless FT8, FT4, and JS8 decode pipeline per known in-window frequency to a
   slot that also has a live vrx: the pump writes each slot's stream once,
   and every downstream demod drains independently. A reader whose cursor has
   been dropped out by overflow (fell below `base_seq()`) resyncs the cursor
@@ -1327,10 +1327,10 @@ the `slot` byte (§16.7 audio layout).
   `spawn_auto` in [`api/src/hub.rs`](api/src/hub.rs) builds a
   `VirtualReceiver` tuned to the slot NCO + offset, feeds it the slot's ring
   (sharing the write-once pump stream with the live vrx, §16.9 above), and
-  runs the corresponding `Ft8` / JS8 decode task with a `DropSink` (no audio
-  out). Decoded rows reuse the existing `Ft8Log` / `Js8Log` WS events — the
-  log view is the same whether the decode came from a manual vrx or from an
-  auto pipeline. `Session.auto: BTreeMap<u8, AutoTask>` is torn down on
+   runs the corresponding `Ft8` / `Js8` / `Ft4` decode task with a `DropSink` (no audio
+   out). Decoded rows reuse the shared `WsEvent::Log` WS event — the
+   log view is the same whether the decode came from a manual vrx or from an
+   auto pipeline. `Session.auto: BTreeMap<u8, AutoTask>` is torn down on
   `Tune` (when the slot retunes, any auto pipelines on that slot are
   rebuilt) and on `Stop`. UI exposes an "Auto Decode" checkbox per slot with
   a live per-frequency readout (which bands are currently in the slot's EP6
@@ -1346,9 +1346,12 @@ the `slot` byte (§16.7 audio layout).
 ### 16.10 FT8 (digital mode, implemented)
 
 The virtual receiver supports a third mode, `VrxMode::Ft8`, alongside USB /
-LSB (§16.3), and a fourth, `VrxMode::Js8` (§16.11). FT8 is decoded by the [`mfsk-core`](https://crates.io/crates/mfsk-core)
+LSB (§16.3), and two more, `VrxMode::Js8` (§16.11) and `VrxMode::Ft4` (§16.11).
+All three are WSJT-family digital decoders. FT8 is decoded by the [`mfsk-core`](https://crates.io/crates/mfsk-core)
 `Ft8` decoder (`hl2/src/receiver/ft8.rs`) — the same one WSJT-X uses — run
-per 15 s slot against the demodulator's raw tap.
+per 15 s slot against the demodulator's raw tap. FT4 uses the same `mfsk-core`
+engine (`hl2/src/receiver/ft4.rs`) at a 7.5 s slot; JS8 runs its own LDPC
+pipeline (`hl2/src/receiver/js8/`).
 
 **Mode + sample rate.** `VrxMode::Ft8` selects a **12 kHz** baseband sample
 rate (the mfsk-core FT8 reference rate), not the SSB audio path. The
@@ -1386,7 +1389,7 @@ real-time path. `FT8_SLOT_MS = 15_000` and `FT8_SAMPLE_RATE_HZ = 12_000` are
 `Ft8Tap` → `Arc<dyn RawSampleTap>` and puts it in `ReceiverConfig.tap`, and
 spawns `spawn_ft8_decode_task` (`hub.rs`) — a 1 s ticker that computes
 `closed_slot_for(now_ms)` and calls `decode_closed_slot`; on ≥ 1 row it
-broadcasts `WsEvent::Ft8Log(Ft8Log { decodes })` to every connected websocket
+broadcasts `WsEvent::Log(DecodeLog { decodes })` to every connected websocket
 (fired-and-forget: a lagged / gone fanout is a no-op — the slot is already
 marked decoded, no retry). `VrxTask.stop` aborts that handle on teardown.
 
@@ -1397,46 +1400,51 @@ marked decoded, no retry). `VrxTask.stop` aborts that handle on teardown.
 | `VrxMode::Ft8` | third `VrxMode` variant (the SSB variants are `Usb` / `Lsb`) | `lib.rs` |
 | `VrxCfg.mode: VrxMode` | the requested mode (USB / LSB / FT8) | `lib.rs` |
 | `VrxState.mode: VrxMode` | echo of the active mode (mirrored into the UI `<select>`) | `lib.rs` |
-| `Ft8Decode { text, freq_hz, dt_sec, snr_db, slot_ms, vrx }` | one decoded 77-bit WSJT message + its frequency / timing / SNR / slot anchor; `vrx: VrxState` is the full snapshot (slot / offset / mode / bw / gain) of the receiver that demodulated it | `lib.rs:256` |
-| `Ft8Log { decodes: Vec<Ft8Decode> }` | the batch, ≥ 0 rows; `0` = silence slot | `lib.rs:281` |
-| `WsEvent::Ft8Log` | the fanout event; `to_message` (`api/src/ws.rs`) serializes to the wire below | `hub.rs` |
+ | `DecodeRow { text, freq_hz, dt_sec, snr_db, slot_ms, vrx }` | the **one** decoded-message wire row shared by every digital mode (FT8 / FT4 / JS8). For FT8/FT4 `text` is the resolved 77-bit WSJT payload; for JS8 it is the decoder's display string. `vrx: VrxState` is the full snapshot (slot / offset / **mode** / bw / gain) of the receiver that demodulated it — the mode-of-record that replaced the per-mode `Ft8Decode`/`Ft4Decode`/`Js8Decode` types | `lib.rs:218` |
+ | `DecodeLog { decodes: Vec<DecodeRow> }` | the batch, ≥ 0 rows; one envelope for **all** digital modes | `lib.rs:245` |
+ | `WsEvent::Log` | the fanout event (replaces `WsEvent::Ft8Log` / `Ft4Log` / `Js8Log`); `to_message` (`api/src/ws.rs`) serializes to the wire below | `hub.rs` |
 
-**Wire frame** (text, not binary):
+**Wire frame** (text, not binary) — one envelope for **all** digital modes:
 
 ```json
-{"cmd":"ft8log","data":[{"text":"CQ DE W1AW","freq_hz":153.5,"dt_sec":-0.42,
-                          "snr_db":18.3,"slot_ms":1721395200000,
-                          "vrx":{"slot":1,"offset_hz":0,"mode":"ft8","bw_hz":2600,"gain_db":0.0,"rate_hz":12000,"muted":false}}, …]}
+{"cmd":"log","data":[{"text":"CQ DE W1AW","freq_hz":153.5,"dt_sec":-0.42,
+                      "snr_db":18.3,"slot_ms":1721395200000,
+                      "vrx":{"slot":1,"offset_hz":0,"mode":"ft8","bw_hz":2600,"gain_db":0.0,"rate_hz":12000,"muted":false}}, …]}
 ```
 
-Sent **at most once per completed 15 s slot**, and **only when ≥ 1 row decodes**
+The mode is **per-row**, carried in `data[..].vrx.mode` (`"ft8"` / `"ft4"` /
+`"js8"`), so the same `"log"` command carries FT8, FT4, and JS8 rows
+indistinguishably. An FT8 row is sent **at most once per completed 15 s slot**, and
+**only when ≥ 1 row decodes**
 (silent slots — no CRC-passing hit — are a no-op, not an empty-frame broadcast).
-The `data` array is exactly the `Ft8Log.decodes` list. Each row carries the
+The `data` array is exactly the `DecodeLog.decodes` list. Each row carries the
 `vrx` snapshot of the receiver that produced it, so a multi-slot setup shows
 *exactly which (slot, offset, tuning)* demodulator decoded the message — the
-UI stamps the row's **Rx** column from `vrx.slot`.
+UI stamps the row's **Rx** column from `vrx.slot` and the **Mode** column from
+`vrx.mode`.
 
 **UI panel** (`hl2-ui`, `ui/src/app.rs`). The vrx panel's `<select>` gains
 `<option value="ft8">`. The panel is **per-slot**: the selected RX nav tab
 drives `Shared.vrx_slot` and `Shared::refocus_vrx_panel` re-anchors the
 sideband / bandwidth / gain editor to that slot's active [`VrxState`] (or the
-band defaults: `lsb` below 10 MHz, `usb` at/above). On switch to FT8 the
-description line changes (§16.7 `vrx_desc`), and a *FT8 decode log* table
-renders in the panel — newest-first, capped at `FT8_LOG_CAP` (200 rows) — with
-an **Rx** column stamped from each decode's `vrx.slot` (so simultaneous
-FT8 receivers on different slots are distinguishable). The log is appended in
+band defaults: `lsb` below 10 MHz, `usb` at/above). On switch to a digital mode
+the description line changes (§16.7 `vrx_desc`) and a single **decode log** table
+renders in the panel — newest-first, capped at `FT8_LOG_CAP` (200 rows) — that
+mixes every digital mode's rows. Each row has an **Rx** column stamped from
+`vrx.slot` (so simultaneous decoders on different slots are distinguishable) and
+a **Mode** column stamped from `vrx.mode`. The log is appended in
 `on_text` (`ui/src/app.rs`, before the `ServerResponse` parse, because
-`ft8log` is not a `ServerResponse`) — `Envelope.data: Vec<Ft8Decode>` matches
+`log` is not a `ServerResponse`) — `Envelope.data: Vec<DecodeRow>` matches
 the wire shape exactly.
 
 **End-to-end path.** `VrxMode::Ft8` → `spawn_vrx` → `ReceiverConfig.tap =
 Ft8Tap(shared())` → demod `RawSampleTap::append` (writer, off the critical
 section) → 1 s ticker `decode_closed_slot` (reader, off-lock) → each row stamped
-with the slot's [`VrxState`] snapshot → `WsEvent::Ft8Log` → every tab's `on_text`
-→ `ft8_log` (bounded, newest-first) → the `ft8_log_html` table (§16.7 panel).
-The decode path is **per-slot, per-pipeline**: one decoder per `VrxTask`, so two
-slots running FT8 decode independently (their `wsjtx` slots are the same 15 s
-wall-clock window, but the demod + NCO offset differ).
+with the slot's [`VrxState`] snapshot (`on_decodes`) → `WsEvent::Log` → every
+tab's `on_text` → `decode_log` (bounded, newest-first) → the `decode_log_html`
+table (§16.7 panel). The decode path is **per-slot, per-pipeline**: one decoder
+per `VrxTask`, so two slots running FT8 decode independently (their `wsjtx`
+slots are the same 15 s wall-clock window, but the demod + NCO offset differ).
 
 ### 16.11 JS8 (digital mode, all speeds, implemented)
 
@@ -1512,34 +1520,41 @@ four run concurrently from one buffer, each on its own clock.
 **Server task** (`hl2-api`, `api/src/hub.rs`). `spawn_vrx` branches on
 `VrxMode`: in `Js8` it builds `js8_shared()`, wraps it as `Js8Tap` →
 `Arc<dyn RawSampleTap>` into `ReceiverConfig.tap`, and spawns
-`spawn_js8_decode` (`hub.rs:1176`) — a **500 ms** ticker (sliced into 5×100
-ms sleeps so `stop` resolves in ≤100 ms) calling `js8_step(&shared, now_ms)`.
-On ≥ 1 frame it maps each `Js8Message` through `jmsg` (`hub.rs:1272`) into a
-wire `Js8Decode` (`submode` = the frame's 4th char, e.g. `JS8B` → `'B'`,
-`hub.rs:1276`), appends spot-able frames to the PSK Reporter queue
-(`add_js8`, §16.12), and broadcasts `WsEvent::Js8Log(Js8Log { decodes })`.
+`spawn_js8_decode` (`hub.rs:1887`) — a **500 ms** ticker (sliced into 5×100
+ms sleeps so `stop` solves in ≤100 ms) calling `js8_step(&shared, now_ms)`.
+On ≥ 1 frame it runs the shared decode tail `on_decodes` (`hub.rs:1724`) —
+each `Js8Message` is read through the `DecodedMessage` trait (its
+`impl DecodedMessage for Js8Message` supplies `display()` = the frame's
+display string and `spot_fields()` = the JS8 caller/locator rules,
+`decoder.rs`), rows are stamped with the receiver's [`VrxState`] into
+`DecodeRow`, spot-able frames are appended to the PSK Reporter sink
+(§16.12), and `WsEvent::Log(DecodeLog { decodes })` is broadcast.
 `VrxTask.js8` holds the handle; `VrxTask::stop` aborts it.
 
 **Wire contract** (`hl2-common`):
 
 | Item | Shape | Ref |
 |------|-------|-----|
-| `VrxMode::Js8` | fourth `VrxMode` variant (wire name `js8`) | `lib.rs:128` |
-| `Js8Decode { kind, callsign, to, grid, cmd, num, text, message, submode, freq_hz, dt_sec, snr_db, slot_ms, vrx }` | one decoded JS8 frame: structured fields (frame class, from/to, grid, command) plus `text` (free text) and `message` (display string); **`submode: char`** ('A'/'B'/'C'/'E') tags the speed — `#[serde(default)]` so old clients default to 'A' (`lib.rs:209`); `vrx: VrxState` is the demodulator's snapshot | `lib.rs:206` |
-| `Js8Log { decodes: Vec<Js8Decode> }` | the batch, ≥ 0 rows | `lib.rs:250` |
-| `WsEvent::Js8Log` | the fanout event; `to_message` (`api/src/ws.rs`) serializes to the wire below | `hub.rs` |
+| `VrxMode::Js8` | fourth `VrxMode` variant (wire name `js8`) | `lib.rs:164` |
+| `DecodedMessage` | the trait every decoder implements; `Js8Message::display()` = the frame's display string, `Js8Message::spot_fields()` = the JS8 caller/locator rules (`decoder.rs`) | `lib.rs` |
+| `DecodeRow { text, freq_hz, dt_sec, snr_db, slot_ms, vrx }` | the **one** decoded-message wire row (JS8's `text` = display string) | `lib.rs:218` |
+| `WsEvent::Log` | the fanout event; `to_message` (`api/src/ws.rs`) serializes to the wire below | `hub.rs` |
 
-**Wire frame** (text, not binary):
+**Wire frame** (text, not binary) — the **same** `"log"` envelope as FT8/FT4,
+distinguished per-row by `data[..].vrx.mode = "js8"`:
 
 ```json
-{"cmd":"js8log","data":[{"kind":1,"callsign":"N1MM","grid":"FN42",
-                         "cmd":null,"num":null,"text":"HEARTBEAT",
-                         "message":"N1MM: HEARTBEAT FN42","submode":"B",
-                         "freq_hz":441.0,"dt_sec":-4.5,"snr_db":9.8,
-                         "slot_ms":1721395200000,
-                         "vrx":{"slot":1,"offset_hz":0,"mode":"js8","bw_hz":2600,
-                                "gain_db":0.0,"rate_hz":12000,"muted":false}}, …]}
+{"cmd":"log","data":[{"text":"N1MM: HEARTBEAT FN42",
+                      "freq_hz":441.0,"dt_sec":-4.5,"snr_db":9.8,
+                      "slot_ms":1721395200000,
+                      "vrx":{"slot":1,"offset_hz":0,"mode":"js8","bw_hz":2600,
+                             "gain_db":0.0,"rate_hz":12000,"muted":false}}, …]}
 ```
+
+> The former structured JS8 columns (`kind`, `callsign`, `to`, `grid`, `cmd`,
+> `num`, `submode`) are now folded into `text` (the decoder's display string),
+> so the wire row has one uniform shape across modes. The speed tag that the
+> old `submode` column carried is preserved inside that display string.
 
 Sent **continuously** (500 ms tick), **only when ≥ 1 frame decodes on that
 tick** — a given speed can fire at most once per ~1.5 s re-arm window (its
@@ -1547,26 +1562,31 @@ cycle boundary), so different speeds interleave on the wire.
 
 **UI panel** (`hl2-ui`, `ui/src/app.rs`). The vrx panel's `<select>` gains
 `<option value="js8">`; on switch to JS8 the description line states all
-four speeds are decoded continuously, and a *JS8 decode log* table renders
-(newest-first) — columns **Rx** (from `vrx.slot`) / **Speed** (`submode`,
-`app.rs:1199`) / Freq / Δt / SNR / Slot / **Frame** (the display `message`);
-the empty state reads *Waiting for a decoded JS8 frame…*. Appended in
-`on_text` from the `js8log` envelope, same shape as `ft8log`.
+four speeds are decoded continuously, and the single **decode log** table
+(newest-first, shared with FT8/FT4) renders this slot's JS8 rows — columns
+**Rx** (from `vrx.slot`) / **Mode** (`vrx.mode`, via `vrx_mode_label`) /
+Freq / Δt / SNR / Slot / **Text** (the display string); the empty state reads
+*Waiting for a decoded message…*. Appended in `on_text` from the `log`
+envelope, same shape as `ft8log` used to be.
 
 **End-to-end path.** `VrxMode::Js8` → `spawn_vrx` → `ReceiverConfig.tap =
 Js8Tap(js8_shared())` → demod `RawSampleTap::append` (writer) → 500 ms
 ticker `js8_step` (reader, off-lock; readiness-gated, per-speed re-arm) →
- `jmsg` stamping the cycle's [`VrxState`] + `submode` → `add_js8` (optional
- spot, mode tag = `JS8`) → `WsEvent::Js8Log` → every tab's `on_text`
-→ the `js8_log_html` table. Per-pipeline like FT8, but **per-speed continuous**
+ `on_decodes` stamping each row's [`VrxState`] + spot via `SpotSink`
+ (mode tag = `JS8`) → `WsEvent::Log` → every tab's `on_text`
+→ the `decode_log_html` table. Per-pipeline like FT8, but **per-speed continuous**
 rather than per-slot.
 
 ### 16.12 PSK Reporter spot posting (FT8 / JS8 → pskreporter.info, implemented)
 
-Decoded FT8 and JS8 rows are posted to [PSK Reporter](http://pskreporter.info) in
-the shape wsjtx posts them. Transport is
+Decoded FT8, FT4, and JS8 rows are posted to [PSK Reporter](http://pskreporter.info) in
+the shape wsjtx/js8call post them. Transport is
 UDP to `report.pskreporter.info:4739` (wsjtx `PSKReporter.cpp:35-37`),
 overridable with `PSKREP_ADDR`.
+
+The spot selector per mode lives **inside the decoder** (`DecodedMessage::spot_fields`),
+and the API has a single mode-agnostic bridge (`Pskrep: SpotSink`) that turns any
+spot-able row into a wire `Spot` and enqueues it. No per-mode `add_*` methods remain.
 
 **Crate `pskrep`** (no dependencies):
 
@@ -1581,15 +1601,13 @@ overridable with `PSKREP_ADDR`.
 
 | Item | Location | Notes |
 |------|----------|-------|
-| `ft8_spot(m, rf_hz, station)` | `api/src/pskrep_hook.rs` | spot-selection port of wsjtx `pskPost` (`widgets/mainwindow.cpp:7565`): word1 = `CQ`/`QRZ` (with direction tag: `CQ DX`, `CQ NA`, `CQ 559`) or a bare call → **caller = word2, grid = word3** (`R` → word4), per `DecodedText::deCallAndGrid` (`Decoder/decodedtext.cpp:212`); post iff the grid passes `grid_regexp` (`widgets/mainwindow.cpp:308`, `[A-R]{2}[0-9]{2}([A-X]{2})?` not `RR73`) **or** the text contains ` CQ `; self-spot suppression when the text contains *both* our base callsign (`Radio::base_callsign` — `W1AW/K9ABC` → `K9ABC`) and our 4-char grid (`mainwindow.cpp:7568`) |
-| `js8_spot(m, rf_hz, station)` | `api/src/pskrep_hook.rs` | Mirrors js8call's spotting (mainwindow.cpp `logCallActivity` / `processSpots`): spot **any** frame with a sender, the locator being optional. Caller is the structured `callsign` (heartbeat / compound / compound-directed, or the directed `from`), else the leading `CALL:` word of a data frame's free text (js8call mainwindow.cpp:8292-8306). `locator` = the frame's `grid` when it is a valid square (`grid_is_square`), else empty. Self-spot suppression: caller equals our base call **and** (grid equals our 4-char square, or no grid). `mode: "JS8"` — plain, not `JS8<speed>` (js8call posts a single mode name, mainwindow.cpp:9611, so the collector's mode filter matches) |
-| `Spot.freq_hz` | — | `rf_hz + m.freq_hz` (wsjtx `m_freqNominalPeriod + audioFrequency`, `mainwindow.cpp:7590`) — `rf_hz` is the vrx slot's current tune **plus the receiver's NCO `offset_hz`** (the demod is parked at tune + offset, and the decode's `freq_hz` is the tone-0 offset within the passband), re-read from `Session.tuning` at decode time (`api/src/hub.rs`) |
-| `Spot.time_epoch` | — | `slot_ms/1000 + dt_sec` (slot boundary + signal-start offset, wsjtx's `qSpotTime` from the row's time column) |
+| `spot_fields` (FT8 / FT4) | `hl2/src/receiver/spot.rs` `wsjt_spot_fields` (called from each mode's `DecodedMessage::spot_fields`, `ft8.rs:134` / `ft4.rs:133`) | spot-selection port of wsjtx `pskPost` (`widgets/mainwindow.cpp:7565`): word1 = `CQ`/`QRZ` (with direction tag: `CQ DX`, `CQ NA`, `CQ 559`) or a bare call → **caller = word2, grid = word3** (`R` → word4), per `DecodedText::deCallAndGrid` (`Decoder/decodedtext.cpp:212`); post iff the grid passes `grid_is_square` (`common/src/lib.rs:366`, `[A-R]{2}[0-9]{2}([A-X]{2})?`) **or** the text contains ` CQ `; self-spot suppression when the text contains *both* our base callsign and our 4-char grid. FT8 and FT4 share this one grammar |
+| `spot_fields` (JS8) | `hl2/src/receiver/js8/decoder.rs` `js8_spot_fields` (called from `Js8Message::spot_fields`, `decoder.rs:134`) | Mirrors js8call's spotting (mainwindow.cpp `logCallActivity` / `processSpots`): spot **any** frame with a sender, the locator being optional. Caller is the structured `callsign` (heartbeat / compound / compound-directed, or the directed `from`), else the leading `CALL:` word of a data frame's free text (js8call mainwindow.cpp:8292-8306). `locator` = the frame's `grid` when it is a valid square, else empty. Self-spot suppression: caller equals our base call **and** (grid equals our 4-char square, or no grid) |
+| `build_spot` / `spot` | `api/src/pskrep_hook.rs` (`Pskrep::build_spot:98`, `impl SpotSink:115`) | The API's *single* spot bridge for **all** modes: reads each row through the `DecodedMessage` trait, calls `spot_fields(&spot_station)`, then computes the wire envelope from the mode-agnostic fields — `freq_hz = rf_hz + m.freq_hz()` (wsjtx `m_freqNominalPeriod + audioFrequency`, `mainwindow.cpp:7590`; `rf_hz` = the vrx slot's tune **plus NCO `offset_hz`** re-read at decode time) and `time_epoch = slot_ms/1000 + dt_sec` (the row's time column). `spot()` then enqueues into the PSK Reporter queue |
 | `Pskrep` + `run_sender` | `api/src/pskrep_hook.rs` | **60 s** UDP loop: drain the shared queue → `build_packets` (descriptors on the next 3 reports at startup/reconnect, wsjtx `PSKReporter.cpp:84,152`) → send (splitting across multiple datagrams when > ~8 spots, or more with short grid) → advance sequence (wsjtx `PSKReporter.cpp:324`). Slower cadence than wsjtx's 1 s on purpose: a few virtual receivers (each running FT8 + FT4 + JS8) feed one shared queue, and we batch them into a friendly ≤1/min report rather than flood the collector. Runs on a dedicated std thread + current-thread tokio runtime (started in `api/src/main.rs` — Rocket builds state before its own runtime exists) |
-| decode-task hook | `api/src/hub.rs` `spawn_ft8_decode_task` / `spawn_js8_decode_task` | one `Pskrep::add_ft8` / `add_js8` per decoded row (wsjtx posts **every** decoded line that passes the selector, not just CQs) |
+| decode-task hook | `api/src/hub.rs` `on_decodes` (`hub.rs:1724`) | one `SpotSink::spot` per decoded row for **every** digital mode (wsjtx posts **every** decoded line that passes the selector, not just CQs); no per-mode `add_ft8`/`add_ft4`/`add_js8` anymore |
 
 **On/off**: spot posting is **inactive unless `PSK_CALL` is set** (env);
 `PSK_GRID` / `PSK_ANTENNA` / `PSK_RIG` fill the receiver-information
-record. The decode broadcasts (`WsEvent::Ft8Log` / `WsEvent::Js8Log`) are
-unaffected.
+record. The decode broadcasts (`WsEvent::Log`) are unaffected.
 

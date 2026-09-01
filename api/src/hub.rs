@@ -33,8 +33,8 @@ use hl2::receiver::{
 };
 use hl2::{DEFAULT_LNA_GAIN_DB, Hl2, Hl2Event, discover};
 use hl2_common::{
-    AutoMonitor, ClientCmd, DiscoveryInfo, Ft4Decode, Ft4Log, Ft8Decode, Ft8Log, Js8Decode, Js8Log,
-    SampleFormat, ServerResponse, SharedState, SpectrumSource, VrxCfg, VrxMode, VrxState,
+    AutoMonitor, ClientCmd, DecodeLog, DiscoveryInfo, SampleFormat, ServerResponse, SharedState,
+    SpectrumSource, SpotSink, VrxCfg, VrxMode, VrxState,
 };
 
 /// Map `hl2::receiver::AutoMode` (the auto-decode registry in `hl2`) to
@@ -67,19 +67,13 @@ pub enum WsEvent {
         rate_hz: u16,
         samples: Vec<i16>,
     },
-    /// A batch of decoded FT8 messages (server → client JSON text frame
-    /// `{"cmd":"ft8log","data":[…]}`), at most one per wall-clock 15 s slot,
-    /// and only when the decoder produced ≥ 1 CRC-passing row.
-    Ft8Log(Ft8Log),
-    /// A batch of decoded JS8 frames (server → client JSON text frame
-    /// `{"cmd":"js8log","data":[…]}`), sent whenever the readiness gate
-    /// fires for any speed (A/B/C/E each re-arming independently), and only
-    /// when a ≥ 1 CRC-passing frame decoded in that window.
-    Js8Log(Js8Log),
-    /// A batch of decoded FT4 messages (server → client JSON text frame
-    /// `{"cmd":"ft4log","data":[…]}`), at most one per wall-clock 7.5 s slot,
-    /// and only when the decoder produced ≥ 1 CRC-passing row.
-    Ft4Log(Ft4Log),
+    /// A batch of decoded digital-mode messages (server → client JSON text
+    /// frame `{"cmd":"log","data":[…]}`), for **any** digital mode (FT8 /
+    /// FT4 / JS8 / …) — the mode is carried per-row in `vrx.mode`, so the
+    /// client never branches on mode to receive a log batch. Sent at most
+    /// once per wall-clock slot (FT8 15 s / FT4 7.5 s) or JS8 readiness
+    /// tick, and only when the decoder produced ≥ 1 CRC-passing row.
+    Log(DecodeLog),
 }
 
 /// Tunable knobs for the spectrum pipeline.
@@ -180,7 +174,7 @@ struct DecodeTask {
 /// [`VrxTask`] does in FT8/JS8 mode — so both pipelines are byte-for-byte
 /// the same DSP, just with the audio sink + fan-out task stripped out.
 ///
-/// Decoded rows go to the same `WsEvent::Ft8Log` / `JsEvent::Js8Log`
+/// Decoded rows go to the shared `WsEvent::Log` envelope
 /// broadcast the live vrx uses (the UI distinguishes auto rows by the
 /// embedded `VrxState.muted == true`). PSK Reporter spot-ability is
 /// driven by `PSK_CALL` as usual; no separate auto-spot path.
@@ -1002,7 +996,7 @@ impl RadioHub {
     /// headless `VirtualReceiver` + the mode's decoder pipeline for each
     /// in-window entry. `enabled=false` tears down the slot's pipeline.
     ///
-    /// Decodes are pushed on the same `WsEvent::Ft8Log`/`Js8Log` envelope
+    /// Decodes are pushed on the shared `WsEvent::Log` envelope
     /// the live vrx uses; the UI distinguishes auto rows by
     /// `Ft8Decode.vrx.muted == true` (or JS8's `Js8Decode.vrx.muted`),
     /// which `spawn_auto` sets via the synthetic `VrxState`.
@@ -1627,7 +1621,7 @@ fn synthetic_vrx_state(slot: u8, nco_hz: u32, freq_hz: u32, auto_mode: AutoMode)
 /// and, if it has not already been decoded, runs the `mfsk-core` batch
 /// decode (the demod thread's critical section is bounded by
 /// `Ft8Tap::append` and never includes a decode). On success (≥ 1 row) it
-/// broadcasts a `WsEvent::Ft8Log`.
+/// broadcasts a `WsEvent::Log`.
 ///
 /// Same dedicated-standard-thread shape as the JS8 decode thread
 /// ([`spawn_js8_decode`]): all mode decodes live on their own thread with a
@@ -1689,45 +1683,16 @@ fn spawn_ft8_decode(
                 }
                 match res {
                     Ok(msgs) if !msgs.is_empty() => {
-                        let log = Ft8Log {
-                            decodes: msgs.iter().map(|m| mmsg(m, vrx)).collect(),
-                        };
-                        let n = log.decodes.len();
+                        let n = msgs.len();
                         if std::env::var("HL2_DEBUG").is_ok() {
                             eprintln!("[HUB] ft8 slot {slot} decoded {n} row(s)");
                         }
-                        let tune_hz = match session.try_lock() {
-                            Ok(g) => g
-                                .as_ref()
-                                .and_then(|s| s.tuning.get(&vrx_slot).copied())
-                                .unwrap_or(0),
-                            Err(_) => 0,
-                        };
-                        let offset = vrx.offset_hz;
-                        let rf_hz = if tune_hz == 0 {
-                            0
-                        } else {
-                            ((tune_hz as i64) + offset as i64).max(0) as u32
-                        };
-                        let mut spotted = 0usize;
-                        if rf_hz != 0 {
-                            let mut g = pskrep.lock().unwrap();
-                            for m in &msgs {
-                                if g.add_ft8(m, rf_hz) {
-                                    spotted += 1;
-                                }
-                            }
-                        }
+                        let rf_hz = rf_for_vrx(&session, vrx_slot, vrx.offset_hz);
+                        let (log, spotted) = on_decodes(&msgs, vrx, rf_hz, &pskrep);
+                        let _ = fanout.send(WsEvent::Log(log));
                         if spotted > 0 && std::env::var("HL2_DEBUG").is_ok() {
-                            eprintln!(
-                                "[HUB] ft8 slot {slot}: {spotted} spot(s) queued for pskreporter"
-                            );
+                            eprintln!("[HUB] ft8 slot {slot}: {spotted} spot(s) queued");
                         }
-                        // Fire-and-forget broadcast: if all websockets are
-                        // gone (or lagged) the send returns `Err`, and
-                        // that's fine — the slot is already marked decoded,
-                        // no retry.
-                        let _ = fanout.send(WsEvent::Ft8Log(log));
                     }
                     Ok(_) => {} // silence / no CRC-pass hit — no broadcast.
                     Err(e) => {
@@ -1745,32 +1710,69 @@ fn spawn_ft8_decode(
     }
 }
 
-/// Map an `hl2::receiver::Ft8Message` to its wire `hl2_common::Ft8Decode`,
-/// stamping the producing receiver's [`VrxState`] (slot, NCO offset, mode,
-/// bandwidth, gain) onto the row so the UI can attribute the decode to the
-/// exact receiver — not just the slot.
-fn mmsg(m: &hl2::receiver::Ft8Message, vrx: VrxState) -> Ft8Decode {
-    Ft8Decode {
-        text: m.text.clone(),
-        freq_hz: m.freq_hz,
-        dt_sec: m.dt_sec,
-        snr_db: m.snr_db,
-        slot_ms: m.slot_ms,
-        vrx,
+/// The shared decode tail (all digital modes): build the mode-agnostic
+/// [`hl2_common::DecodeLog`] by reading each message through the
+/// [`hl2_common::DecodedMessage`] trait, spot each qualifying message into
+/// the PSK Reporter sink, and return the log (to broadcast) + the number of
+/// spots queued.
+///
+/// `rf_hz` is the passband centre the rows were decoded against
+/// (`0` = untun­ed — no spots are posted). This is the *single* place the
+/// API branches on "was this spot-able" — everything mode-specific (the
+/// call/locator grammar, self-spot suppression) already lives inside each
+/// mode's `DecodedMessage::spot_fields` impl.
+fn on_decodes<T: hl2_common::DecodedMessage>(
+    msgs: &[T],
+    vrx: VrxState,
+    rf_hz: u32,
+    pskrep: &crate::pskrep_hook::SharedPsk,
+) -> (hl2_common::DecodeLog, usize) {
+    let log = hl2_common::DecodeLog {
+        decodes: msgs.iter().map(|m| decode_row(m, vrx)).collect(),
+    };
+    let mut spotted = 0usize;
+    if rf_hz != 0 {
+        let mut g = pskrep.lock().unwrap();
+        for m in msgs {
+            if g.spot(m, rf_hz) {
+                spotted += 1;
+            }
+        }
+    }
+    (log, spotted)
+}
+
+/// The passband centre an vrx's rows were decoded against: the slot's NCO
+/// plus the receiver's own offset. `0` when the slot is untuned (the sink
+/// then posts no spots).
+fn rf_for_vrx(session: &std::sync::Arc<Mutex<Option<Session>>>, slot: u8, offset_hz: i32) -> u32 {
+    let tune_hz = match session.try_lock() {
+        Ok(g) => g
+            .as_ref()
+            .and_then(|s| s.tuning.get(&slot).copied())
+            .unwrap_or(0),
+        Err(_) => 0,
+    };
+    if tune_hz == 0 {
+        0
+    } else {
+        ((tune_hz as i64) + offset_hz as i64).max(0) as u32
     }
 }
 
-/// Map an `hl2::receiver::Ft4Message` to its wire `hl2_common::Ft4Decode`,
-/// stamping the producing receiver's [`VrxState`] (slot, NCO offset, mode,
-/// bandwidth, gain) onto the row so the UI can attribute the decode to the
-/// exact receiver — not just the slot.
-fn mmsg_ft4(m: &hl2::receiver::Ft4Message, vrx: VrxState) -> Ft4Decode {
-    Ft4Decode {
-        text: m.text.clone(),
-        freq_hz: m.freq_hz,
-        dt_sec: m.dt_sec,
-        snr_db: m.snr_db,
-        slot_ms: m.slot_ms,
+/// Map one decoded message (any digital mode) to its wire
+/// [`hl2_common::DecodeRow`], stamping the producing receiver's
+/// [`VrxState`] (slot, NCO offset, mode, bandwidth, gain) onto the row so
+/// the UI can attribute the decode to the exact receiver — not just the
+/// slot. Reads everything through the [`hl2_common::DecodedMessage`] trait,
+/// so a new mode needs no API-layer change here.
+fn decode_row<T: hl2_common::DecodedMessage>(m: &T, vrx: VrxState) -> hl2_common::DecodeRow {
+    hl2_common::DecodeRow {
+        text: m.display().to_string(),
+        freq_hz: m.freq_hz(),
+        dt_sec: m.dt_sec(),
+        snr_db: m.snr_db(),
+        slot_ms: m.slot_ms(),
         vrx,
     }
 }
@@ -1837,45 +1839,16 @@ fn spawn_ft4_decode(
                 }
                 match res {
                     Ok(msgs) if !msgs.is_empty() => {
-                        let log = Ft4Log {
-                            decodes: msgs.iter().map(|m| mmsg_ft4(m, vrx)).collect(),
-                        };
-                        let n = log.decodes.len();
+                        let n = msgs.len();
                         if std::env::var("HL2_DEBUG").is_ok() {
                             eprintln!("[HUB] ft4 slot {slot} decoded {n} row(s)");
                         }
-                        let tune_hz = match session.try_lock() {
-                            Ok(g) => g
-                                .as_ref()
-                                .and_then(|s| s.tuning.get(&vrx_slot).copied())
-                                .unwrap_or(0),
-                            Err(_) => 0,
-                        };
-                        let offset = vrx.offset_hz;
-                        let rf_hz = if tune_hz == 0 {
-                            0
-                        } else {
-                            ((tune_hz as i64) + offset as i64).max(0) as u32
-                        };
-                        let mut spotted = 0usize;
-                        if rf_hz != 0 {
-                            let mut g = pskrep.lock().unwrap();
-                            for m in &msgs {
-                                if g.add_ft4(m, rf_hz) {
-                                    spotted += 1;
-                                }
-                            }
-                        }
+                        let rf_hz = rf_for_vrx(&session, vrx_slot, vrx.offset_hz);
+                        let (log, spotted) = on_decodes(&msgs, vrx, rf_hz, &pskrep);
+                        let _ = fanout.send(WsEvent::Log(log));
                         if spotted > 0 && std::env::var("HL2_DEBUG").is_ok() {
-                            eprintln!(
-                                "[HUB] ft4 slot {slot}: {spotted} spot(s) queued for pskreporter"
-                            );
+                            eprintln!("[HUB] ft4 slot {slot}: {spotted} spot(s) queued");
                         }
-                        // Fire-and-forget broadcast: if all websockets are
-                        // gone (or lagged) the send returns `Err`, and
-                        // that's fine — the slot is already marked decoded,
-                        // no retry.
-                        let _ = fanout.send(WsEvent::Ft4Log(log));
                     }
                     Ok(_) => {} // silence / no CRC-pass hit — no broadcast.
                     Err(e) => {
@@ -1954,43 +1927,20 @@ fn spawn_js8_decode(
                     .unwrap_or(0);
                 match js8_step(&shared, now_ms) {
                     Ok(msgs) if !msgs.is_empty() => {
-                        let log = Js8Log {
-                            decodes: msgs.iter().map(|m| jmsg(m, vrx)).collect(),
-                        };
-                        let n = log.decodes.len();
+                        let n = msgs.len();
                         if std::env::var("HL2_DEBUG").is_ok() {
                             eprintln!("[HUB] js8 step decoded {n} frame(s)");
                         }
-                        let tune_hz = match session.try_lock() {
-                            Ok(g) => g
-                                .as_ref()
-                                .and_then(|s| s.tuning.get(&vrx_slot).copied())
-                                .unwrap_or(0),
-                            Err(_) => 0,
-                        };
-                        let offset = vrx.offset_hz;
-                        let rf_hz = if tune_hz == 0 {
-                            0
-                        } else {
-                            ((tune_hz as i64) + offset as i64).max(0) as u32
-                        };
-                        let mut spotted = 0usize;
-                        if rf_hz != 0 {
-                            let mut g = pskrep.lock().unwrap();
-                            for m in &msgs {
-                                if g.add_js8(m, rf_hz) {
-                                    spotted += 1;
-                                }
-                            }
-                        }
+                        let rf_hz = rf_for_vrx(&session, vrx_slot, vrx.offset_hz);
+                        let (log, spotted) = on_decodes(&msgs, vrx, rf_hz, &pskrep);
                         if spotted > 0 && std::env::var("HL2_DEBUG").is_ok() {
-                            eprintln!("[HUB] js8: {spotted} spot(s) queued for pskreporter");
+                            eprintln!("[HUB] js8: {spotted} spot(s) queued");
                         }
                         // Fire-and-forget broadcast: if all websockets are
                         // gone (or lagged) the send returns `Err`, and
                         // that's fine — dedup / re-arm is in the decoder,
                         // not in us, so no retry.
-                        let _ = fanout.send(WsEvent::Js8Log(log));
+                        let _ = fanout.send(WsEvent::Log(log));
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -2005,31 +1955,6 @@ fn spawn_js8_decode(
     DecodeTask {
         stop,
         thread: Some(th),
-    }
-}
-
-/// Map an `hl2::receiver::Js8Message` to its wire `hl2_common::Js8Decode`,
-/// stamping the producing receiver's [`VrxState`] (slot, NCO offset, mode,
-/// bandwidth, gain) onto the row so the UI can attribute the decode to the
-/// exact receiver — not just the slot.
-fn jmsg(m: &hl2::receiver::Js8Message, vrx: VrxState) -> Js8Decode {
-    let f = &m.frame;
-    Js8Decode {
-        // "JS8X" → 'X'
-        submode: m.submode.chars().nth(3).unwrap_or('A'),
-        kind: f.kind,
-        callsign: f.callsign.clone(),
-        to: f.to.clone(),
-        grid: f.grid.clone(),
-        cmd: f.cmd.clone(),
-        num: f.num,
-        text: f.text.clone(),
-        message: f.message.clone(),
-        freq_hz: m.freq_hz,
-        dt_sec: m.dt_sec,
-        snr_db: m.snr_db,
-        slot_ms: m.slot_ms,
-        vrx,
     }
 }
 

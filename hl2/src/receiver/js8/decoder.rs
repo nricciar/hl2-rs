@@ -29,6 +29,8 @@ use crate::receiver::js8::msg::DecodedFrame;
 use crate::receiver::js8::params::MODES;
 use crate::receiver::js8::sync::{Spectra, sync_pass};
 
+use hl2_common::{DecodedMessage, SpotFields, SpotStation};
+
 // ────────────────────────────────────────────────────────────────────────────
 // Constants
 
@@ -105,6 +107,126 @@ pub struct Js8Message {
     /// (ms since Unix epoch; `decode_step` stamps it from the demod's
     /// sample count, which is monotonic and matches the buffer content).
     pub slot_ms: u64,
+}
+
+impl DecodedMessage for Js8Message {
+    fn freq_hz(&self) -> f32 {
+        self.freq_hz
+    }
+    fn dt_sec(&self) -> f32 {
+        self.dt_sec
+    }
+    fn snr_db(&self) -> f32 {
+        self.snr_db
+    }
+    fn slot_ms(&self) -> u64 {
+        self.slot_ms
+    }
+    fn mode(&self) -> &'static str {
+        // Plain "JS8" — js8call posts a single mode name (mainwindow.cpp:9611)
+        // regardless of speed, so the collector's mode filter matches. We do
+        // not post speed-specific JS8A/B/C/E (those are not a filter option).
+        "JS8"
+    }
+    fn display(&self) -> &str {
+        &self.frame.message
+    }
+    fn spot_fields(&self, st: &SpotStation) -> Option<SpotFields> {
+        js8_spot_fields(&self.frame, st)
+    }
+}
+
+/// Spot-selection for one decoded JS8 frame, mirroring the WSJT selector but
+/// driven by the structured fields (JS8 is a protocol, not free text).
+///
+/// js8call spots **any** received frame that carries a sender — the locator
+/// is only added when a grid square is present (mainwindow.cpp
+/// `logCallActivity` + `processSpots`: directed frames and `CALL:`-prefixed
+/// data frames are queued without a grid). So a spot requires a non-empty
+/// **caller**, with `locator = grid` when that is a valid square.
+///
+/// The caller is taken from:
+///   * the structured `callsign` field — heartbeats / compounds /
+///     compound-directed (`callsign` + optional `grid`) and directed frames
+///     (`callsign` = the `from`) which carry no grid;
+///   * else the first word of the free-text data payload only when it leads
+///     the message as `CALL:` (js8call mainwindow.cpp:8292-8306), the other
+///     common case; e.g. `K1ABC: ...`.
+///
+/// Self-spotting: suppress when the caller matches our base callsign **and**
+/// either (a) the locator matches our 4-char grid, or (b) the frame carries
+/// no locator at all. A different grid with the same base call still spots
+/// (mobile on our base).
+fn js8_spot_fields(
+    f: &crate::receiver::js8::msg::DecodedFrame,
+    st: &SpotStation,
+) -> Option<SpotFields> {
+    use crate::receiver::js8::msg::{
+        FRAME_COMPOUND, FRAME_COMPOUND_DIRECTED, FRAME_DIRECTED, FRAME_HEARTBEAT,
+    };
+    use hl2_common::spot::{base_callsign, grid_is_square};
+
+    let kind = f.kind;
+
+    // Choose the sender: structured fields first, then a leading `CALL:`
+    // word on data frames.
+    let structured_call = f.callsign.trim();
+    let call = if matches!(
+        kind,
+        FRAME_HEARTBEAT | FRAME_COMPOUND | FRAME_COMPOUND_DIRECTED | FRAME_DIRECTED
+    ) && !structured_call.is_empty()
+    {
+        Some(structured_call)
+    } else {
+        data_frame_caller(f)
+    };
+    let Some(call) = call else {
+        return None;
+    };
+
+    // Locator: only a valid square, never a command name; otherwise empty.
+    let grid_raw = f.grid.as_deref().unwrap_or("").trim();
+    let grid: Option<&str> = grid_is_square(grid_raw).then_some(grid_raw);
+
+    // Self-spot suppression: caller matches our base call **and** the grid
+    // matches ours too — or the frame carries no grid at all (directed /
+    // data-frame `CALL:`), in which case the matching callsign is enough
+    // (that is how *our* directed messages would look). A different grid with
+    // the same base call (a mobile on our base) still spots.
+    let base_call = base_callsign(&st.callsign);
+    if !base_call.is_empty() {
+        let g4: String = st.grid.chars().take(4).collect();
+        let caller_matches = call.eq_ignore_ascii_case(base_call);
+        let grid_matches = grid.is_some_and(|g| g.eq_ignore_ascii_case(g4.as_str()));
+        if caller_matches && (grid.is_none() || grid_matches) {
+            return None;
+        }
+    }
+
+    Some(SpotFields {
+        caller: call.to_ascii_uppercase(),
+        locator: grid.map(str::to_ascii_uppercase).unwrap_or_default(),
+    })
+}
+
+/// For a JS8 free-text (data) frame, the leading sender when the payload
+/// starts a directed message as `CALL:` — js8call's data-frame spotting rule
+/// (mainwindow.cpp:8292-8306: first word callsign immediately followed by
+/// `:`). Returns `None` when the text does not follow that shape.
+fn data_frame_caller(f: &crate::receiver::js8::msg::DecodedFrame) -> Option<&str> {
+    let t = f.text.trim();
+    let pos = t.find(':')?;
+    let head = t[..pos].trim();
+    let w: Vec<&str> = head.split_whitespace().collect();
+    if w.len() != 1 {
+        return None;
+    }
+    let call = w[0];
+    let b = call.as_bytes();
+    let ok = !call.is_empty()
+        && b.iter()
+            .all(|c| c.is_ascii_alphanumeric() || *c == b'/' || *c == b'.' || *c == b'@');
+    if ok { Some(call) } else { None }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -786,5 +908,149 @@ mod tests {
             "10 dB ({a}) reported {ar} but 0 dB ({c}) reported {cr} — not monotonic"
         );
         assert!(ar > -10.0, "10 dB true SNR reported {ar} dB (floor?)");
+    }
+
+    use crate::receiver::js8::msg::{
+        DecodedFrame, FRAME_COMPOUND, FRAME_DIRECTED, FRAME_HEARTBEAT,
+    };
+    use hl2_common::SpotStation;
+
+    fn js8_base() -> Js8Message {
+        Js8Message {
+            frame: DecodedFrame {
+                kind: FRAME_HEARTBEAT,
+                callsign: String::new(),
+                to: None,
+                grid: None,
+                cmd: None,
+                num: None,
+                bits3: 0,
+                is_alt: false,
+                text: String::new(),
+                message: String::new(),
+            },
+            submode: "JS8A",
+            mode_id: 0,
+            freq_hz: 1_500.0,
+            dt_sec: 0.48,
+            snr_db: 11.0,
+            slot_ms: 1_700_000_015_000,
+        }
+    }
+
+    fn js8msg(callsign: &str, grid: Option<&str>) -> Js8Message {
+        let mut m = js8_base();
+        m.frame.kind = FRAME_HEARTBEAT;
+        m.frame.callsign = callsign.into();
+        m.frame.grid = grid.map(str::to_string);
+        m
+    }
+
+    fn js8_dir(from: &str, to: &str, cmd: &str) -> Js8Message {
+        let mut m = js8_base();
+        m.frame.kind = FRAME_DIRECTED;
+        m.frame.callsign = from.into();
+        m.frame.to = Some(to.into());
+        m.frame.cmd = Some(cmd.into());
+        m.frame.grid = None;
+        m
+    }
+
+    fn js8_compound(callsign: &str, grid: &str) -> Js8Message {
+        let mut m = js8_base();
+        m.frame.kind = FRAME_COMPOUND;
+        m.frame.callsign = callsign.into();
+        m.frame.grid = Some(grid.into());
+        m
+    }
+
+    fn js8_data(text: &str) -> Js8Message {
+        let mut m = js8_base();
+        m.frame.kind = DecodedFrame::KIND_DATA_JSC;
+        m.frame.callsign = String::new();
+        m.frame.grid = None;
+        m.frame.text = text.into();
+        m.frame.message = text.into();
+        m
+    }
+
+    fn st() -> SpotStation {
+        SpotStation::new("K9ABC", "FN31")
+    }
+
+    #[test]
+    fn js8_heartbeat_spots_call_and_grid() {
+        let s = js8msg("R7IW", Some("LN35"))
+            .spot_fields(&st())
+            .expect("spots");
+        assert_eq!(s.caller, "R7IW");
+        assert_eq!(s.locator, "LN35");
+    }
+
+    #[test]
+    fn js8_heartbeat_without_grid_still_spots() {
+        let s = js8msg("R7IW", None).spot_fields(&st()).expect("spots");
+        assert_eq!(s.caller, "R7IW");
+        assert_eq!(s.locator, "");
+    }
+
+    #[test]
+    fn js8_directed_frame_spots_from_call_without_grid() {
+        let s = js8_dir("R7IW", "K9ABC", "SNR")
+            .spot_fields(&st())
+            .expect("directed");
+        assert_eq!(s.caller, "R7IW");
+        assert_eq!(s.locator, "");
+    }
+
+    #[test]
+    fn js8_compound_spots_call_and_grid() {
+        let s = js8_compound("R7IW", "LN35")
+            .spot_fields(&st())
+            .expect("compound");
+        assert_eq!(s.caller, "R7IW");
+        assert_eq!(s.locator, "LN35");
+    }
+
+    #[test]
+    fn js8_data_frame_leading_call_spots() {
+        let s = js8_data("K1ABC: Hello there")
+            .spot_fields(&st())
+            .expect("data CALL: lead");
+        assert_eq!(s.caller, "K1ABC");
+        assert_eq!(s.locator, "");
+    }
+
+    #[test]
+    fn js8_data_frame_without_call_does_not_spot() {
+        assert!(js8_data("HELLO WORLD").spot_fields(&st()).is_none());
+    }
+
+    #[test]
+    fn js8_bad_grid_becomes_empty_locator() {
+        let s = js8msg("K1ABC", Some("FN4"))
+            .spot_fields(&st())
+            .expect("spots");
+        assert_eq!(s.caller, "K1ABC");
+        assert_eq!(s.locator, "");
+    }
+
+    #[test]
+    fn js8_no_call_does_not_spot() {
+        let mut m = js8_base();
+        m.frame.kind = FRAME_HEARTBEAT;
+        m.frame.callsign = String::new();
+        assert!(m.spot_fields(&st()).is_none());
+    }
+
+    #[test]
+    fn js8_self_spot_is_suppressed() {
+        assert!(js8msg("K9ABC", Some("FN31")).spot_fields(&st()).is_none());
+        assert!(js8msg("K9ABC", Some("PM95")).spot_fields(&st()).is_some());
+    }
+
+    #[test]
+    fn js8_self_directed_is_suppressed() {
+        assert!(js8_dir("K9ABC", "R7IW", "SNR").spot_fields(&st()).is_none());
     }
 }
