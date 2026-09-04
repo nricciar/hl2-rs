@@ -131,7 +131,13 @@ struct VrxTask {
     /// the UI's per-slot S-meter stays alive.
     meter: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// The demod std thread — owns the `VirtualReceiver` and reads the
-    /// shared `BasebandRing`. `JoinHandle` lets `stop` flush + join.
+    /// shared `BasebandRing` it was spawned against. `JoinHandle` lets
+    /// `stop` flush + join. The hub re-spawns this whole task whenever the
+    /// slot's activation changes (see `rebind_vrx_on_activate`) — we do
+    /// NOT need to track the captured ring here; the library's own
+    /// `Hl2::is_slot_active` tells the hub whether the slot is currently
+    /// activated, and that is the only activation state the idempotency
+    /// checks need.
     demod: Option<std::thread::JoinHandle<()>>,
     /// The coalescing tokio fan-out task that drains `buf` and broadcasts
     /// `WsEvent::Audio` frames. Aborted on stop.
@@ -826,6 +832,19 @@ impl RadioHub {
         };
         let (state0, _) = self.snapshot().await;
 
+        // Does this tune *activate* the slot (i.e. it wasn't active before)?
+        // We capture the pre-tune state now so the predicate is stable by
+        // the time `h.tune` has run and registered the slot in the
+        // `BasebandFanout` (side effect of `Hl2::tune`; see the
+        // `Hl2::is_slot_active` doc). If the slot was already active and
+        // this is a plain retune, the fan-out retains the same ring `Arc`
+        // across `register_slot` calls, so any vrx running on this slot
+        // still points at the right ring and needs no re-spawn.
+        let activates = match &ctrl {
+            Some(c) => !c.is_slot_active(slot),
+            None => false,
+        };
+
         match ctrl {
             Some(c) => match c.tune(slot, freq_hz).await {
                 Ok(()) => {
@@ -862,6 +881,9 @@ impl RadioHub {
                     }
                     if torn > 0 && std::env::var("HL2_DEBUG").is_ok() {
                         eprintln!("[HUB] {torn} auto pipeline(s) torn down (Tune slot={slot})");
+                    }
+                    if activates {
+                        self.rebind_vrx_on_activate(slot).await;
                     }
                     let (state, _) = self.snapshot().await;
                     ServerResponse::ok(id, &state)
@@ -977,6 +999,48 @@ impl RadioHub {
                 if !started {
                     return ServerResponse::err(id, &state0, "HL2 not started");
                 }
+                // Idempotency: if this slot already has a vrx whose config
+                // matches the request *and* the slot is currently activated,
+                // return the current snapshot without tearing down and
+                // re-spawning the demod thread. UI reconciliation can (and
+                // does) re-send `setvrx` for the active tab on every stale
+                // echo it cannot match against a fresh response — a
+                // rebuild-per-command would churn the demod, reset AGC
+                // state, and spam `vrx started` logs endlessly. Equality is
+                // on (slot, mode, bw, gain, offset); `muted` is deliberately
+                // NOT part of it (mute is a separate command, and a stale-mute
+                // `setvrx` must not force a rebuild just because the mute
+                // intent changed).
+                //
+                // Activation matters too: `Hl2::baseband_ring(slot)` resolves
+                // to the slot's *dedicated* ring only once `tune(slot, ..)`
+                // has registered it in the fan-out (the first successful
+                // tune does this), and falls back to the position-0 (RX1)
+                // ring until then. A receiver spawned *before* its slot was
+                // tuned is therefore demodulating the wrong ring; we must
+                // re-spawn it against the now-dedicated ring. The library
+                // exposes `Hl2::is_slot_active(slot)` for exactly this
+                // predicate — the hub asks the library instead of re-deriving
+                // "is this slot alive" from its own bookkeeping. `tune_cmd`
+                // re-binds any affected vrx as the slot comes online (see
+                // `rebind_vrx_on_activate`), so the two paths agree without
+                // comparing ring-handle identity.
+                let up_to_date = {
+                    let guard = self.session.lock().await;
+                    guard.as_ref().is_some_and(|s| {
+                        s.ctrl.is_slot_active(c.slot)
+                            && s.vrx.get(&c.slot).is_some_and(|existing| {
+                                existing.state.mode == c.mode
+                                    && existing.state.bw_hz == c.bw_hz
+                                    && (existing.state.gain_db - c.gain_db).abs() < 1e-6
+                                    && existing.state.offset_hz == c.offset_hz
+                            })
+                    })
+                };
+                if up_to_date {
+                    let (state, _) = self.snapshot().await;
+                    return ServerResponse::ok(id, &state);
+                }
                 // Rebuild only *this* slot's pipeline (other slots keep
                 // streaming). Extract-under-lock, stop-outside-lock (see
                 // `VrxTask::stop` doc): the decode-thread join can block for
@@ -1072,6 +1136,123 @@ impl RadioHub {
         }
         let (state, _) = self.snapshot().await;
         ServerResponse::ok(id, &state)
+    }
+
+    /// Re-bind the virtual receiver on `slot` to the slot's *current*
+    /// baseband ring, preserving the operator's existing config (mode / bw /
+    /// gain / offset).
+    ///
+    /// Why: a `VrxTask`'s demod thread binds to a specific `BasebandRing`
+    /// `Arc` at spawn time (see `spawn_vrx`). `Hl2::baseband_ring(slot)`
+    /// resolves to the slot's *dedicated* ring only once the slot has been
+    /// registered in the `BasebandFanout` — which happens as a side effect
+    /// of the first successful `tune(slot, f≠0)`. Before that, it falls
+    /// back to the position-0 (RX1) ring. A vrx therefore spawned *before*
+    /// its slot was tuned is demodulating the wrong ring: the UI's audio
+    /// (and any decoders on it) track RX1, not this slot.
+    ///
+    /// The hub is the one that sends `tune`, so *it* can keep the vrx in
+    /// sync: when a tune *activates* a slot (it wasn't active before), any
+    /// vrx currently running on that slot is still bound to the fallback
+    /// (RX1) ring. Re-resolve the ring and re-spawn the vrx against the
+    /// newly-registered dedicated one. The "was it active?" predicate is
+    /// the library's own — `Hl2::is_slot_active(slot)` — so the hub's
+    /// decision is a contract with the library, not a re-derivation from
+    /// hub-internal bookkeeping. `set_vrx_cmd` uses the same predicate (via
+    /// `s.ctrl.is_slot_active`) in its idempotency gate, so the two paths
+    /// agree.
+    ///
+    /// Only reachable when there is actually a vrx running on the slot and
+    /// the tune just activated it. A plain *retune* of an already-active
+    /// slot is not routed here: the fan-out retains the same `Arc` for the
+    /// slot across `register_slot` calls (see
+    /// `BasebandFanout::register_slot`), so the running demod's ring handle
+    /// is still valid for the new NCO.
+    ///
+    /// Mirrors the extract-under-lock → stop-outside-lock → spawn → insert
+    /// sequence in `set_vrx_cmd`: there is never a window with two vrx tasks
+    /// on the same slot, and the session `tokio::sync::Mutex` is held only
+    /// long enough to do the map operations (`VrxTask::stop` can block for
+    /// up to one decoder burst, ~1-3 s, on the decode-thread join).
+    async fn rebind_vrx_on_activate(&self, slot: u8) {
+        // Extract the slot's existing vrx under the lock, reading its config
+        // and mute intent out (we're about to drop the `VrxTask`, so we
+        // must carry both forward for the replacement). Mirrors the
+        // extract-under-lock start of `set_vrx_cmd`'s rebuild path — except
+        // that `set_vrx_cmd` rebuilds from an explicit operator request, so
+        // the mute intent re-asserts via a follow-up `setvrxmute` the UI
+        // already sends; here we must preserve the prior state directly so
+        // the new vrx comes up in the operator's mute mode.
+        let mut old_vrx: Option<VrxTask> = None;
+        let mut cfg: Option<hl2_common::VrxCfg> = None;
+        let mut kept_muted: bool = false;
+        {
+            let mut guard = self.session.lock().await;
+            if let Some(s) = guard.as_mut() {
+                if let Some(v) = s.vrx.remove(&slot) {
+                    kept_muted = v.muted.load(std::sync::atomic::Ordering::Relaxed);
+                    cfg = Some(hl2_common::VrxCfg {
+                        slot: v.state.slot,
+                        offset_hz: v.state.offset_hz,
+                        mode: v.state.mode,
+                        bw_hz: v.state.bw_hz,
+                        gain_db: v.state.gain_db,
+                    });
+                    old_vrx = Some(v);
+                }
+            }
+        }
+        // Nothing to re-bind — no vrx was running on this slot. `set_vrx`
+        // will spawn one (now that the slot is activated, it picks up the
+        // correct dedicated ring).
+        let Some(cfg) = cfg else {
+            return;
+        };
+        // Stop the old pipeline off the lock. `muted` has already been
+        // captured; the new vrx will be set back to it after `spawn_vrx`.
+        if let Some(mut v) = old_vrx {
+            v.stop();
+        }
+        // Resolve the slot's *current* ring. Now that the tune has run (and
+        // this is only called on activation transitions), this is the
+        // slot's dedicated ring, not the fallback.
+        let ring = {
+            let guard = self.session.lock().await;
+            guard.as_ref().map(|s| s.ctrl.baseband_ring(slot))
+        };
+        let Some(ring) = ring else {
+            return;
+        };
+        match spawn_vrx(
+            ring,
+            self.fanout.clone(),
+            &cfg,
+            self.session.clone(),
+            self.pskrep.clone(),
+        )
+        .await
+        {
+            Ok(mut new_vrx) => {
+                // Restore the operator's mute intent onto the fresh task
+                // before the map swap (see the capture above).
+                new_vrx
+                    .muted
+                    .store(kept_muted, std::sync::atomic::Ordering::Relaxed);
+                new_vrx.state.muted = kept_muted;
+                {
+                    let mut guard = self.session.lock().await;
+                    if let Some(s) = guard.as_mut() {
+                        s.vrx.insert(slot, new_vrx);
+                    }
+                }
+                if std::env::var("HL2_DEBUG").is_ok() {
+                    eprintln!("[HUB] vrx re-bound for slot={slot} after tune (dedicated ring)");
+                }
+            }
+            Err(e) => {
+                eprintln!("[HUB] vrx rebind after tune slot={slot} failed: {e}");
+            }
+        }
     }
 
     /// Enable / disable auto-decode on one RX slot.
