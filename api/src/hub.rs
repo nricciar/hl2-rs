@@ -125,6 +125,11 @@ struct VrxTask {
     /// Mute flag shared with the audio fan-out task. Set via
     /// `ClientCmd::SetVrxMute`; while true the fan-out drains + discards
     muted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Signal-level meter — the demod writes the pre-AGC in-band RMS, in
+    /// dB FS (one-pole smoothed), into this atomic on every emit. The hub
+    /// reads it back in `shared_state` and re-broadcasts on a fast tick so
+    /// the UI's per-slot S-meter stays alive.
+    meter: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// The demod std thread — owns the `VirtualReceiver` and reads the
     /// shared `BasebandRing`. `JoinHandle` lets `stop` flush + join.
     demod: Option<std::thread::JoinHandle<()>>,
@@ -310,6 +315,20 @@ impl std::ops::Drop for VrxTask {
 
 impl Session {
     fn shared_state(&self, state_at: u64, src: &SpectrumSource) -> SharedState {
+        // Per-slot signal-level meter (dB FS) — the demod writes these
+        // atomics every emit; we read and re-broadcast on a fast tick so
+        // the UI's per-slot gauge animates. The floor (−140 dBFS) is
+        // already applied by `meter_tick`; an uninitialised (−120) value
+        // means "silent — gauge at its bottom", the correct resting state.
+        let vrx_levels = self
+            .vrx
+            .iter()
+            .map(|(slot, t)| {
+                let bits = t.meter.load(std::sync::atomic::Ordering::Relaxed);
+                let db = f64::from_bits(bits);
+                (*slot, if db.is_finite() { db } else { -140.0 })
+            })
+            .collect::<std::collections::BTreeMap<u8, f64>>();
         SharedState {
             started: self.started,
             rx_count: self.rx_count,
@@ -323,6 +342,7 @@ impl Session {
             spectrum_center_hz: spectrum_center(&self.tuning, src),
             spectrum_span_hz: spectrum_span(src),
             vrx: self.vrx.values().map(|t| (t.state.slot, t.state)).collect(),
+            vrx_levels,
             auto_monitors: self
                 .auto
                 .iter()
@@ -373,6 +393,15 @@ pub struct RadioHub {
     /// `SharedState::state_at` so UI clients can discard out-of-order
     /// snapshots (last-writer-wins without a lock).
     state_rev: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The periodic "S-meter" re-broadcast task — started alongside
+    /// `run_spectral` on `Start`, aborted on `Stop`. Sends a
+    /// `ServerResponse::welcome` (which carries `vrx_levels`) on a ~100 ms
+    /// cadence so the UI's per-slot gauges don't wait for the next command
+    /// to see a new meter value. Idle when no vrx is running (we check the
+    /// map's length and skip the broadcast; the demod's own emission is
+    /// the write-side, so the read-side is free to tick faster than that
+    /// — the atomic's value just doesn't change).
+    levels_task: std::sync::Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Which stream feeds the spectrum pipeline.
     spectrum_source: std::sync::Arc<std::sync::Mutex<SpectrumSource>>,
     /// Bumped every time `spectrum_source` is replaced so the accumulator in
@@ -401,6 +430,7 @@ impl RadioHub {
             fanout: std::sync::Arc::new(fanout),
             task: std::sync::Arc::new(std::sync::Mutex::new(None)),
             state_rev: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            levels_task: std::sync::Arc::new(std::sync::Mutex::new(None)),
             spectrum_source: std::sync::Arc::new(std::sync::Mutex::new(SpectrumSource::default())),
             spectrum_rev: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pskrep,
@@ -469,6 +499,49 @@ impl RadioHub {
         let _ = self.fanout.send(WsEvent::Json(resp));
     }
 
+    /// Periodically re-broadcast the current `SharedState` (wrapping in
+    /// `ServerResponse::welcome`) so the UI's per-slot S-meter / gauge is
+    /// kept alive between commands.
+    ///
+    /// The demod thread is the *writer* of `vrx_levels` (one atomic per
+    /// vrx, updated every audio emit); nothing else changes the value, so
+    /// the only thing the UI ever sees moving between commands is this
+    /// meter. Commands (Start / Tune / SetVrx / …) each broadcast a fresh
+    /// snapshot, but the meter itself only changes as audio streams — hence
+    /// this ~100 ms tick, which is fast enough for a needle to feel alive
+    /// but slow enough to be negligible CPU (a single snapshot + one
+    /// `BroadcastChannel::send` per tick).
+    ///
+    /// We skip the broadcast when there is no vrx (nothing to show) and when
+    /// the level map hasn't changed since the last tick (no point re-sending
+    /// an identical snapshot — the UI would re-apply the same numbers). The
+    /// comparison is against the *previous* tick's map, not a global "ever
+    /// seen" cache, so a single vrx whose level is stable still produces
+    /// periodic traffic (a needle that should be frozen IS frozen, which is
+    /// the correct visual).
+    ///
+    /// Runs for the life of a session (started in `Start`, aborted in
+    /// `Stop`) — see `levels_task`.
+    async fn run_levels(&self) {
+        let mut tick = tokio::time::interval(tokio::time::Duration::from_millis(100));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last: BTreeMap<u8, f64> = BTreeMap::new();
+        loop {
+            let _ = tick.tick().await;
+            let (state, _) = self.snapshot().await;
+            if state.vrx.is_empty() {
+                last.clear();
+                continue;
+            }
+            if state.vrx_levels == last {
+                continue;
+            }
+            last = state.vrx_levels.clone();
+            let resp = ServerResponse::welcome(&state);
+            let _ = self.fanout.send(WsEvent::Json(resp));
+        }
+    }
+
     /// Snapshot the current shared state (release the session lock first).
     ///
     /// The snapshot is stamped with the current `state_rev`, so a command that
@@ -496,6 +569,7 @@ impl RadioHub {
                     spectrum_span_hz: span_hz,
                     vrx: std::collections::BTreeMap::new(),
                     auto_monitors: std::collections::BTreeMap::new(),
+                    vrx_levels: std::collections::BTreeMap::new(),
                 },
                 None,
             ),
@@ -637,6 +711,16 @@ impl RadioHub {
                     );
                 *self.task.lock().unwrap() = Some(handle);
 
+                // Start the periodic S-meter re-broadcast task.
+                if let Some(old) = self.levels_task.lock().unwrap().take() {
+                    old.abort();
+                }
+                let levels_handle = tokio::spawn({
+                    let self2 = self.clone();
+                    async move { self2.run_levels().await }
+                });
+                *self.levels_task.lock().unwrap() = Some(levels_handle);
+
                 let (state, _) = self.snapshot().await;
                 ServerResponse::ok(id, &state)
             }
@@ -699,6 +783,9 @@ impl RadioHub {
             // are independent of the pump — but aborting first lets the
             // ring's write side close out before we join the demods.)
             if let Some(t) = self.task.lock().unwrap().take() {
+                t.abort();
+            }
+            if let Some(t) = self.levels_task.lock().unwrap().take() {
                 t.abort();
             }
 
@@ -1315,6 +1402,12 @@ async fn spawn_vrx(
         None
     };
 
+    // One atomic the demod writes the pre-AGC in-band dB-FS level into on
+    // every emit. The API reads it back in `shared_state` (via `vrx_levels`)
+    // and re-broadcasts on a fast tick (`run_vrx_levels`) to keep the UI's
+    // per-slot S-meter alive — the demod thread owns the value, so the hub
+    // needs a lock-free shared handle.
+    let meter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new((-120.0f64).to_bits()));
     let rx_cfg = ReceiverConfig {
         mode,
         source_rate_hz: VRX_SOURCE_RATE_HZ,
@@ -1335,6 +1428,7 @@ async fn spawn_vrx(
             gain_db: cfg.gain_db,
         },
         tap,
+        meter: Some(meter.clone()),
     };
     let (sink, buf) = BufSink::pair(hl2::receiver::BUF_SINK_DEFAULT_CAP);
     let rx = VirtualReceiver::new(rx_cfg, Box::new(sink))
@@ -1423,6 +1517,7 @@ async fn spawn_vrx(
         buf,
         stop,
         muted,
+        meter,
         demod: Some(demod),
         fanout: Some(fanout_task),
         ft8: ft8_task,
@@ -1531,6 +1626,7 @@ async fn spawn_auto(
             gain_db: 0.0,
         },
         tap: Some(tap),
+        meter: None,
     };
     let rx = hl2::receiver::VirtualReceiver::new(rx_cfg, Box::new(DropSink::new()))
         .map_err(|e| format!("auto vrx build failed: {e}"))?;

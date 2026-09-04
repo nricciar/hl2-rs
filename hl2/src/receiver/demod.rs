@@ -49,7 +49,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
 use num_complex::Complex;
 
 use super::sink::AudioSink;
-use super::{AudioConfig, Mode, Sideband};
+use super::{AudioConfig, MeterHandle, Mode, Sideband, meter_write};
 
 /// Gated (HL2_DEBUG) instrument counter so we don't flood on every emit.
 static EMIT_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -566,6 +566,12 @@ pub struct SsbDemodulator {
     /// [`RawSampleTap`]). `None` for plain SSB. `Arc` so the API layer can
     /// keep one handle for the demod and hand a clone to the decode task.
     tap: Option<std::sync::Arc<dyn RawSampleTap>>,
+    /// Optional signal-level meter (see [`MeterHandle`]). The demod writes
+    /// the pre-AGC in-band RMS, in dB FS, one-pole smoothed, on every emit.
+    meter: Option<MeterHandle>,
+    /// Running smoothed level (dB FS), for the one-pole filter. Initialised
+    /// to a deep floor so the first emit moves the gauge quickly.
+    meter_smooth: f64,
 }
 
 /// Minimum decimated samples to accumulate before a block is normalised and
@@ -601,6 +607,36 @@ pub trait RawSampleTap: std::fmt::Debug + Send + Sync {
     fn append(&self, samples: &[f32]);
 }
 
+/// Advance the one-pole smoothed S-meter: compute the in-band RMS of the
+/// pre-AGC decimated `f32` stream, express it in dB FS (0 dBFS = full-scale
+/// i16 — the natural "1.0" amplitude maps to −∞ dB, the AGC target
+/// of 0.1 × 32767 maps to ≈ −20 dBFS), apply fast-attack / slow-release
+/// one-pole smoothing, and store the result into the meter atomic.
+///
+/// The smoothing constants are shared between the SSB and digital paths
+/// (one `smooth` accumulator per demod, held in the demod struct so the
+/// `&mut self` borrow inside `emit` suffices — no mutex needed).
+///
+/// `now_db` is floored at −140 dBFS: below that the receiver is "silent"
+/// (only the ADI chain's inherent quantisation noise) and it's kinder to
+/// the gauge to pin the needle at its bottom instead of dropping into the
+/// f64 noise floor.
+pub fn meter_tick(meter: &MeterHandle, smooth: &mut f64, slice: &[f32]) {
+    if slice.is_empty() {
+        return;
+    }
+    let mut ss = 0.0f64;
+    for v in slice {
+        let x = *v as f64;
+        ss += x * x;
+    }
+    let rms = (ss / slice.len() as f64).sqrt();
+    let now_db = (20.0 * (rms.max(1e-7).log10())).max(-140.0).min(0.0);
+    let alpha = if now_db > *smooth { 0.5 } else { 0.05 };
+    *smooth += alpha * (now_db - *smooth);
+    meter_write(meter, *smooth);
+}
+
 impl SsbDemodulator {
     /// The sideband this demodulator was built for.
     pub fn sideband(&self) -> Sideband {
@@ -619,6 +655,11 @@ impl SsbDemodulator {
         // stream, at `audio_cfg.rate_hz`, in arrival order.
         if let Some(tap) = self.tap.as_ref() {
             tap.append(slice);
+        }
+        // S-meter: advance the one-pole smoothed level from the pre-AGC
+        // decimated stream (before the AGC rescales it).
+        if let Some(meter) = self.meter.as_ref() {
+            meter_tick(meter, &mut self.meter_smooth, slice);
         }
         let mut out = vec![0i16; slice.len()];
         let written =
@@ -819,6 +860,7 @@ pub fn make_demod(
         bandwidth_hz,
         audio,
         None,
+        None,
     )
 }
 
@@ -841,6 +883,7 @@ pub fn make_demod_tap(
     bandwidth_hz: u32,
     audio: AudioConfig,
     tap: Option<std::sync::Arc<dyn RawSampleTap>>,
+    meter: Option<MeterHandle>,
 ) -> Result<Box<dyn Demodulator>, DemodError> {
     if matches!(mode, Mode::Ft8 | Mode::Js8 | Mode::Ft4) {
         let label = match mode {
@@ -855,6 +898,7 @@ pub fn make_demod_tap(
             audio,
             tap,
             label,
+            meter,
         )?));
     }
     let sideband = match mode {
@@ -897,6 +941,8 @@ pub fn make_demod_tap(
         agc_gain: 1000.0,
         audio_buf: Vec::with_capacity(256),
         tap,
+        meter,
+        meter_smooth: -120.0,
     }))
 }
 
@@ -930,6 +976,10 @@ pub struct DigitalDemodulator {
     /// Pre-AGC raw-sample tap the FT8 slot decoder hangs off (see
     /// [`super::ft8::Ft8Tap`]). `None` if the mode was built without one.
     tap: Option<std::sync::Arc<dyn RawSampleTap>>,
+    /// Optional signal-level meter. See [`SsbDemodulator::meter`].
+    meter: Option<MeterHandle>,
+    /// Running smoothed level (dB FS), for the one-pole filter.
+    meter_smooth: f64,
 }
 
 impl DigitalDemodulator {
@@ -942,6 +992,7 @@ impl DigitalDemodulator {
         audio: AudioConfig,
         tap: Option<std::sync::Arc<dyn RawSampleTap>>,
         mode_label: &'static str,
+        meter: Option<MeterHandle>,
     ) -> Result<Self, DemodError> {
         let m = source_rate_hz as usize / audio.rate_hz as usize;
         if m < 4 {
@@ -974,6 +1025,8 @@ impl DigitalDemodulator {
             audio_buf: Vec::with_capacity(256),
             tap,
             mode_label,
+            meter,
+            meter_smooth: -120.0,
         })
     }
 
@@ -984,6 +1037,11 @@ impl DigitalDemodulator {
         // stream, at `audio_cfg.rate_hz`, in arrival order.
         if let Some(tap) = self.tap.as_ref() {
             tap.append(slice);
+        }
+        // S-meter: advance the one-pole smoothed level from the pre-AGC
+        // decimated stream (before the AGC rescales it).
+        if let Some(meter) = self.meter.as_ref() {
+            meter_tick(meter, &mut self.meter_smooth, slice);
         }
         let mut out = vec![0i16; slice.len()];
         let written =
@@ -1226,7 +1284,7 @@ mod tests {
             let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::<f32>::new()));
             let tap = std::sync::Arc::new(VecF32Tap::new(sink.clone()));
             let mut demod: Box<dyn Demodulator> =
-                make_demod_tap(Mode::Ft8, rate, 0.0, 2_600, cfg, Some(tap)).expect("build");
+                make_demod_tap(Mode::Ft8, rate, 0.0, 2_600, cfg, Some(tap), None).expect("build");
             let iq = complex_sine(rate, f_hz, n, 0.5);
             let mut vec_sink = VecSink::new();
             let _ = demod.demod(&iq, &mut vec_sink).expect("demod");
@@ -1306,7 +1364,8 @@ mod tests {
             let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::<f32>::new()));
             let tap = std::sync::Arc::new(VecF32Tap::new(sink.clone()));
             let mut demod: Box<dyn Demodulator> =
-                make_demod_tap(Mode::Ft8, rate, nco_hz, 2_600, cfg, Some(tap)).expect("build");
+                make_demod_tap(Mode::Ft8, rate, nco_hz, 2_600, cfg, Some(tap), None)
+                    .expect("build");
             let iq = complex_sine(rate, f_in, n, 0.5);
             let mut vec_sink = VecSink::new();
             let _ = demod.demod(&iq, &mut vec_sink).expect("demod");
@@ -1332,7 +1391,7 @@ mod tests {
         let dc_sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::<f32>::new()));
         let dc_tap = std::sync::Arc::new(VecF32Tap::new(dc_sink.clone()));
         let mut demod_dc: Box<dyn Demodulator> =
-            make_demod_tap(Mode::Ft8, rate, 0.0, 2_600, cfg, Some(dc_tap)).expect("build");
+            make_demod_tap(Mode::Ft8, rate, 0.0, 2_600, cfg, Some(dc_tap), None).expect("build");
         let iq_dc = complex_sine(rate, 1_500.0, n, 0.5);
         let mut ws = VecSink::new();
         let _ = demod_dc.demod(&iq_dc, &mut ws).expect("demod");

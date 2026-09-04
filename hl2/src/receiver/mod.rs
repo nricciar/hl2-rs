@@ -161,6 +161,25 @@ impl Mode {
     }
 }
 
+/// A level meter: the demod writes the current pre-AGC in-band RMS, in
+/// dB FS (0 dBFS = full-scale), into this atomic on every audio emit,
+/// one-pole smoothed. `u64` holds the IEEE-754 bits of the `f64` value,
+/// so the demod thread and the API read-back need no lock.
+///
+/// `None` (no meter) means the level is not tracked — receivers without a
+/// gauge (auto-decode, plain capture) don't pay the per-emit cost.
+pub type MeterHandle = std::sync::Arc<std::sync::atomic::AtomicU64>;
+
+/// Write an `f64` level (dB FS) into a [`MeterHandle`].
+pub fn meter_write(meter: &MeterHandle, level_db: f64) {
+    meter.store(level_db.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the current level (dB FS) from a [`MeterHandle`].
+pub fn meter_read(meter: &MeterHandle) -> f64 {
+    f64::from_bits(meter.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Audio output parameters (mono).
 #[derive(Debug, Clone, Copy)]
 pub struct AudioConfig {
@@ -198,6 +217,12 @@ pub struct ReceiverConfig {
     /// Optional pre-AGC raw-sample tap (FT8 decode — see
     /// [`RawSampleTap`]). `None` for plain SSB / wide pass-through.
     pub tap: Option<std::sync::Arc<dyn RawSampleTap>>,
+    /// Optional signal-level meter: the demod writes the current
+    /// pre-AGC in-band RMS, in dB FS, into this atomic (as IEEE-754
+    /// bits) on every emit. `None` for receivers that don't need a
+    /// level read-back (e.g. auto-decode). One handle per receiver,
+    /// so each vrx's gauge is independent.
+    pub meter: Option<MeterHandle>,
 }
 
 impl Default for ReceiverConfig {
@@ -212,6 +237,7 @@ impl Default for ReceiverConfig {
             bandwidth_hz: None,
             audio: AudioConfig::default(),
             tap: None,
+            meter: None,
         }
     }
 }
@@ -242,6 +268,7 @@ impl VirtualReceiver {
     pub fn new(cfg: ReceiverConfig, sink: Box<dyn AudioSink>) -> Result<Self, ReceiverError> {
         let mode = cfg.mode;
         let tap = cfg.tap.clone();
+        let meter = cfg.meter.clone();
         let demod = make_demod_tap(
             mode,
             cfg.source_rate_hz,
@@ -249,6 +276,7 @@ impl VirtualReceiver {
             cfg.bandwidth(),
             cfg.audio,
             tap,
+            meter,
         )?;
         Ok(Self {
             cfg,

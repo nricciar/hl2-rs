@@ -109,6 +109,15 @@ pub struct SharedState {
     /// with a simple `contains_key`.
     #[serde(default)]
     pub auto_monitors: BTreeMap<u8, Vec<AutoMonitor>>,
+    /// Per-slot demod signal level, in dB FS of the pre-AGC channel input.
+    /// This is the raw S-meter level: the S-unit mapping (S1 = near the
+    /// noise floor, +6 dB per S unit, red past S9 / +20 dB) is applied by
+    /// the client. A missing slot = no live virtual receiver on that slot
+    /// right now. The value is republished by the server's periodic state
+    /// heartbeat, so the UI's S-meter needle tracks the live level without
+    /// any command traffic.
+    #[serde(default)]
+    pub vrx_levels: BTreeMap<u8, f64>,
 }
 
 impl SharedState {
@@ -127,6 +136,7 @@ impl SharedState {
             spectrum_span_hz: 0,
             vrx: BTreeMap::new(),
             auto_monitors: BTreeMap::new(),
+            vrx_levels: BTreeMap::new(),
         }
     }
 }
@@ -818,6 +828,31 @@ mod tests {
         obj.remove("vrx");
         let p = serde_json::from_value::<SharedState>(serde_json::Value::Object(obj)).unwrap();
         assert!(p.vrx.is_empty());
+    }
+
+    #[test]
+    fn vrx_levels_roundtrip_and_default() {
+        // `vrx_levels` is a per-slot map of signal levels (dB FS) the UI
+        // renders as the S-meter. It must round-trip and default to empty
+        // when absent (older servers) so the UI gracefully shows no meter.
+        let mut st = SharedState::new(4);
+        let mut lv = std::collections::BTreeMap::new();
+        lv.insert(1u8, -42.5_f64);
+        lv.insert(2u8, -30.0_f64);
+        st.vrx_levels = lv.clone();
+        let j = serde_json::to_string(&st).unwrap();
+        let p = serde_json::from_str::<SharedState>(&j).unwrap();
+        assert_eq!(p.vrx_levels, lv);
+        // A value appears literally in the serialized form (keys are strings,
+        // values are JSON numbers).
+        assert!(j.contains(r#""1":-42.5"#), "got: {j}");
+        // An older payload without `vrx_levels` still decodes (defaults empty),
+        // and the empty map round-trips.
+        let legacy = r#"{"started":true,"rx_count":4,"tuning":{},"sample_format":"sample16","adc_sample_rate_hz":76800000,"lna_gain_db":6,"oc_bits":0,"spectrum_source":"ep4","state_at":0}"#;
+        let p = serde_json::from_str::<SharedState>(legacy).unwrap();
+        assert!(p.vrx_levels.is_empty());
+        let e = serde_json::to_string(&SharedState::new(4)).unwrap();
+        assert!(e.contains(r#""vrx_levels":{}"#), "got: {e}");
     }
 
     #[test]

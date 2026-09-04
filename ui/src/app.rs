@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use wasm_bindgen::JsCast;
@@ -10,6 +11,134 @@ use crate::audio::Audio;
 use crate::canvas;
 use crate::client::{WsClient, parse_audio, parse_binary};
 use hl2_common::{CH_AUDIO, CH_WIDEBAND};
+
+/// The user's desired config for one RX slot's receiver.
+///
+/// Kept separately from [`hl2_common::VrxState`] — the server's *actual*
+/// state — so we can remember per-slot settings across tab switches and
+/// reconnects, and re-send `setvrx` when the two disagree. `muted` is the
+/// user's intent; a muted non-active tab is torn down on the server
+/// (`setvrxoff`), so the server will *not* echo it in its `SharedState.vrx`
+/// map — `Shared::vrx_cfg` is the memory then, and the reconcile step in
+/// [`Shared::reconcile_vrx`] re-spawns it on the next `tune`/`start`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VrxSlotCfg {
+    mode: VrxModeChoice,
+    bw_hz: u32,
+    gain_db: f32,
+    muted: bool,
+}
+
+/// The 5 modes the virtual receiver can demodulate (mirrors the panel
+/// dropdown). Kept as a small enum rather than `String` so
+/// [`VrxSlotCfg`] stays `Copy`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum VrxModeChoice {
+    Usb,
+    Lsb,
+    Ft8,
+    Js8,
+    Ft4,
+}
+
+/// Each tick on the S-meter bar: `(label, position)` where `position` is
+/// the bar fraction (0.0..=1.0) the tick marks.
+///
+/// Layout is **60/40**: S1 through S9 occupy the first 60 % of the bar
+/// (S9 = 0.600), and the +20/+40/+60 overload region takes the final 40 %
+/// spread evenly by dB (60 dB in 0.333 × 60 %).
+///
+/// Only odd S units (S1/S3/S5/S7/S9) and the overload ticks are labelled;
+/// the even positions still draw their stub mark (CSS `::after`) but carry
+/// an empty label to keep the scale legible in the narrow bar.
+const SMETER_TICKS: [(&'static str, f32); 12] = [
+    ("S1", 0.000),
+    ("", 0.075),
+    ("S3", 0.150),
+    ("", 0.225),
+    ("S5", 0.300),
+    ("", 0.375),
+    ("S7", 0.450),
+    ("", 0.525),
+    ("S9", 0.600),
+    ("+20", 0.733),
+    ("+40", 0.867),
+    ("+60", 1.000),
+];
+/// Same shape for the SWR half: 1:1 → 4:1, log-ish spacing. 1.0 → 0.0,
+/// 1.5 → 0.25, 2.0 → 0.5, 2.5 → 0.625, 3:1 → 0.75, 4:1 → 1.0. The red zone
+/// starts above ~2.5:1 (a typical "your antenna needs work" boundary on
+/// HF/VHF rigs).
+const SWR_TICKS: [(&'static str, f32); 6] = [
+    ("1:1", 0.000),
+    ("1.5", 0.250),
+    ("2:1", 0.500),
+    ("2.5", 0.625),
+    ("3:1", 0.750),
+    ("4:1", 1.000),
+];
+
+/// Normalise a pre-AGC dBFS reading against the running noise-floor estimate
+/// to a 0..=100.0 bar position.  Mirrors [`SMETER_TICKS`]: S1 = the floor,
+/// S9 = floor + 54 dB → 60 % bar position (the S region is the first 60 % of
+/// the bar); past S9 the +20/+40/+60 overload region (another 60 dB) compresses
+/// into the final 40 %, so +60 dB pins the full 100 %.
+fn smeter_pos(level_dbfs: f64, floor_db: f64) -> f64 {
+    let above_floor = (level_dbfs - floor_db).max(0.0);
+    if above_floor <= 48.0 {
+        let v = (above_floor / 48.0) * 60.0;
+        v.min(100.0).max(0.0)
+    } else {
+        let v = 60.0 + ((above_floor - 48.0) / 60.0) * 40.0;
+        v.min(100.0).max(0.0)
+    }
+}
+
+impl VrxModeChoice {
+    fn as_str(self) -> &'static str {
+        match self {
+            VrxModeChoice::Usb => "usb",
+            VrxModeChoice::Lsb => "lsb",
+            VrxModeChoice::Ft8 => "ft8",
+            VrxModeChoice::Js8 => "js8",
+            VrxModeChoice::Ft4 => "ft4",
+        }
+    }
+    fn parse(s: &str) -> Self {
+        match s {
+            "lsb" => VrxModeChoice::Lsb,
+            "ft8" => VrxModeChoice::Ft8,
+            "js8" => VrxModeChoice::Js8,
+            "ft4" => VrxModeChoice::Ft4,
+            _ => VrxModeChoice::Usb,
+        }
+    }
+}
+
+impl Default for VrxSlotCfg {
+    fn default() -> Self {
+        Self {
+            mode: VrxModeChoice::Usb,
+            bw_hz: 2_600,
+            gain_db: 0.0,
+            muted: true,
+        }
+    }
+}
+
+impl VrxSlotCfg {
+    fn for_band(hz: u32) -> Self {
+        let mode = if hz > 0 && hz < 10_000_000 {
+            VrxModeChoice::Lsb
+        } else {
+            VrxModeChoice::Usb
+        };
+        Self {
+            mode,
+            ..Default::default()
+        }
+    }
+}
 
 /// Maximum rows kept in the FT8 decode log (newest-first, oldest dropped).
 const FT8_LOG_CAP: usize = 200;
@@ -81,13 +210,29 @@ struct Shared {
     /// `SharedState.auto_monitors`. Presence of a slot = auto decode is on
     /// for that slot; the `Vec` carries the (mode, target-frequency) readout.
     auto_monitors: RefCell<std::collections::BTreeMap<u8, Vec<hl2_common::AutoMonitor>>>,
-    vrx_sideband: RefCell<String>,
-    vrx_bw_hz: RefCell<u32>,
-    vrx_gain_db: RefCell<f32>,
+    /// Per-slot desired receiver config (mode / bandwidth / gain / muted).
+    /// The UI is the source of truth for what the user wants on each slot;
+    /// `Shared::vrx` mirrors what is actually running on the server, and
+    /// `Shared::reconcile_vrx` re-sends `setvrx`/`setvrxoff` until the two
+    /// agree. Populating a slot's entry is what makes the server spawn it
+    /// (see C2 `ensure_vrx`); muting a muted non-active slot removes it
+    /// (see C2 `teardown_vrx`).
+    vrx_cfg: RefCell<BTreeMap<u8, VrxSlotCfg>>,
+    /// Per-slot signal level in dB FS (pre-AGC in-band RMS), mirrored from
+    /// `SharedState.vrx_levels` in `on_text`.
+    vrx_levels: RefCell<BTreeMap<u8, f64>>,
+    /// Per-slot noise-floor estimate (dB FS) — a self-calibrating long-term
+    /// minimum that the S-meter maps signal strength against (see
+    /// [`Shared::track_floors`]). One entry per active RX slot so each slot's
+    /// ambient level is tracked independently.
+    vrx_floor_db: RefCell<BTreeMap<u8, f64>>,
     /// Decoded digital-mode rows (FT8 / FT4 / JS8), newest-first, capped
     /// (see [`FT8_LOG_CAP`]). All modes share one buffer + one wire
     /// envelope; the mode of each row is read from its `vrx` snapshot.
     decode_log: RefCell<Vec<hl2_common::DecodeRow>>,
+    /// Global Web Audio master-vol slider (0..1). Not per-slot: only one
+    /// slot's audio plays at a time (the unmuted one), so a single master
+    /// gain covers all of them. See `Audio::set_gain`.
     vrx_play_gain: RefCell<f32>,
     started_prev: RefCell<bool>,
     started_local: RefCell<bool>,
@@ -126,9 +271,9 @@ impl Shared {
             vrx_slot: RefCell::new(1),
             vrx: RefCell::new(std::collections::BTreeMap::new()),
             auto_monitors: RefCell::new(std::collections::BTreeMap::new()),
-            vrx_sideband: RefCell::new("usb".into()),
-            vrx_bw_hz: RefCell::new(2_600),
-            vrx_gain_db: RefCell::new(0.0),
+            vrx_cfg: RefCell::new(std::collections::BTreeMap::new()),
+            vrx_levels: RefCell::new(std::collections::BTreeMap::new()),
+            vrx_floor_db: RefCell::new(std::collections::BTreeMap::new()),
             decode_log: RefCell::new(Vec::new()),
             vrx_play_gain: RefCell::new(0.8),
         })
@@ -242,13 +387,23 @@ impl Shared {
             // entry is a full `VrxState` (slot / offset / mode / bw / gain /
             // rate / muted), keyed by RX slot.
             *sh.vrx.borrow_mut() = resp.state.vrx.clone();
+            // Mirror the per-slot signal-level meters (dB FS); these come in
+            // with *every* fresh `SharedState` — including the periodic
+            // `welcome` re-broadcast the hub sends on a ~100 ms tick while
+            // any receiver is running (see `RadioHub::run_levels`).
+            *sh.vrx_levels.borrow_mut() = resp.state.vrx_levels.clone();
+            // Track each slot's noise floor from the fresh level samples so
+            // the S-meter maps signal strength against the live band floor.
+            sh.track_floors();
             // Mirror the per-slot auto-decode monitors (headless digital-mode
             // decoders the server is running against known band frequencies).
             *sh.auto_monitors.borrow_mut() = resp.state.auto_monitors.clone();
-            // Re-anchor the panel editor to the targeted slot: if it has an
-            // active receiver pick up its settings, otherwise fall back to
-            // the band defaults (so the panel always shows a usable state).
-            Shared::refocus_vrx_panel(sh);
+            // Reconcile the server's per-slot receiver set with what the
+            // operator wants per the auto-lifecycle model (active tab spawned
+            // + their mute; non-active unmuted kept alive; non-active muted
+            // torn down). Idempotent — a slot whose server state already
+            // matches the desired one sends no commands.
+            Shared::reconcile_vrx(sh);
         }
         if let Some(devs) = &resp.devices {
             let ips: Vec<String> = devs
@@ -327,20 +482,17 @@ impl Shared {
                 if samples.is_empty() {
                     return;
                 }
-                // Only feed audio the operator is currently *listening* on:
-                // the targeted slot's receiver — and only while that receiver
-                // is active and unmuted on the server (the server stops
-                // streaming a muted slot, but a stale frame from before the
-                // mute is discarded here too). A single shared `Audio` engine
-                // plays the routed block; the master gain honours the
-                // user's slider and the mute state.
-                let target = *sh.vrx_slot.borrow();
+                // Only stream audio the operator has explicitly asked to hear:
+                // that's *any* slot whose receiver is running AND unmuted
+                // (server-side, a muted vrx stops pushing frames, but a stray
+                // frame from a recently-muted slot still arrives — discard
+                // it). In practice this is a single slot: the active tab
+                // spawns muted, and the one non-active tab that is
+                // explicitly unmuted is the "playing" station. A single
+                // shared `Audio` engine plays whichever one arrives.
                 let is_listening = {
                     let vrx = sh.vrx.borrow();
-                    match vrx.get(&target) {
-                        Some(v) => v.slot as u16 == slot && !v.muted,
-                        None => false,
-                    }
+                    vrx.get(&(slot as u8)).map(|v| !v.muted).unwrap_or(false)
                 };
                 if !is_listening {
                     return;
@@ -440,17 +592,6 @@ impl Shared {
         }
     }
 
-    /// Tear down the targeted slot's virtual receiver (`setvrxoff { slot }`).
-    fn send_vrx_off(sh: &Rc<Self>) {
-        let slot = *sh.vrx_slot.borrow();
-        let Some(msg) = vrx_cmd_msg_off(slot) else {
-            return;
-        };
-        if let Some(c) = sh.client.borrow().as_ref() {
-            let _ = c.send_text(&msg);
-        }
-    }
-
     /// Mute / unmute the receiver on `slot` **without rebuilding it**: while
     /// muted the demod (and the FT8 decoder, in FT8 mode) keep running on the
     /// server, but it stops broadcasting that slot's `CH_AUDIO`
@@ -490,57 +631,160 @@ impl Shared {
         }
     }
 
-    /// String form of a `VrxMode` for the panel `<select>` value.
-    fn vrx_mode_str(m: &hl2_common::VrxMode) -> &'static str {
-        match m {
-            hl2_common::VrxMode::Usb => "usb",
-            hl2_common::VrxMode::Lsb => "lsb",
-            hl2_common::VrxMode::Ft8 => "ft8",
-            hl2_common::VrxMode::Js8 => "js8",
-            hl2_common::VrxMode::Ft4 => "ft4",
+    /// Number of RX slots the UI can drive (1..=4). Matched to the tab row.
+    const RX_SLOTS: usize = 4;
+
+    /// The user's desired config for `slot`, seeding it on first access.
+    ///
+    /// Seeding is band-aware: below 10 MHz the conventional sideband is LSB,
+    /// above it USB (the classic "water above 10 m" rule); bandwidth and gain
+    /// default to a safe voice setting; `muted` defaults to `true` so a tab
+    /// is only "playing" once the operator explicitly unmutes it.
+    fn cfg_for(&self, slot: u8) -> VrxSlotCfg {
+        let mut cfg = self.vrx_cfg.borrow_mut();
+        if cfg.get(&slot).is_none() {
+            let hz = self.tuning.borrow().get(&slot).copied().unwrap_or(0);
+            cfg.insert(slot, VrxSlotCfg::for_band(hz));
+        }
+        cfg.get(&slot).copied().unwrap_or_default()
+    }
+
+    /// Spawn (or rebuild) the receiver on `slot`, applying the user's
+    /// `muted` intent. This is the "auto-spawn" for an active tab and the
+    /// (re)spawn of a torn-down slot when the operator comes back to it.
+    fn ensure_vrx(&self, slot: u8, muted: bool) {
+        let c = self.cfg_for(slot);
+        // Record the operator's mute intent for this slot.
+        if let Some(v) = self.vrx_cfg.borrow_mut().get_mut(&slot) {
+            v.muted = muted;
+        }
+        let cfg = hl2_common::VrxCfg {
+            slot,
+            offset_hz: 0,
+            mode: match c.mode {
+                VrxModeChoice::Lsb => hl2_common::VrxMode::Lsb,
+                VrxModeChoice::Ft8 => hl2_common::VrxMode::Ft8,
+                VrxModeChoice::Js8 => hl2_common::VrxMode::Js8,
+                VrxModeChoice::Ft4 => hl2_common::VrxMode::Ft4,
+                VrxModeChoice::Usb => hl2_common::VrxMode::Usb,
+            },
+            bw_hz: c.bw_hz,
+            gain_db: c.gain_db,
+        };
+        // The wire `VrxCfg` has no `muted` field (mute is a separate command),
+        // so send `setvrx` then `setvrxmute` to converge the mute state
+        // without rebuilding.
+        if let Some(cl) = self.client.borrow().as_ref() {
+            let setvrx = serde_json::json!({ "id": 100u64 + slot as u64, "cmd": "setvrx", "data": { "cfg": cfg } }).to_string();
+            let _ = cl.send_text(&setvrx);
+            let setmute = serde_json::json!({ "id": 200u64 + slot as u64, "cmd": "setvrxmute", "data": { "slot": slot, "muted": muted } }).to_string();
+            let _ = cl.send_text(&setmute);
         }
     }
 
-    fn default_vrx_bw_hz() -> u32 {
-        2_600
+    /// Tear down the receiver on `slot` (`setvrxoff`). Used for muted
+    /// non-active tabs; the config stays in `vrx_cfg` so a later return
+    /// re-spawns it with the remembered settings.
+    fn teardown_vrx(&self, slot: u8) {
+        if let Some(cl) = self.client.borrow().as_ref() {
+            let msg = serde_json::json!({ "id": 300u64 + slot as u64, "cmd": "setvrxoff", "data": { "slot": slot } }).to_string();
+            let _ = cl.send_text(&msg);
+        }
     }
 
-    /// Re-anchor the virtual-receiver panel editor to what is actually
-    /// configured on the server for the *targeted* slot ([`Shared::vrx_slot`]):
+    /// The desired server state for one slot, per the auto-lifecycle model:
     ///
-    /// * If the slot has an active [`hl2_common::VrxState`], mirror its mode /
-    ///   channel bandwidth / gain into the editor (`vrx_sideband` /
-    ///   `vrx_bw_hz` / `vrx_gain_db`) so the panel shows the live values.
-    /// * Otherwise seed the editor with the slot's **band defaults** (see
-    ///   [`Shared::panel_defaults`]) so a fresh tab still has a usable
-    ///   sideband/bandwidth/gain to press **On** with.
+    /// * **Active tab** — always spawned, carrying the operator's `muted`
+    ///   intent (default muted).
+    /// * **Non-active tab, unmuted** — the "playing" station: stays spawned +
+    ///   unmuted so switching tabs doesn't silence it.
+    /// * **Non-active tab, muted** — torn down (a muted tab has no audio to
+    ///   stream and nothing to decode); it respawns when re-visited.
     ///
-    /// Called on every fresh [`SharedState`] and immediately when the targeted
-    /// slot changes, so multiple tabs always converge on the same config.
-    fn refocus_vrx_panel(sh: &Rc<Self>) {
-        let slot = *sh.vrx_slot.borrow();
-        let (sb, bw, g) = {
-            let vrx = sh.vrx.borrow();
-            match vrx.get(&slot) {
-                Some(v) => (Self::vrx_mode_str(&v.mode).to_string(), v.bw_hz, v.gain_db),
-                None => {
-                    let def_mode = sh.panel_defaults();
-                    (def_mode, Self::default_vrx_bw_hz(), 0.0f32)
+    /// `None` radio / not started → every slot torn down.
+    fn desired_vrx(&self, slot: u8) -> Option<bool> {
+        // `Option<bool>`: `None` = tear down, `Some(muted)` = spawned.
+        if !*self.started.borrow() {
+            return None;
+        }
+        let active = *self.vrx_slot.borrow() == slot;
+        if active {
+            return Some(self.cfg_for(slot).muted);
+        }
+        let cfg = self.vrx_cfg.borrow();
+        match cfg.get(&slot) {
+            Some(c) if !c.muted => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Self-calibrate the per-slot noise floor from the latest level samples.
+    ///
+    /// The S-meter has to express signal strength *relative to the ambient
+    /// noise floor of the slot's band* — S1 at the floor, S9 ~54 dB above it
+    /// (see [`smeter_pos`]). The server reports the absolute pre-AGC level in
+    /// dB FS but has no way of knowing the band's floor, so the UI tracks it:
+    /// a slow one-pole estimate that follows the running *minimum* of the
+    /// level on each slot.
+    ///
+    /// The asymmetry matters. A quiet sample is the floor, so the estimate
+    /// falls quickly toward it (attack `0.5` — a few 100 ms rebroadcasts). A
+    /// loud sample is signal, *not* a higher floor, so the estimate climbs
+    /// only very slowly toward it (release `0.02`) — that keeps a weak
+    /// carrier sitting low on the bar while a strong one climbs, instead of
+    /// the floor chasing the signal and parking the needle at S1 again. A
+    /// receiver torn down (no sample) is dropped so a stale floor never lags.
+    fn track_floors(&self) {
+        let cur: Vec<(u8, f64)> = self
+            .vrx_levels
+            .borrow()
+            .iter()
+            .map(|(&s, &l)| (s, l))
+            .collect();
+        let mut floors = self.vrx_floor_db.borrow_mut();
+        // Drop floors for slots no longer reporting a level.
+        floors.retain(|slot, _| cur.iter().any(|(s, _)| *s == *slot));
+        for (slot, level) in cur {
+            let prev = floors.get(&slot).copied().unwrap_or(-120.0);
+            let alpha = if level < prev { 0.5 } else { 0.02 };
+            let next = prev + alpha * (level - prev);
+            floors.insert(slot, next);
+        }
+    }
+
+    /// Converge the server (for every slot) to the desired state above —
+    /// spawning missing ones, tearing down extra ones, and flipping mute
+    /// state in place (cheap, no rebuild). Idempotent: when a slot already
+    /// matches, we send nothing, so the periodic level re-broadcasts cause no
+    /// command churn. Call after any change that affects the model: start /
+    /// stop, tab switch, tune, mode / BW / gain edit, mute toggle, or a fresh
+    /// `SharedState` from the server.
+    fn reconcile_vrx(&self) {
+        for slot in 1..=Self::RX_SLOTS as u8 {
+            let desired = self.desired_vrx(slot);
+            // Read the actual server state for this slot *before* deciding,
+            // so we don't hold a `Ref` across the command-sending below.
+            let actual = self.vrx.borrow().get(&slot).copied();
+            match (desired, actual) {
+                (Some(m), None) => {
+                    // Must exist but doesn't → spawn (with `muted`).
+                    self.ensure_vrx(slot, m);
                 }
+                (Some(m), Some(va)) => {
+                    if va.muted != m {
+                        // Exists but mute state is wrong → flip it (no rebuild).
+                        if let Some(cl) = self.client.borrow().as_ref() {
+                            let msg = serde_json::json!({ "id": 400u64 + slot as u64, "cmd": "setvrxmute", "data": { "slot": slot, "muted": m } }).to_string();
+                            let _ = cl.send_text(&msg);
+                        }
+                    }
+                }
+                (None, Some(_)) => {
+                    // Present but should be torn down.
+                    self.teardown_vrx(slot);
+                }
+                (None, None) => {}
             }
-        };
-        *sh.vrx_sideband.borrow_mut() = sb;
-        *sh.vrx_bw_hz.borrow_mut() = bw;
-        *sh.vrx_gain_db.borrow_mut() = g;
-    }
-
-    fn panel_defaults(&self) -> String {
-        let slot = *self.vrx_slot.borrow();
-        let hz = self.tuning.borrow().get(&slot).copied().unwrap_or(0);
-        if hz > 0 && hz < 10_000_000 {
-            "lsb".to_string()
-        } else {
-            "usb".to_string()
         }
     }
 
@@ -675,17 +919,6 @@ fn vrx_cmd_msg(slot: u8, mode: &str, bw_hz: u32, gain_db: f32) -> Option<String>
         gain_db,
     };
     Some(serde_json::json!({ "id": 7u64, "cmd": "setvrx", "data": { "cfg": cfg } }).to_string())
-}
-
-fn vrx_cmd_msg_off(slot: u8) -> Option<String> {
-    Some(
-        serde_json::json!({
-            "id": 8u64,
-            "cmd": "setvrxoff",
-            "data": { "slot": slot }
-        })
-        .to_string(),
-    )
 }
 
 fn is_current(sh: &Shared, my_id: u64) -> bool {
@@ -1112,6 +1345,9 @@ pub fn app() -> Html {
             " warn"
         };
     let offline_class = if online { "" } else { " offline" };
+    // One Rc handle per site that needs to capture an `Rc<Shared>` inside a
+    // `Callback` (Yew's `Callback` must own the value it moves). The names are
+    // positional to keep the diffs honest when rows are reordered.
     let sh2 = sh.clone();
     let sh7 = sh.clone();
     let sh8 = sh.clone();
@@ -1125,8 +1361,7 @@ pub fn app() -> Html {
     let sh18 = sh.clone();
     let sh19 = sh.clone();
     let sh21 = sh.clone();
-    let sh23 = sh.clone();
-    let sh25 = sh.clone();
+    let sh29 = sh.clone();
 
     let floor_auto = *sh.floor_auto.borrow();
     let scale_floor_display = if floor_auto {
@@ -1203,12 +1438,11 @@ pub fn app() -> Html {
 
     let vrx_slot: u8 = *sh13.vrx_slot.borrow();
     let vrx_on: bool = sh13.vrx.borrow().contains_key(&vrx_slot);
-    let vrx_muted_cur: bool = sh13
-        .vrx
-        .borrow()
-        .get(&vrx_slot)
-        .map(|v| v.muted)
-        .unwrap_or(false);
+    // Mute state: `vrx_cfg` is the *user's intent* for this slot and is the
+    // single source of truth (reconcile_vrx compares against it). We read the
+    // button state from it, not from the server-echoed `vrx` map — the two
+    // converge via `reconcile_vrx` after every state change.
+    let vrx_muted_cur: bool = sh13.cfg_for(vrx_slot).muted;
     // The decode tables show while *any* slot demodulates the mode —
     // including headless auto-decode monitors (which carry no `VrxState`
     // of their own and don't appear in `vrx`).
@@ -1231,35 +1465,34 @@ pub fn app() -> Html {
     }) || auto_modes.contains(&hl2_common::VrxMode::Ft8)
         || auto_modes.contains(&hl2_common::VrxMode::Js8)
         || auto_modes.contains(&hl2_common::VrxMode::Ft4);
-    let vrx_sideband_cur: String = sh14.vrx_sideband.borrow().clone();
-    let vrx_bw_cur: u32 = *sh15.vrx_bw_hz.borrow();
-    let vrx_gain_cur: f32 = *sh16.vrx_gain_db.borrow();
+    // Per-slot editor seed: read from `vrx_cfg` (or seed from the server's
+    // live `VrxState` if the operator has already spawned this slot), so
+    // the panel shows the remembered settings for *this* tab. `cfg_for`
+    // inserts a default on first access, so the `.clone()` is always
+    // `Some` after.
+    let vrx_sideband_cur: VrxModeChoice = sh14.cfg_for(vrx_slot).mode;
+    let vrx_bw_cur: u32 = sh15.cfg_for(vrx_slot).bw_hz;
+    let vrx_gain_cur: f32 = sh16.cfg_for(vrx_slot).gain_db;
     let vrx_play_gain_cur: f32 = *sh17.vrx_play_gain.borrow();
     let decode_log: Vec<hl2_common::DecodeRow> = sh17.decode_log.borrow().clone();
-    let vrx_desc: Html = if vrx_sideband_cur == "ft8" {
-        html! {
-            <p class="muted">
-                {format!("Demodulates RX{vrx_slot} baseband as FT8 (12 kHz sample rate). Decoded messages appear in the log below — one decode attempt per completed 15 s slot.")}
-            </p>
-        }
-    } else if vrx_sideband_cur == "js8" {
-        html! {
-            <p class="muted">
-                {format!("Demodulates RX{vrx_slot} baseband as JS8 (all speeds: A/B/C/E, 12 kHz sample rate). Each speed is decoded continuously — a cycle (15/10/6/30 s) is decoded as soon as its data is ready, not on a fixed slot boundary. Decoded frames appear in the log below, tagged with their speed.")}
-            </p>
-        }
-    } else if vrx_sideband_cur == "ft4" {
-        html! {
-            <p class="muted">
-                {format!("Demodulates RX{vrx_slot} baseband as FT4 (12 kHz sample rate). FT4 is a 7.5 s-slot WSJT-family mode — decoded messages appear in the log below, one decode attempt per completed 7.5 s slot.")}
-            </p>
-        }
+
+    // S-meter / SWR gauge value for the targeted slot. The live level is
+    // from `vrx_levels[slot]` (dB FS, pre-AGC); the noise floor is the
+    // self-calibrating per-slot estimate (see `track_floors`). No receiver
+    // on the slot → 0 % (bar parked at its bottom).
+    let level_dbfs: Option<f64> = sh17.vrx_levels.borrow().get(&vrx_slot).copied();
+    let floor_db: f64 = sh17
+        .vrx_floor_db
+        .borrow()
+        .get(&vrx_slot)
+        .copied()
+        .unwrap_or(0.0);
+    let gauge_val: f64 = level_dbfs.map(|l| smeter_pos(l, floor_db)).unwrap_or(0.0);
+    // Mute/Unmute label for the targeted slot (drives the toggle button text).
+    let mute_label: String = if vrx_muted_cur {
+        "Mute".to_string()
     } else {
-        html! {
-            <p class="muted">
-                {format!("Demodulates RX{vrx_slot} baseband as SSB — ")}{if vrx_sideband_cur == "usb" {"USB" } else { "LSB" }}{". Shaded band on the spectrum = channel-select passband."}
-            </p>
-        }
+        "Unmute".to_string()
     };
 
     // The decode-log table; rendered while *any* slot demodulates a digital
@@ -1286,7 +1519,7 @@ pub fn app() -> Html {
             .collect();
         html! {
             <div class="ft8-log">
-                <h4>{"decode log"}</h4>
+                <h4>{"Decode Log"}</h4>
                 {if decode_log.is_empty() {
                     html! {
                         <p class="muted">{"Waiting for a decoded message…"}</p>
@@ -1317,13 +1550,6 @@ pub fn app() -> Html {
         Html::default()
     };
 
-    // Mute/Unmute label for the targeted slot (drives the toggle button text).
-    let mute_label: String = if vrx_muted_cur {
-        "Mute".to_string()
-    } else {
-        "Unmute".to_string()
-    };
-
     // The RX filter-bank relay checkboxes. Relay N (1-based) drives bit
     // (N-1) of the open-collector mask. Each box independently toggles its own
     // bit and sends a `setocbits` command; the server re-asserts the resulting
@@ -1349,14 +1575,18 @@ pub fn app() -> Html {
                    aria-current={if active { Some("page") } else { None }}
                    href="#"
                     title="EP4 — raw wideband (122.88 MSps); no NCO, so the frequency readout is disabled"
-                    onclick={Callback::from(move |_| {
-                        *shc.spectrum_source.borrow_mut() = None;
-                        *shc.vrx_slot.borrow_mut() = 1;
-                        Shared::refocus_vrx_panel(&shc);
-                        Shared::send_spectrum_source(&shc, None);
-                        shc.notify();
-                    })}>
-                    {"EP4"}
+                     onclick={Callback::from(move |_| {
+                         *shc.spectrum_source.borrow_mut() = None;
+                         *shc.vrx_slot.borrow_mut() = 1;
+                         // EP4 is not a receiver, but it re-activates RX1
+                         // as the "active tab" — reconcile so RX1 re-spawns
+                         // per the auto-lifecycle model and the (former)
+                         // active tab is kept or torn down accordingly.
+                         shc.reconcile_vrx();
+                         Shared::send_spectrum_source(&shc, None);
+                         shc.notify();
+                     })}>
+                     {"EP4"}
                 </a>
             </li>
         }
@@ -1403,27 +1633,33 @@ pub fn app() -> Html {
                 </div>
 
                 <ul class="nav nav-tabs">
-                    {(1..5u8).map(|n| {
-                        let active = *sh21.spectrum_source.borrow() == Some(n);
-                        let shc = sh.clone();
-                        html! {
-                            <li class="nav-item">
-                                <a class={if active { "nav-link active" } else { "nav-link" }}
-                                   aria-current={if active { Some("page") } else { None }}
-                                href="#"
-                                onclick={Callback::from(move |_| {
-                                    let src = Some(n);
-                                    *shc.spectrum_source.borrow_mut() = src;
-                                    *shc.vrx_slot.borrow_mut() = n;
-                                    Shared::refocus_vrx_panel(&shc);
-                                    Shared::send_spectrum_source(&shc, src);
-                                    shc.notify();
-                                })}>
-                                    {format!("RX{n}")}
-                                </a>
-                            </li>
-                        }
-                    }).collect::<Html>()}
+                      {(1..=4u8).map(|n| {
+                          let active = *sh21.spectrum_source.borrow() == Some(n);
+                          let shc = sh.clone();
+                          html! {
+                              <li class="nav-item">
+                                  <a class={if active { "nav-link active" } else { "nav-link" }}
+                                     aria-current={if active { Some("page") } else { None }}
+                                     href="#"
+                                     onclick={Callback::from(move |_| {
+                                         let src = Some(n);
+                                         *shc.spectrum_source.borrow_mut() = src;
+                                         *shc.vrx_slot.borrow_mut() = n;
+                                         // The panel re-renders from
+                                         // `vrx_cfg` (seeded from server state
+                                         // on first access). Reconcile the
+                                         // server to the new auto-lifecycle
+                                         // state (the just-activated tab now
+                                         // owns "active").
+                                         shc.reconcile_vrx();
+                                         Shared::send_spectrum_source(&shc, src);
+                                         shc.notify();
+                                     })}>
+                                      {format!("RX{n} ")}
+                                  </a>
+                              </li>
+                          }
+                      }).collect::<Html>()}
                     {ep4_tab.clone()}
                     <li class="ms-auto">
                     <div class="form-check form-switch">
@@ -1458,157 +1694,77 @@ pub fn app() -> Html {
                     </li>
                 </ul>
 
-                <div class="tune-row">
-                    {freq_stepper(sh.clone(), freq, started, sh.spectrum_source.borrow().is_none())}
+                  <div class="controls-grid">
+                      <div class="col-left">
+                          {freq_stepper(sh.clone(), freq, started, sh.spectrum_source.borrow().is_none())}
 
-                    <div class={if online && started { "fpanel" } else { "fpanel idle" }}>
-                        <div class="fpanel-block">
-                            <span class="fpanel-label">{"RX filter bank"}</span>
-                            {oc_row}
-                        </div>
-                        <div class="fpanel-sep"></div>
-                        <div class="fpanel-block">
-                            <span class="fpanel-label">{"LNA"}</span>
-                            <input type="range" min="-12" max="48" step="1"
-                                value={lna_cur.to_string()}
-                                style={format!("--fill: {}%", lna_pct)}
-                                class="lna-slider"
-                                aria-label="LNA gain (dB)"
-                                oninput={Callback::from(move |e: web_sys::InputEvent| {
-                                    if let Some(inp) = e.target_dyn_into::<HtmlInputElement>() {
-                                        let v: i8 = inp.value().parse::<i8>().unwrap_or(6).clamp(-12, 48);
-                                        *sh10.lna.borrow_mut() = v;
-                                        if *sh10.started.borrow() {
-                                            Shared::send_lna(&sh10, v);
-                                        }
-                                    }
-                                    sh10.notify();
-                                })}/>
-                            <span class="lna-val">{format!("{:+} dB", lna_cur)}</span>
-                        </div>
-                    </div>
-                </div>
-
-                     <canvas id="panadapter" width="800" height="250"></canvas>
-                     <canvas id="waterfall" width="800" height="256" class="waterfall"></canvas>
-                       // Auto decode on its own row so a long monitor list
-                       // (3 modes x multiple bands) can't wrap the Floor/Ceil
-                       // inputs onto a different line from the Auto scale box.
-                        <div class="row autodecode-row">{auto_row.clone()}</div>
-                        <div class="row scale-row">
-                          <label class="autobox">
-                            <input
-                                type="checkbox"
-                                checked={floor_auto}
-                                onchange={Callback::from(move |e: web_sys::Event| {
-                                    if let Some(dom) = e.target() {
-                                        if let Ok(cx) = dom.dyn_into::<HtmlInputElement>() {
-                                            let on = cx.checked();
-                                            if on {
-                                                *sh18.auto_recenter.borrow_mut() = true;
-                                            } else {
-                                                *sh18.floor.borrow_mut() = *sh18.auto_floor.borrow();
-                                                *sh18.ceil.borrow_mut() = *sh18.auto_ceil.borrow();
-                                            }
-                                            *sh18.floor_auto.borrow_mut() = on;
-                                        }
-                                    }
-                                    sh18.notify();
-                                })}
-                            />
-                            {"Auto scale"}
-                        </label>
-                        <label>{"Floor dB "}
-                            <input type="number" min="-120" max="0" disabled={floor_auto}
-                                value={scale_floor_display.to_string()} oninput={Callback::from(move |e: web_sys::InputEvent| {
-                                if let Some(inp) = e.target_dyn_into::<HtmlInputElement>() {
-                                    let v: f64 = inp.value().parse::<f64>().unwrap_or(*sh7.floor.borrow());
-                                    *sh7.floor.borrow_mut() = v;
-                                    *sh7.floor_auto.borrow_mut() = false;
-                                }
-                                sh7.notify();
-                            })} />
-                        </label>
-                        <label>{"Ceil dB "}
-                            <input type="number" min="-100" max="30" disabled={floor_auto}
-                                value={scale_ceil_display.to_string()} oninput={Callback::from(move |e: web_sys::InputEvent| {
-                                if let Some(inp) = e.target_dyn_into::<HtmlInputElement>() {
-                                    let v: f64 = inp.value().parse::<f64>().unwrap_or(*sh8.ceil.borrow());
-                                    *sh8.ceil.borrow_mut() = v;
-                                    *sh8.floor_auto.borrow_mut() = false;
-                                }
-                                sh8.notify();
-                            })} />
-                        </label>
-                    </div>
-
-                <div class="panel vrx-panel">
-                    <h3>{"Virtual receiver"}</h3>
-                    {vrx_desc}
-                    <div class="row">
-                        <span class={format!("vrx-badge {}", if vrx_on {"on"} else {"off"})}>
-                            {format!("● RX{vrx_slot} {}", if vrx_on { if vrx_muted_cur { "ON (muted)" } else { "ON" } } else { "OFF" })}
-                        </span>
-                         <label>{"Mode "}
-                             <select onchange={Callback::from(move |e: web_sys::Event| {
+                          <div class="cfg-row">
+                      <div class="cfg-block">
+                          <select
+                              class="cfg-select"
+                             onchange={Callback::from(move |e: web_sys::Event| {
                                  if let Some(dom) = e.target() {
                                      if let Ok(sel) = dom.dyn_into::<HtmlSelectElement>() {
                                          let v = sel.value().to_lowercase();
-                                          if v == "usb" || v == "lsb" || v == "ft8" || v == "js8" || v == "ft4" {
-                                             *sh14.vrx_sideband.borrow_mut() = v.clone();
-                                         }
-                                         if sh14.vrx.borrow().contains_key(&*sh14.vrx_slot.borrow()) {
-                                             let bw = *sh14.vrx_bw_hz.borrow();
-                                             let g  = *sh14.vrx_gain_db.borrow();
+                                         let choice = VrxModeChoice::parse(&v);
+                                         let slot = *sh14.vrx_slot.borrow();
+                                         { let mut cfg = sh14.vrx_cfg.borrow_mut(); if let Some(c) = cfg.get_mut(&slot) { c.mode = choice; } }
+                                         if sh14.vrx.borrow().contains_key(&slot) {
+                                             let c = sh14.cfg_for(slot);
                                              sh14.audio.reset();
-                                             Shared::send_vrx(&sh14, &v, bw, g);
+                                             Shared::send_vrx(&sh14, choice.as_str(), c.bw_hz, c.gain_db);
                                          }
                                          sh14.notify();
                                      }
                                  }
                              })}>
-                                 <option value="usb" selected={vrx_sideband_cur == "usb"}>{"USB"}</option>
-                                 <option value="lsb" selected={vrx_sideband_cur == "lsb"}>{"LSB"}</option>
-                                  <option value="ft8" selected={vrx_sideband_cur == "ft8"}>{"FT8"}</option>
-                                  <option value="js8" selected={vrx_sideband_cur == "js8"}>{"JS8"}</option>
-                                  <option value="ft4" selected={vrx_sideband_cur == "ft4"}>{"FT4"}</option>
-                             </select>
-                         </label>
-                        <label>{"BW Hz "}
-                            <input type="number" min="300" max="12000" step="100"
-                                   value={vrx_bw_cur.to_string()} oninput={Callback::from(move |e: web_sys::InputEvent| {
-                                if let Some(inp) = e.target_dyn_into::<HtmlInputElement>() {
-                                    let v: u32 = inp.value().parse::<u32>().unwrap_or(2600).max(300).min(12000);
-                                    *sh15.vrx_bw_hz.borrow_mut() = v;
-                                    if sh15.vrx.borrow().contains_key(&*sh15.vrx_slot.borrow()) {
-                                        let sb = sh15.vrx_sideband.borrow().clone();
-                                        let g  = *sh15.vrx_gain_db.borrow();
-                                        sh15.audio.reset();
-                                        Shared::send_vrx(&sh15, &sb, v, g);
-                                    }
-                                }
-                                sh15.notify();
-                            })} />
-                        </label>
-                        <label>{"Gain dB "}
-                            <input type="number" min="-40" max="40" step="1"
-                                   value={format!("{:.1}", vrx_gain_cur)} oninput={Callback::from(move |e: web_sys::InputEvent| {
-                                if let Some(inp) = e.target_dyn_into::<HtmlInputElement>() {
-                                    let v: f32 = inp.value().parse::<f32>().unwrap_or(0.0).clamp(-40.0, 40.0);
-                                    *sh16.vrx_gain_db.borrow_mut() = v;
-                                    if sh16.vrx.borrow().contains_key(&*sh16.vrx_slot.borrow()) {
-                                        let sb = sh16.vrx_sideband.borrow().clone();
-                                        let bw = *sh16.vrx_bw_hz.borrow();
-                                        sh16.audio.reset();
-                                        Shared::send_vrx(&sh16, &sb, bw, v);
-                                    }
-                                }
-                                sh16.notify();
-                            })} />
-                        </label>
-                        <label class="vol"><span>{"Vol"}</span>
-                            <input type="range" min="0" max="100" step="1"
-                                   value={((vrx_play_gain_cur * 100.0).round() as i32).to_string()} oninput={Callback::from(move |e: web_sys::InputEvent| {
+                             <option value="usb" selected={vrx_sideband_cur == VrxModeChoice::Usb}>{"USB"}</option>
+                             <option value="lsb" selected={vrx_sideband_cur == VrxModeChoice::Lsb}>{"LSB"}</option>
+                             <option value="ft8" selected={vrx_sideband_cur == VrxModeChoice::Ft8}>{"FT8"}</option>
+                             <option value="js8" selected={vrx_sideband_cur == VrxModeChoice::Js8}>{"JS8"}</option>
+                             <option value="ft4" selected={vrx_sideband_cur == VrxModeChoice::Ft4}>{"FT4"}</option>
+                         </select>
+                     </div>
+                     <div class="cfg-block">
+                         <span class="cfg-label">{"BW Hz"}</span>
+                         <input type="number" min="300" max="12000" step="100" class="cfg-number"
+                             value={vrx_bw_cur.to_string()} oninput={Callback::from(move |e: web_sys::InputEvent| {
+                                 if let Some(inp) = e.target_dyn_into::<HtmlInputElement>() {
+                                     let v: u32 = inp.value().parse::<u32>().unwrap_or(2600).max(300).min(12000);
+                                     let slot = *sh15.vrx_slot.borrow();
+                                     { let mut cfg = sh15.vrx_cfg.borrow_mut(); if let Some(c) = cfg.get_mut(&slot) { c.bw_hz = v; } }
+                                     if sh15.vrx.borrow().contains_key(&slot) {
+                                         let c = sh15.cfg_for(slot);
+                                         sh15.audio.reset();
+                                         Shared::send_vrx(&sh15, c.mode.as_str(), v, c.gain_db);
+                                     }
+                                 }
+                                 sh15.notify();
+                             })} />
+                     </div>
+                     <div class="cfg-block">
+                         <span class="cfg-label">{"Gain dB"}</span>
+                         <input type="number" min="-40" max="40" step="1" class="cfg-number"
+                             value={format!("{:.1}", vrx_gain_cur)} oninput={Callback::from(move |e: web_sys::InputEvent| {
+                                 if let Some(inp) = e.target_dyn_into::<HtmlInputElement>() {
+                                     let v: f32 = inp.value().parse::<f32>().unwrap_or(0.0).clamp(-40.0, 40.0);
+                                     let slot = *sh16.vrx_slot.borrow();
+                                     { let mut cfg = sh16.vrx_cfg.borrow_mut(); if let Some(c) = cfg.get_mut(&slot) { c.gain_db = v; } }
+                                     if sh16.vrx.borrow().contains_key(&slot) {
+                                         let c = sh16.cfg_for(slot);
+                                         sh16.audio.reset();
+                                         Shared::send_vrx(&sh16, c.mode.as_str(), c.bw_hz, v);
+                                     }
+                                 }
+                                 sh16.notify();
+                              })} />
+                      </div>
+                      <div>
+                        <span class="audio-label">{"Volume"}</span>
+                        <input type="range" min="0" max="100" step="1" class="vol-slider"
+                            value={((vrx_play_gain_cur * 100.0).round() as i32).to_string()}
+                            style={format!("--fill: {}%", (vrx_play_gain_cur * 100.0).round() as i32)}
+                            oninput={Callback::from(move |e: web_sys::InputEvent| {
                                 if let Some(inp) = e.target_dyn_into::<HtmlInputElement>() {
                                     let v: i32 = inp.value().parse::<i32>().unwrap_or(80).max(0).min(100);
                                     let lin = (v as f32) / 100.0;
@@ -1617,66 +1773,155 @@ pub fn app() -> Html {
                                 }
                                 sh19.notify();
                             })} />
-                            <span class="vol-val">{((vrx_play_gain_cur * 100.0).round() as i32).to_string()}{"%"}</span>
-                        </label>
-                        <button disabled={!vrx_on} onclick={Callback::from(move |_| {
-                            let slot = *sh21.vrx_slot.borrow();
-                            let muted_now = sh21.vrx.borrow().get(&slot).map(|v| v.muted).unwrap_or(false);
-                            let new_muted = !muted_now;
-                            Shared::send_vrx_mute(&sh21, slot, new_muted);
-                            if new_muted {
-                                sh21.audio.mute();
-                            } else {
-                                sh21.audio.unmute();
-                            }
-                             let mut vrx = sh21.vrx.borrow_mut();
-                             if let Some(v) = vrx.get_mut(&slot) {
-                                 v.muted = new_muted;
-                             }
-                             sh21.notify();
-                        })}>
-                            {mute_label.clone()}
+                        <span class="vol-val">{((vrx_play_gain_cur * 100.0).round() as i32).to_string()}{"%"}</span>
+                        <span class="audio-sep"></span>
+                        <button
+                            class={if vrx_muted_cur { "mute-btn muted" } else { "mute-btn" }}
+                            disabled={!vrx_on}
+                            title={if vrx_muted_cur { "Unmute — re-enable audio on this receiver (the demod keeps running)" } else { "Mute — silence audio on this receiver (the demod keeps running)" }}
+                            onclick={Callback::from(move |_| {
+                                let slot = *sh29.vrx_slot.borrow();
+                                let new_muted = !sh29.cfg_for(slot).muted;
+                                // 1. Update the user-intent map (the source of
+                                //    truth for this slot).
+                                if let Some(cfg) = sh29.vrx_cfg.borrow_mut().get_mut(&slot) {
+                                    cfg.muted = new_muted;
+                                }
+                                // 2. Tell the server to flip the live mute state
+                                //    without rebuilding the receiver.
+                                if sh29.vrx.borrow().contains_key(&slot) {
+                                    Shared::send_vrx_mute(&sh29, slot, new_muted);
+                                    if new_muted { sh29.audio.mute(); } else { sh29.audio.unmute(); }
+                                }
+                                // 3. Reconcile so the server's state matches the
+                                //    intent (e.g. if the server hadn't applied
+                                //    the mute yet, or the receiver wasn't
+                                //    spawned yet — in which case the server will
+                                //    be told to spawn on the next tick with the
+                                //    right `muted`).
+                                sh29.reconcile_vrx();
+                                sh29.notify();
+                            })}>
+                            {mute_label}
                         </button>
-                        <button disabled={vrx_on} onclick={Callback::from(move |_| {
-                            let slot = *sh23.vrx_slot.borrow();
-                            let sb = sh23.vrx_sideband.borrow().clone();
-                            let bw = *sh23.vrx_bw_hz.borrow();
-                            let g  = *sh23.vrx_gain_db.borrow();
-                            let others: Vec<u8> = sh23.vrx.borrow().iter()
-                                .filter(|(s, _)| **s != slot)
-                                .map(|(s, _)| *s)
-                                .collect();
-                             for os in others {
-                                 Shared::send_vrx_mute(&sh23, os, true);
-                                 let mut vrx = sh23.vrx.borrow_mut();
-                                 if let Some(v) = vrx.get_mut(&os) { v.muted = true; }
-                             }
-                            Shared::send_vrx_mute(&sh23, slot, false);
-                            sh23.audio.unmute();
-                            Shared::send_vrx(&sh23, &sb, bw, g);
-                            sh23.notify();
-                        })}>
-                            {"On"}
-                        </button>
-                        <button disabled={!vrx_on} onclick={Callback::from(move |_| {
-                            let slot = *sh25.vrx_slot.borrow();
-                            sh25.audio.mute();
-                            Shared::send_vrx_off(&sh25);
-                            sh25.vrx.borrow_mut().remove(&slot);
-                            sh25.notify();
-                        })}>
-                            {"Off"}
-                        </button>
-                    </div>
+                      </div>
+                  </div>
+                      </div>
+                      <div class="col-right">
+                          <div class={if online && started { "fpanel" } else { "fpanel idle" }}>
+                              <div class="fpanel-block">
+                                  <span class="fpanel-label">{"RX filter bank"}</span>
+                                  {oc_row}
+                              </div>
+                              <div class="fpanel-sep"></div>
+                              <div class="fpanel-block">
+                                  <span class="fpanel-label">{"LNA"}</span>
+                                  <input type="range" min="-12" max="48" step="1"
+                                      value={lna_cur.to_string()}
+                                      style={format!("--fill: {}%", lna_pct)}
+                                      class="lna-slider"
+                                      aria-label="LNA gain (dB)"
+                                      oninput={Callback::from(move |e: web_sys::InputEvent| {
+                                          if let Some(inp) = e.target_dyn_into::<HtmlInputElement>() {
+                                              let v: i8 = inp.value().parse::<i8>().unwrap_or(6).clamp(-12, 48);
+                                              *sh10.lna.borrow_mut() = v;
+                                              if *sh10.started.borrow() {
+                                                  Shared::send_lna(&sh10, v);
+                                              }
+                                          }
+                                          sh10.notify();
+                                      })}/>
+                                  <span class="lna-val">{format!("{:+} dB", lna_cur)}</span>
+                              </div>
+                          </div>
 
-                    {decode_log_html}
-                </div>
+                          <div class="gauge">
+                              <div class="gauge-outer-labels">
+                                  {
+                                      SMETER_TICKS.iter().map(|(lbl, frac)| {
+                                          let red = *frac > 0.6;
+                                          html! { <span class={if red {"gauge-tick red"} else {"gauge-tick"}} style={format!("left: calc({}%)", (*frac * 100.0).floor())}>{*lbl}</span> }
+                                      }).collect::<Html>()
+                                  }
+                              </div>
+                              <div class="gauge-track">
+                                  <div class="gauge-fill" style={format!("width: {}%", gauge_val)}></div>
+                              </div>
+                              <div class="gauge-inner-labels">
+                                  {
+                                      SWR_TICKS.iter().map(|(lbl, frac)| {
+                                          let red = *frac > 0.625;
+                                          html! { <span class={if red {"gauge-tick red"} else {"gauge-tick"}} style={format!("left: calc({}%)", (*frac * 100.0).floor())}>{*lbl}</span> }
+                                      }).collect::<Html>()
+                                  }
+                              </div>
+                          </div>
+                      </div>
+                  </div>
 
-                <footer class="hint">
-                    <p>{"Binary frames: "}<code>{"0x01 0x00"}</code>{" (CH_WIDEBAND) → magnitude spectrum. Control via JSON."}</p>
-                </footer>
-            </div>
-        }
+
+                      <canvas id="panadapter" width="800" height="250"></canvas>
+                      <canvas id="waterfall" width="800" height="256" class="waterfall"></canvas>
+                        // Auto decode on its own row so a long monitor list
+                        // (3 modes x multiple bands) can't wrap the Floor/Ceil
+                        // inputs onto a different line from the Auto scale box.
+                         <div class="row autodecode-row">{auto_row.clone()}</div>
+                         <div class="row scale-row">
+                           <label class="autobox">
+                             <input
+                                 type="checkbox"
+                                 checked={floor_auto}
+                                 onchange={Callback::from(move |e: web_sys::Event| {
+                                     if let Some(dom) = e.target() {
+                                         if let Ok(cx) = dom.dyn_into::<HtmlInputElement>() {
+                                             let on = cx.checked();
+                                             if on {
+                                                 *sh18.auto_recenter.borrow_mut() = true;
+                                             } else {
+                                                 *sh18.floor.borrow_mut() = *sh18.auto_floor.borrow();
+                                                 *sh18.ceil.borrow_mut() = *sh18.auto_ceil.borrow();
+                                             }
+                                             *sh18.floor_auto.borrow_mut() = on;
+                                         }
+                                     }
+                                     sh18.notify();
+                                 })}
+                             />
+                             {"Auto scale"}
+                         </label>
+                         <label>{"Floor dB "}
+                             <input type="number" min="-120" max="0" disabled={floor_auto}
+                                 value={scale_floor_display.to_string()} oninput={Callback::from(move |e: web_sys::InputEvent| {
+                                 if let Some(inp) = e.target_dyn_into::<HtmlInputElement>() {
+                                     let v: f64 = inp.value().parse::<f64>().unwrap_or(*sh7.floor.borrow());
+                                     *sh7.floor.borrow_mut() = v;
+                                     *sh7.floor_auto.borrow_mut() = false;
+                                 }
+                                 sh7.notify();
+                             })} />
+                         </label>
+                         <label>{"Ceil dB "}
+                             <input type="number" min="-100" max="30" disabled={floor_auto}
+                                 value={scale_ceil_display.to_string()} oninput={Callback::from(move |e: web_sys::InputEvent| {
+                                 if let Some(inp) = e.target_dyn_into::<HtmlInputElement>() {
+                                     let v: f64 = inp.value().parse::<f64>().unwrap_or(*sh8.ceil.borrow());
+                                     *sh8.ceil.borrow_mut() = v;
+                                     *sh8.floor_auto.borrow_mut() = false;
+                                 }
+                                 sh8.notify();
+                             })} />
+                         </label>
+                     </div>
+
+                 <div class="panel decode-panel">
+                     {decode_log_html}
+                 </div>
+
+                 <footer class="hint">
+                     <p>{"Binary frames: "}<code>{"0x01 0x00"}</code>{" (CH_WIDEBAND) → magnitude spectrum. Control via JSON."}</p>
+                 </footer>
+             </div>
+         }
 }
 
 #[cfg(test)]
