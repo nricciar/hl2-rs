@@ -1835,27 +1835,29 @@ pub fn app() -> Html {
                               </div>
                           </div>
 
-                          <div class="gauge">
-                              <div class="gauge-outer-labels">
-                                  {
-                                      SMETER_TICKS.iter().map(|(lbl, frac)| {
-                                          let red = *frac > 0.6;
-                                          html! { <span class={if red {"gauge-tick red"} else {"gauge-tick"}} style={format!("left: calc({}%)", (*frac * 100.0).floor())}>{*lbl}</span> }
-                                      }).collect::<Html>()
-                                  }
-                              </div>
-                              <div class="gauge-track">
-                                  <div class="gauge-fill" style={format!("width: {}%", gauge_val)}></div>
-                              </div>
-                              <div class="gauge-inner-labels">
-                                  {
-                                      SWR_TICKS.iter().map(|(lbl, frac)| {
-                                          let red = *frac > 0.625;
-                                          html! { <span class={if red {"gauge-tick red"} else {"gauge-tick"}} style={format!("left: calc({}%)", (*frac * 100.0).floor())}>{*lbl}</span> }
-                                      }).collect::<Html>()
-                                  }
-                              </div>
-                          </div>
+                           <div class="gauge">
+                               <span class="gauge-rowname gauge-rowname-top">{"S"}</span>
+                               <div class="gauge-outer-labels">
+                                   {
+                                       SMETER_TICKS.iter().map(|(lbl, frac)| {
+                                           let red = *frac > 0.6;
+                                           html! { <span class={if red {"gauge-tick red"} else {"gauge-tick"}} style={format!("left: calc({}%)", (*frac * 100.0).floor())}>{*lbl}</span> }
+                                       }).collect::<Html>()
+                                   }
+                               </div>
+                               <div class="gauge-track">
+                                   <div class="gauge-fill" style={format!("width: {}%", gauge_val)}></div>
+                               </div>
+                               <div class="gauge-inner-labels">
+                                   {
+                                       SWR_TICKS.iter().map(|(lbl, frac)| {
+                                           let red = *frac > 0.625;
+                                           html! { <span class={if red {"gauge-tick red"} else {"gauge-tick"}} style={format!("left: calc({}%)", (*frac * 100.0).floor())}>{*lbl}</span> }
+                                       }).collect::<Html>()
+                                   }
+                               </div>
+                               <span class="gauge-rowname gauge-rowname-bottom">{"SWR"}</span>
+                           </div>
                       </div>
                   </div>
 

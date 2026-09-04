@@ -393,15 +393,25 @@ input[type=number]:disabled {
     Past S9 (≥60 %) the track's red tail lights up; past 2.5:1 (≥62.5 %) the
     same tail is the SWR red zone. Width is set by the parent column (see
     `.col-right`) — no box/border; just the bar + labels. */
- .gauge {
-     position: relative;
-     padding: 1.45rem 0.35rem;
- }
+  .gauge {
+      position: relative;
+      padding: 1.45rem 0.35rem;
+      /* Width of the left gutter reserved for the "S" / "SWR" row names.
+         The track and both tick rows shift right by this amount so they
+         start after the row names (see `.gauge-track` / `.gauge-*-labels`);
+         the row names themselves sit in this strip (`.gauge-rowname`). */
+      --gauge-gutter: 2.7rem;
+  }
 /* Outer S scale: `left: <frac> %` pins each label to its fractional position
    on the underlying bar. The track is 14 px tall, centred in the
    .gauge's content box. */
 .gauge-track {
     position: relative;
+    /* Shift the bar right so it starts after the "S"/"SWR" row-name gutter
+       (reserved in `.gauge` as `--gauge-gutter`). The bar gets slightly
+       shorter on the left; the tick rows below are shifted by the same
+       amount so they stay aligned to this bar's ends. */
+    margin-left: var(--gauge-gutter);
     height: 14px;
     border-radius: 3px;
     background: #0a0e15;
@@ -434,30 +444,36 @@ input[type=number]:disabled {
     transition: width 80ms linear;
 }
 /* Tick labels above the track (S scale). */
-.gauge-outer-labels {
-    position: absolute;
-    top: 0;
-    left: 0.4rem;
-    right: 0.4rem;
-    height: 1.4rem;
-    pointer-events: none;
-}
+ .gauge-outer-labels {
+     position: absolute;
+     top: 0;
+     /* Start after the "S"/"SWR" row-name gutter (the track is shifted right
+        by the same `--gauge-gutter` via `margin-left`), keeping the original
+        0.4rem inset so the S ticks still line up with the track's ends. */
+     left: calc(0.4rem + var(--gauge-gutter));
+     right: 0.4rem;
+     height: 1.4rem;
+     pointer-events: none;
+ }
 /* Tick labels below the track (SWR scale). Mirrors the top row:
    `align-items: flex-end` pins each tick span to the container's bottom
    edge (adjacent to the track's bottom border), so its `::after` stub
    hangs **up** out of the track — exactly the vertical distance that the
    top row's stub hangs *down* in — instead of the spans sitting at the top
    of the container and their stubs overlapping the track. */
-.gauge-inner-labels {
-    position: absolute;
-    bottom: 0;
-    left: 0.4rem;
-    right: 0.4rem;
-    height: 1.4rem;
-    pointer-events: none;
-    display: flex;
-    align-items: flex-end;
-}
+ .gauge-inner-labels {
+     position: absolute;
+     bottom: 0;
+     /* Same left/right offset as the top row: shifted right by the
+        `--gauge-gutter` row-name strip so the SWR ticks line up with the
+        shifted track's ends. */
+     left: calc(0.4rem + var(--gauge-gutter));
+     right: 0.4rem;
+     height: 1.4rem;
+     pointer-events: none;
+     display: flex;
+     align-items: flex-end;
+ }
 /* Tick labels above the track (S scale) and below it (SWR scale). Both rows
    share the same .gauge-tick styling; positional classes place the marker
    stub on the right side of the label — downward stub for the top row,
@@ -499,12 +515,39 @@ input[type=number]:disabled {
     bottom: 100%;
     margin-bottom: 2px;
 }
-.gauge-tick.red {
+ .gauge-tick.red {
     color: var(--err);
-}
-.gauge-tick.red::after {
+ }
+ .gauge-tick.red::after {
     background: rgba(224,91,91,0.6);
-}
+ }
+ /* The "S" / "SWR" row names: sit in the left gutter (reserved on `.gauge`
+    as `--gauge-gutter`), right-aligned up against the track, and share the
+    exact text metrics of `.gauge-tick` (size / font / colour) so they read
+    as the row's name for the same scale. No tick stub — they are a label,
+    not a position marker. */
+ .gauge-rowname {
+    position: absolute;
+    left: 0.35rem;
+    width: var(--gauge-gutter);
+    box-sizing: border-box;
+    text-align: left;
+    height: 1em;
+    line-height: 1;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.62rem;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    pointer-events: none;
+    user-select: none;
+ }
+ .gauge-rowname-top {
+     top: 0;
+ }
+ .gauge-rowname-bottom {
+     bottom: 0;
+ }
 
 /* Config row: Mode / BW / Gain for the active tab's receiver. Sized to the
    gauge width by virtue of being full-width; each block has its own label +
