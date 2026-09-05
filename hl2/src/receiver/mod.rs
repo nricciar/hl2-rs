@@ -48,9 +48,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub use auto::{AUTO_MODES, AutoMode};
 pub use baseband_ring::{BASEBAND_RING_CAP, BasebandRing};
+pub use demod::AudioEngine;
 pub use demod::{
-    AmDemodulator, Demodulator, DigitalDemodulator, F32Fir, F32FirState, IqBlock, Nco,
-    PolyphaseDecimator, RawSampleTap, SsbDemodulator, make_demod, make_demod_tap,
+    AmCore, AmDemodulator, DemodCore, Demodulator, DigitalCore, DigitalDemodulator, F32Fir,
+    F32FirState, IqBlock, Nco, PolyphaseDecimator, RawSampleTap, SsbCore, SsbDemodulator,
+    StandardDemod, make_demod, make_demod_tap,
 };
 pub use fanout::BasebandFanout;
 pub use ft4::{
