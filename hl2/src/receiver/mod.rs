@@ -49,8 +49,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub use auto::{AUTO_MODES, AutoMode};
 pub use baseband_ring::{BASEBAND_RING_CAP, BasebandRing};
 pub use demod::{
-    Demodulator, DigitalDemodulator, F32Fir, F32FirState, IqBlock, Nco, PolyphaseDecimator,
-    RawSampleTap, SsbDemodulator, make_demod, make_demod_tap,
+    AmDemodulator, Demodulator, DigitalDemodulator, F32Fir, F32FirState, IqBlock, Nco,
+    PolyphaseDecimator, RawSampleTap, SsbDemodulator, make_demod, make_demod_tap,
 };
 pub use fanout::BasebandFanout;
 pub use ft4::{
@@ -99,6 +99,9 @@ pub enum Sideband {
 /// `BasebandTap` idea in PROTOCOL.md §16.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
+    /// AM (DSB-FC, full-carrier) voice. Both sidebands pass; the carrier DC
+    /// is removed by the AGC DC-block step. See [`am::AmDemodulator`].
+    Am,
     /// Single-sideband voice, with the selected sideband.
     Ssb(Sideband),
     /// Wideband complex pass-through (digital-mode placeholder).
@@ -139,6 +142,7 @@ impl Mode {
     /// `bandwidth_hz`.
     pub fn default_bandwidth_hz(&self) -> u32 {
         match self {
+            Mode::Am => 8_000,
             Mode::Ssb(_) => 2_600,
             Mode::SsbWide => 2_400_000,
             Mode::Ft8 => 2_600,
@@ -152,6 +156,7 @@ impl Mode {
     /// `Ft8`.
     pub fn sideband(&self) -> Option<Sideband> {
         match self {
+            Mode::Am => None,
             Mode::Ssb(s) => Some(*s),
             Mode::SsbWide => None,
             Mode::Ft8 => Some(Sideband::Usb),

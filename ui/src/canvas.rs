@@ -290,6 +290,10 @@ pub fn draw_vrx_passband(
     let centre = center as f64 + offset_hz as f64;
     let (lo, hi) = if sideband == "lsb" {
         (centre - bw_hz as f64, centre)
+    } else if sideband == "am" {
+        // AM (DSB-FC): both sidebands pass — a symmetric band about the
+        // carrier, `[centre−bw, centre+bw]`.
+        (centre - bw_hz as f64, centre + bw_hz as f64)
     } else {
         (centre, centre + bw_hz as f64)
     };
@@ -306,6 +310,8 @@ pub fn draw_vrx_passband(
     }
     let color = if sideband == "lsb" {
         "rgba(96, 160, 255, 0.18)" // blue — LSB below the tune
+    } else if sideband == "am" {
+        "rgba(245, 187, 80, 0.18)" // amber — AM, symmetric about the tune
     } else {
         "rgba(76, 215, 125, 0.18)" // green — USB above the tune
     };

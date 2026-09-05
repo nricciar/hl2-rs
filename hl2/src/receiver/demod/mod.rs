@@ -15,6 +15,11 @@
 //! * [`ssb`] — the SSB (USB/LSB) **voice** demodulator ([`SsbDemodulator`]):
 //!   NCO → product-discriminate (USB in-phase / LSB Hilbert) → polyphase
 //!   anti-alias + decimate → AGC → i16, at the voice-rate window.
+//! * [`am`] — the AM (DSB-FC, full-carrier) **voice** demodulator
+//!   ([`AmDemodulator`]): NCO → in-phase arm → polyphase anti-alias +
+//!   decimate → AGC → i16. No Hilbert / sideband selection — both sidebands
+//!   pass through the LPF and the carrier DC is removed by the AGC
+//!   DC-block.
 //! * [`digital`] — the FT8/JS8/FT4 **digital** demodulator
 //!   ([`DigitalDemodulator`]): USB NCO → polyphase decimation straight to the
 //!   12 kHz window rate (no quadrature synthesis), with an optional
@@ -25,6 +30,7 @@
 //! and `audio_format()` — so AM/FM/CW slot in without touching the receiver
 //! loop or the sink API.
 
+pub mod am;
 pub mod digital;
 pub mod dsp;
 pub mod ssb;
@@ -40,6 +46,7 @@ use super::{AudioConfig, MeterHandle, Mode, Sideband, meter_write};
 // Re-export the mode demodulators + shared DSP so the module-root paths
 // (`hl2::receiver::demod::{SsbDemodulator, F32Fir, Nco, …}` and
 // `super::demod::RawSampleTap` from ft8/ft4/js8) keep resolving.
+pub use am::AmDemodulator;
 pub use digital::DigitalDemodulator;
 pub use dsp::{F32Fir, F32FirState, KAISER_BETA, Nco, PolyphaseDecimator};
 pub use ssb::SsbDemodulator;
@@ -300,10 +307,20 @@ pub fn make_demod_tap(
             meter,
         )?));
     }
+    if matches!(mode, Mode::Am) {
+        return Ok(Box::new(am::AmDemodulator::new(
+            source_rate_hz,
+            source_center_hz,
+            bandwidth_hz,
+            audio,
+            tap,
+            meter,
+        )?));
+    }
     let sideband = match mode {
         Mode::Ssb(s) => s,
         Mode::SsbWide => Sideband::Usb,
-        Mode::Ft8 | Mode::Js8 | Mode::Ft4 => unreachable!(),
+        Mode::Ft8 | Mode::Js8 | Mode::Ft4 | Mode::Am => unreachable!(),
     };
     Ok(Box::new(ssb::SsbDemodulator::new(
         sideband,

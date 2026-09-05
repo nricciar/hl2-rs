@@ -170,6 +170,8 @@ pub struct AutoMonitor {
 pub enum VrxMode {
     Usb,
     Lsb,
+    /// AM (DSB-FC, full-carrier) voice demod.
+    Am,
     Ft8,
     Js8,
     Ft4,

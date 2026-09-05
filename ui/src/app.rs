@@ -36,6 +36,7 @@ struct VrxSlotCfg {
 enum VrxModeChoice {
     Usb,
     Lsb,
+    Am,
     Ft8,
     Js8,
     Ft4,
@@ -99,6 +100,7 @@ impl VrxModeChoice {
         match self {
             VrxModeChoice::Usb => "usb",
             VrxModeChoice::Lsb => "lsb",
+            VrxModeChoice::Am => "am",
             VrxModeChoice::Ft8 => "ft8",
             VrxModeChoice::Js8 => "js8",
             VrxModeChoice::Ft4 => "ft4",
@@ -107,6 +109,7 @@ impl VrxModeChoice {
     fn parse(s: &str) -> Self {
         match s {
             "lsb" => VrxModeChoice::Lsb,
+            "am" => VrxModeChoice::Am,
             "ft8" => VrxModeChoice::Ft8,
             "js8" => VrxModeChoice::Js8,
             "ft4" => VrxModeChoice::Ft4,
@@ -663,6 +666,7 @@ impl Shared {
             offset_hz: 0,
             mode: match c.mode {
                 VrxModeChoice::Lsb => hl2_common::VrxMode::Lsb,
+                VrxModeChoice::Am => hl2_common::VrxMode::Am,
                 VrxModeChoice::Ft8 => hl2_common::VrxMode::Ft8,
                 VrxModeChoice::Js8 => hl2_common::VrxMode::Js8,
                 VrxModeChoice::Ft4 => hl2_common::VrxMode::Ft4,
@@ -906,6 +910,7 @@ impl Shared {
 fn vrx_cmd_msg(slot: u8, mode: &str, bw_hz: u32, gain_db: f32) -> Option<String> {
     let mode = match mode {
         "lsb" => hl2_common::VrxMode::Lsb,
+        "am" => hl2_common::VrxMode::Am,
         "ft8" => hl2_common::VrxMode::Ft8,
         "js8" => hl2_common::VrxMode::Js8,
         "ft4" => hl2_common::VrxMode::Ft4,
@@ -1240,8 +1245,8 @@ fn draw_all(sh: &Shared) {
     let span_hz = *sh.spectrum_span_hz.borrow();
     // Per-slot virtual receivers currently active (offset, mode, bw) —
     // each shades its own passband on the currently-displayed source.
-    // (Mode → tint key via `vrx_mode_str_sideband`: LSB tints blue, USB/FT8
-    // green.)
+    // (Mode → tint key via `vrx_mode_str_sideband`: LSB blue, USB/FT8 green,
+    // AM amber — a symmetric band about the tune.)
     let vrx_bands: Vec<(i32, String, u32)> = sh
         .vrx
         .borrow()
@@ -1298,6 +1303,7 @@ fn draw_all(sh: &Shared) {
 fn vrx_mode_str_sideband(v: &hl2_common::VrxState) -> String {
     match v.mode {
         hl2_common::VrxMode::Lsb => "lsb".to_string(),
+        hl2_common::VrxMode::Am => "am".to_string(),
         _ => "usb".to_string(),
     }
 }
@@ -1308,6 +1314,7 @@ fn vrx_mode_label(m: &hl2_common::VrxMode) -> String {
         hl2_common::VrxMode::Ft8 => "FT8".to_string(),
         hl2_common::VrxMode::Js8 => "JS8".to_string(),
         hl2_common::VrxMode::Ft4 => "FT4".to_string(),
+        hl2_common::VrxMode::Am => "AM".to_string(),
         hl2_common::VrxMode::Usb => "USB".to_string(),
         hl2_common::VrxMode::Lsb => "LSB".to_string(),
     }
@@ -1718,9 +1725,10 @@ pub fn app() -> Html {
                                      }
                                  }
                              })}>
-                             <option value="usb" selected={vrx_sideband_cur == VrxModeChoice::Usb}>{"USB"}</option>
-                             <option value="lsb" selected={vrx_sideband_cur == VrxModeChoice::Lsb}>{"LSB"}</option>
-                             <option value="ft8" selected={vrx_sideband_cur == VrxModeChoice::Ft8}>{"FT8"}</option>
+                              <option value="usb" selected={vrx_sideband_cur == VrxModeChoice::Usb}>{"USB"}</option>
+                              <option value="lsb" selected={vrx_sideband_cur == VrxModeChoice::Lsb}>{"LSB"}</option>
+                              <option value="am" selected={vrx_sideband_cur == VrxModeChoice::Am}>{"AM"}</option>
+                              <option value="ft8" selected={vrx_sideband_cur == VrxModeChoice::Ft8}>{"FT8"}</option>
                              <option value="js8" selected={vrx_sideband_cur == VrxModeChoice::Js8}>{"JS8"}</option>
                              <option value="ft4" selected={vrx_sideband_cur == VrxModeChoice::Ft4}>{"FT4"}</option>
                          </select>

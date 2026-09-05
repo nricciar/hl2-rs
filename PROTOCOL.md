@@ -764,7 +764,7 @@ WebSocket (server↔client) contract, in `common/src/lib.rs`:
   | `AudioFrame` | `{slot, seq, rate_hz, samples}` | Binary **audio** payload on `CH_AUDIO`; `slot` routes the block to a virtual receiver | `lib.rs:470` |
   | `VrxCfg` | `{slot, offset_hz, mode, bw_hz, gain_db}` | Requested virtual-receiver config | `lib.rs:201` |
   | `VrxState` | `{slot, offset_hz, mode, bw_hz, gain_db, rate_hz, muted}` | Echo of the active receiver (see `SharedState.vrx`) | `lib.rs:217` |
-   | `VrxMode` | `Usb \| Lsb \| Ft8 \| Js8` | Demod mode (renamed `usb`/`lsb`/`ft8`/`js8` on the wire) | `lib.rs` |
+    | `VrxMode` | `Usb \| Lsb \| Am \| Ft8 \| Js8 \| Ft4` | Demod mode (renamed `usb`/`lsb`/`am`/`ft8`/`js8`/`ft4` on the wire) | `lib.rs` |
   | `SharedState.vrx` | `BTreeMap<u8, VrxState>` | Per-slot active virtual receivers (keyed by RX slot). Mirrored into the UI panel + spectrum passband overlay. Re-echoed on every `SharedState` like `oc_bits`, so all tabs converge. | `lib.rs:146` |
   | `ClientCmd::SetVrx` | `setvrx { cfg: Option<VrxCfg> }` | Create / update the virtual receiver on `cfg.slot`. `cfg: null` tears down that slot. | `lib.rs:345` |
   | `ClientCmd::SetVrxMute` | `setvrxmute { slot, muted }` | Mute / unmute a slot's receiver without rebuilding. | `lib.rs:353` |
@@ -821,7 +821,8 @@ reference-grade:
 A software **audio receiver** lives in the `hl2` crate (`hl2/src/receiver/`):
 it takes the radio's per-slot **complex I/Q baseband** (`num_complex::Complex<f32>`
 pairs at a DDC rate — tests use 192 kHz) and demodulates it to **`i16` mono
-audio** for listening, SSB (USB/LSB) today and AM / FM / FT8 / CW later.
+audio** for listening, SSB (USB/LSB) and AM (DSB-FC) today plus FT8 / JS8 /
+FT4 digital modes; FM and CW later.
 
 > **Status:** the DSP, the three trait seams (`BasebandSource`,
 > `Demodulator`, `AudioSink`), a live EP6 `BasebandSource` and the working
@@ -937,10 +938,11 @@ BasebandSource               Demodulator                      AudioSink
  either `process(iq)` (mod.rs:199) feeds one block or `run(&mut source)`
  (mod.rs:210) drains an entire `BasebandSource`. `ReceiverConfig`
  (mod.rs:117) carries `mode` / `source_rate_hz` / `source_center_hz` /
- `bandwidth_hz` / `audio` (`AudioConfig`, mod.rs:99 — `rate_hz`, `gain_db`).
- `Mode` (mod.rs:68) is `Ssb(Usb|Lsb)` (sideband enum, mod.rs:54) or `SsbWide`
- (the complex pass-through placeholder for digital modes);
- `Mode::default_bandwidth_hz` (mod.rs:81) supplies the channel-select width.
+  `bandwidth_hz` / `audio` (`AudioConfig`, mod.rs:99 — `rate_hz`, `gain_db`).
+  `Mode` (mod.rs:68) is `Am` (full-carrier DSB voice), `Ssb(Usb|Lsb)`
+  (sideband enum, mod.rs:54), or `SsbWide` (the complex pass-through
+  placeholder for digital modes); `Mode::default_bandwidth_hz` (mod.rs:81)
+  supplies the channel-select width.
 
 ### 16.3 SSB demodulation (the DSP that's implemented)
 
@@ -1004,11 +1006,37 @@ phase-shift of `post` (`F32Fir::hilbert`,
 
 `IqBlock` is just `Vec<Complex<f32>>` (demod/mod.rs:86). Error types are
 `InvalidBlockLength` / `RateTooClose` (demod/mod.rs:53, demod/mod.rs:67) boxed
-into `DemodError` (demod/mod.rs:83). Tests in `demod/{ssb,dsp,digital}.rs`
+into `DemodError` (demod/mod.rs:83). Tests in `demod/{ssb,dsp,digital,am}.rs`
 cover in-band USB **and** LSB tones producing audio, in-band-pass/out-of-band-
 reject, the NCO moving an off-band tone into band, the FIR ring / polyphase
-identities, and the digital path out-of-band rejection; `mod.rs` tests cover
-the full `VirtualReceiver` over a `VecSource`.
+identities, the digital path out-of-band rejection, and the AM tone / real-
+baseband / reject / NCO-offset cases; `mod.rs` tests cover the full
+`VirtualReceiver` over a `VecSource`.
+
+### 16.3a AM demodulation (DSB-FC)
+
+The AM chain, in `AmDemodulator::demod`
+([`demod/am.rs`](hl2/src/receiver/demod/am.rs)) — the "keep the in-phase arm"
+half of the SSB pipeline with the Hilbert discarded — is **NCO → in-phase arm
+→ polyphase anti-alias / decimate → AGC (DC-block + RMS target) → i16**:
+
+```text
+each complex pair (I,Q):
+  1  NCO multiply  post = x · e^(−j·φ)          demod/am.rs (demod loop)
+  2  select        r0 = post.re                 demod/am.rs (post.re)
+  3  LPF+decimate  out = lp.push(r0) [polyphase] demod/am.rs
+per block (when enough has accumulated):
+  4  AGC + DC      i16 = DC-block · AGC · gain   demod/mod.rs (normalize_to_i16_with_agc)
+```
+
+Full-carrier AM is `A·[1+m(t)]·cos(2πf_c t)`; down-converting to baseband and
+low-passing yields `A/2·[1+m(t)]` on the **real** arm. The carrier DC (`A/2`)
+is removed by the AGC DC-block step, leaving the modulated audio. **No Hilbert
+and no sideband selection** are needed — both sidebands pass the LPF symmetrically
+— so the DSP is the `DigitalDemodulator` structure (NCO → `post.re` →
+`PolyphaseDecimator`), with a default voice bandwidth of 8 kHz
+(`Mode::Am::default_bandwidth_hz`). Dispatch: `Mode::Am` →
+`AmDemodulator::new` in [`make_demod_tap`](hl2/src/receiver/demod/mod.rs).
 
 ### 16.4 Sinks
 
