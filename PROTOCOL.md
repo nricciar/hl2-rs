@@ -918,16 +918,16 @@ without touching the others (`hl2/src/receiver/mod.rs`):
 BasebandSource               Demodulator                      AudioSink
 (complex I/Q f32 @ddc)  ──► (NCO + channel-select +  ──►  (play to ALSA |
    e.g. VecSource                audio LPF + decimate)     capture to Vec)
-    source.rs:18                demod.rs:75                 sink.rs:30
+     source.rs:18                demod/mod.rs:94             sink.rs:30
  ```
  
  * [`BasebandSource`](hl2/src/receiver/source.rs:18) — where the I/Q comes from
    (socket, file, synth). `VecSource` (source.rs:41) is the in-memory stand-in
    used by tests; `next_block` (source.rs:72) returns `usize` pairs into a
    caller buffer. The socket source is a follow-up (see §16.5).
- * [`Demodulator`](hl2/src/receiver/demod.rs:75) — the mode DSP.
-   `SsbDemodulator` (demod.rs:241) is built-in; new modes add a `Demodulator`
-   plus a `Mode` variant and a branch in [`make_demod`](hl2/src/receiver/demod.rs:339).
+  * [`Demodulator`](hl2/src/receiver/demod/mod.rs:94) — the mode DSP.
+    `SsbDemodulator` (demod/ssb.rs:35) is built-in; new modes add a `Demodulator`
+    plus a `Mode` variant and a branch in [`make_demod`](hl2/src/receiver/demod/mod.rs:249).
  * [`AudioSink`](hl2/src/receiver/sink.rs:30) — where the audio goes.
    `VecSink` (sink.rs:45) captures for tests; `AlsaSink` (sink.rs:135) plays
    via `cpal`, gated on the `alsa` feature.
@@ -945,24 +945,23 @@ BasebandSource               Demodulator                      AudioSink
 ### 16.3 SSB demodulation (the DSP that's implemented)
 
 The actual SSB chain, in `SsbDemodulator::demod`
-([`demod.rs:559`](hl2/src/receiver/demod.rs:559)), is an **NCO +
+([`demod/ssb.rs:198`](hl2/src/receiver/demod/ssb.rs:198)), is an **NCO +
 product-discriminator (Hilbert) + real channel-select LPF + audio decimator**:
 
 ```text
 each complex pair (I,j):
-  1  NCO multiply  post = Re(x · e^(−j·φ))            demod.rs:590-604
+  1  NCO multiply  post = Re(x · e^(−j·φ))            demod/ssb.rs:229
   2  discriminate  USB: r0 = post
-                   LSB: r0 = Hilbert(post)            demod.rs:609-613
-  3  real LPF      r  = filter.convolve(r0)           demod.rs:616
-  4  decimate      audio_buf += Decimator::push(r)    demod.rs:619
+                    LSB: r0 = Hilbert(post)            demod/ssb.rs:236
+  3  LPF+decimate  out = lp.push(r0)  [polyphase]     demod/ssb.rs:240
+  4  accumulate    audio_buf += out                   demod/ssb.rs:240
 per block (when enough has accumulated):
-  5  AGC + DC      i16 = DC-block · AGC · gain        demod.rs:626, 513
+  5  AGC + DC      i16 = DC-block · AGC · gain        demod/ssb.rs:138, demod/mod.rs:198
 ```
 
-* **NCO** (`nco_step`/`nco_phase`, stepped + phase-wrapped at
-  [`demod.rs:593-604`](hl2/src/receiver/demod.rs:593)).
-  `φ̇ = 2π·source_center_hz / fs` (`make_demod`,
-  [`demod.rs:675`](hl2/src/receiver/demod.rs:675)). With a baseband source
+* **NCO** (phase-recurrence, stepped via [`Nco::step`](hl2/src/receiver/demod/dsp.rs:104)).
+  `φ̇ = 2π·source_center_hz / fs` (installed in `make_demod_tap`,
+  [`demod/mod.rs:278`](hl2/src/receiver/demod/mod.rs:278)). With a baseband source
   `source_center_hz == 0` so `nco_step == 0` and the multiply is the identity —
   the USB/LSB distinction is then purely the discriminator below. In the full
   stack (where the DDC hands down an *offset* carrier) a non-zero `nco_step`
@@ -971,41 +970,45 @@ what separates USB from LSB (the reference keeps the in-phase arm for USB and
 conjugates it for LSB).
 * **Product discriminator** — the USB keeps the **in-phase** post-NCO arm
   (`post`); the LSB keeps the **quadrature** arm, synthesised as a 90° (Hilbert)
-  phase-shift of `post` (`F32Fir::hilbert`,
-  [`demod.rs:257`](hl2/src/receiver/demod.rs:257)) — the missing `e^{j·90°}` a
+phase-shift of `post` (`F32Fir::hilbert`,
+[`demod/dsp.rs:184`](hl2/src/receiver/demod/dsp.rs:184)) — the missing `e^{j·90°}` a
   real (Q≈0) baseband never had. The Hilbert is **only run for LSB** (it is
   pure overhead for USB, which discards it).
 * **Channel-select** — a symmetric, unit-gain, windowed-sinc **real** low-pass
-  FIR designed by [`F32Fir::lowpass`](hl2/src/receiver/demod.rs:215). Tap count
+  FIR designed by [`F32Fir::lowpass`](hl2/src/receiver/demod/dsp.rs:142). Tap count
   is forced *odd* (≥17) so the impulse response is centred on a whole sample
-  (linear phase, `H(0)=1`). `make_demod`
-  ([`demod.rs:667-673`](hl2/src/receiver/demod.rs:667)) picks **257 taps** for
+  (linear phase, `H(0)=1`). `SsbDemodulator::new`
+  ([`demod/ssb.rs:101`](hl2/src/receiver/demod/ssb.rs:101)) picks **257 taps** for
   the voice band and the Hilbert (`taps.max(257)`), over a `bandwidth_ratio`
-  clamped to `[1e-3, 0.4]`. Convolution runs through
-  [`F32FirState::convolve`](hl2/src/receiver/demod.rs:361) — a fixed,
-  pre-allocated history ring (the old `Vec::push`/`Vec::drain` rolling buffer
-  is gone), giving O(T) per sample with no reallocation and the same
-  zero-padded onset as [`F32Fir::apply`](hl2/src/receiver/demod.rs:293), which
+  clamped to `[1e-3, 0.4]`. The FIR is split into `M` polyphase branches and
+  convolved through
+  [`PolyphaseDecimator::push`](hl2/src/receiver/demod/dsp.rs:375) (built on the
+  fixed, pre-allocated ring of [`F32FirState::convolve`](hl2/src/receiver/demod/dsp.rs:300));
+  the old `Vec::push`/`Vec::drain` rolling buffer is gone, giving
+  ≈ `1/M` the tap-multiplies per sample with the same
+  zero-padded onset as [`F32Fir::apply`](hl2/src/receiver/demod/dsp.rs:220), which
   remains the reference implementation (the `firstate_matches_reference_apply`
   test locks the two together).
-  * **Decimate** — a one-pole LPF + rate reducer
-    ([`Decimator`](hl2/src/receiver/demod.rs:115)), `rate_in ≥ 4·rate_out`
-    ([`demod.rs:140`](hl2/src/receiver/demod.rs:140)). Keeps the post-decimate
+  * **Decimate** — the polyphase anti-alias / decimate stage
+    ([`PolyphaseDecimator`](hl2/src/receiver/demod/dsp.rs:375)), `rate_in ≥ 4·rate_out`
+    (the `RateTooClose` guard,
+    [`demod/mod.rs:67`](hl2/src/receiver/demod/mod.rs:67)). Keeps the post-decimate
     Nyquist well below the band edge.
   * **Normalise** — DC-block, then apply a slow **RMS-targeted AGC** (fast
     attack / slow release) to map each audio block onto target RMS `i16`, on
     top of the user's `gain_db`
-    ([`normalize_to_i16_with_agc`](hl2/src/receiver/demod.rs:513), state held
+    ([`normalize_to_i16_with_agc`](hl2/src/receiver/demod/mod.rs:198), state held
     in `SsbDemodulator.agc_gain`). Replaces the original per-block peak
     normaliser, which let the noise floor ride the signal envelope — the
     "loud static" symptom. See §16.5.
 
-`IqBlock` is just `Vec<Complex<f32>>` (demod.rs:67). Error types are
-`InvalidBlockLength` / `RateTooClose` (demod.rs:38, 48) boxed into
-`DemodError` (demod.rs:64). Tests in `demod.rs` cover in-band USB **and** LSB
-tones producing audio, in-band-pass/out-of-band-reject, and NCO moving an
-off-band tone into band; `mod.rs` tests cover the full `VirtualReceiver` over a
-`VecSource`.
+`IqBlock` is just `Vec<Complex<f32>>` (demod/mod.rs:86). Error types are
+`InvalidBlockLength` / `RateTooClose` (demod/mod.rs:53, demod/mod.rs:67) boxed
+into `DemodError` (demod/mod.rs:83). Tests in `demod/{ssb,dsp,digital}.rs`
+cover in-band USB **and** LSB tones producing audio, in-band-pass/out-of-band-
+reject, the NCO moving an off-band tone into band, the FIR ring / polyphase
+identities, and the digital path out-of-band rejection; `mod.rs` tests cover
+the full `VirtualReceiver` over a `VecSource`.
 
 ### 16.4 Sinks
 
@@ -1360,7 +1363,7 @@ silent but the *decode* task is what the user waits on.
 
 **Raw-sample tap.** `SsbDemodulator` carries an optional
 `RawSampleTap` (an `Arc<dyn RawSampleTap>`) installed in `make_demod_tap`
-([`hl2/src/receiver/demod.rs`](hl2/src/receiver/demod.rs)). The demod invokes
+([`hl2/src/receiver/demod/mod.rs`](hl2/src/receiver/demod/mod.rs)). The demod invokes
 it with each pre-AGC, decimated `f32` block, so the FT8 decoder sees the same
 samples the SSB/USB LSB path hears, before the RMS-AGC rescales. `Ft8Tap`
 (`hl2/src/receiver/ft8.rs`) is the concrete `RawSampleTap`: it appends into a
@@ -1461,7 +1464,7 @@ boundary, so the reference decodes **as the data becomes ready**
 is exactly what `js8_step` reproduces.
 
 **Mode + sample rate.** `VrxMode::Js8` selects the same **12 kHz** baseband
-path as FT8 (`make_demod_tap`, `hl2/src/receiver/demod.rs` — the demod is the
+path as FT8 (`make_demod_tap`, `hl2/src/receiver/demod/mod.rs` — the demod is the
 FT8/USB pipeline; `Mode::Js8` is a mode flag that makes `hl2-api` attach the
 JS8 tap instead of the FT8 tap). The `CH_AUDIO` stream still carries the
 demod output.

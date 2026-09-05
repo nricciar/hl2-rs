@@ -97,6 +97,7 @@ cargo build --release -p hl2-api --features embed-ui
   keep it single-threaded (`Rc`/`RefCell`).
 - The UI is Trunk-built; `ui/index.html` is the entry, `ui/src/main.rs` the
   browser `main()`, `ui/dist/` is build output.
+- **Sequential Tool Execution Only:** Never generate multiple subagent tool calls (such as calling the @explore or @general subagents) simultaneously in a single turn. Always issue exactly one subagent invocation, wait for the response, and evaluate the results before initiating the next step.
 
 ## Do not
 
