@@ -1138,6 +1138,92 @@ BasebandSource               Demodulator                      AudioSink
  `DigitalCore::new(…, <label>).demodulator(…)` in
  [`make_demod_tap`](hl2/src/receiver/demod/mod.rs:133).
 
+### 16.3d FM / NFM demodulation (phase derivative of a polyphase-LPF'd complex baseband)
+
+  The FM core is `FmCore::process`
+  ([`demod/fm.rs:148`](hl2/src/receiver/demod/fm.rs:148)); standard FM
+  ([`Mode::Fm`](hl2/src/receiver/mod.rs:111), ≈ 15 kHz channel) and NFM
+  (`FmNarrow`, ≈ 5 kHz channel) share it — they are the **same DSP**,
+  distinguished only by the channel-select bandwidth `FmCore::new` tunes the
+  anti-alias / decimate LPF to (`Mode::default_bandwidth_hz`,
+  receiver/mod.rs:157–158). It is a
+  [`DemodCore`](hl2/src/receiver/demod/core.rs:41); the audio tail is the
+  shared [`AudioEngine`](hl2/src/receiver/demod/engine.rs:41):
+
+  ```text
+  each complex pair (I,Q) → FmCore::process (per-sample):
+    1  NCO multiply  post = x · e^(−j·φ)                                  demod/fm.rs:149
+    2  band-limit + decimate, per-arm:
+         i_dec = lp_i.push(post.re)   (lp_i = PolyphaseDecimator, channel BW)
+         q_dec = lp_q.push(post.im)   (lp_q = same taps, same M)            demod/fm.rs:153–154
+    3  on each (i_dec, q_dec) group boundary:                             demod/fm.rs:160–172
+         phase  = atan2(q, i)                     ∈ (−π, π]
+         delta  = wrap(phase − prev_phase)        ∈ (−π, π]   (radians)
+         emit   = delta
+  per input block → StandardDemod::demod (core.rs:108):
+    4  AGC + DC      i16 = DC-block · AGC · gain                          demod/engine.rs:221
+  ```
+
+  The HL2 EP6 wire always delivers **genuine complex I/Q** — the decoder
+  ([`parse_baseband_chunk`](hl2/src/protocol/data.rs:164)) writes
+  `Complex::new(i_re, q_im)` from two independent 24-bit words per I/Q
+  record, so **both** arms carry real signal energy in every
+  configuration. There is no "real (Q≈0)" mode to special-case; the SSB
+  core's Hilbert 90°-phase-shifter (which synthesises the missing
+  quadrature arm for legacy real-SDR input) is pure overhead here and is
+  deliberately not used.
+
+  The audio is the FM **deviation**, i.e. the instantaneous frequency —
+  the time-derivative of the phase. The demod reads the phase of each
+  decimated complex sample as `atan2(q, i)` and diffs it against the
+  previous phase, wrapping to the principal value `(−π, π]`. That wrapped
+  difference *is* the audio, in radians per decimated sample.
+
+  Two properties make this the correct choice for the HL2:
+
+  * **Band-limit first, then read phase.** The per-arm polyphase LPF is a
+    windowed-sinc, unit-gain low-pass at the channel-select bandwidth,
+    split into `M = source_rate / audio_rate` branches by
+    [`PolyphaseDecimator`](hl2/src/receiver/demod/dsp.rs:375). Running it
+    **before** `atan2` removes out-of-band and adjacent-channel noise so
+    the phase is well-defined and smooth over the audio band; reading the
+    phase on the unfiltered full-rate stream would mix wideband noise
+    into every sample and the `delta` would be dominated by noise rather
+    than by the deviation. The two arms share identical taps and the
+    same decimation factor, so their group boundaries line up (every
+    `M`-th input index) and the `(i, q)` pair at each boundary is a true
+    complex sample.
+
+  * **Phase (not magnitude) is the observable.** `atan2` returns a phase
+    regardless of carrier magnitude, so the demod is **naturally
+    amplitude-invariant** — a weak carrier and a strong one produce the
+    same `delta` for the same deviation. This sidesteps the
+    *amplitude-scaling* problem that broke the previous
+    "cross-product + divide-by-magnitude" version of this core: the
+    quad-mod numerator `|z|·|z′|·sin Δφ` scales as `A²`, and on the HL2's
+    weak DDC output (carrier amplitude ~ 1e-3) that lands ~ 1e-6, under
+    the AGC's useful range — *silent at any gain* while the S-meter showed
+    a loud signal. The phase-derivative read is O(1) in `A` for any
+    `A > 0`, which is exactly what the shared AGC (engine.rs:221) needs.
+
+  The deviation `[−f_dev, +f_dev]` is symmetric about DC, so the audio is
+  zero-mean for symmetric deviation and the AGC's DC-block has no work
+  left to do beyond removing a small residual offset.
+
+  Regression guards (all in the `fm.rs` `tests` module):
+  `inband_fm_produces_audio` / `nfm_narrow_channel_passes_in_band_deviation`
+  (peak level at a full-scale carrier), `weak_complex_baseband_fm_produces_audio`
+  / `weak_complex_baseband_nfm_produces_audio` (`A = 1e-3` — the HL2's
+  weak DDC output; asserts the output still reaches the AGC target), and
+  `weak_complex_fm_is_clean_tone` (Goertzel at 1.5 kHz vs. 3.0 kHz and
+  5.0 kHz — the voice bin must dominate its 2× harmonic *and* any
+  broadband floor, so a demod that leaks image at 2f — the "static, no
+  tone" symptom — fails the test).
+
+  Dispatch: `Mode::{Fm,FmNarrow}` →
+  `FmCore::new(…, "fm"|"nfm").demodulator(…)` in
+  [`make_demod_tap`](hl2/src/receiver/demod/mod.rs:167).
+
 ### 16.4 Sinks
 
 * [`AudioSink`](hl2/src/receiver/sink.rs:30) is deliberately `i16`-mono only

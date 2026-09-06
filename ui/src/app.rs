@@ -29,7 +29,7 @@ struct VrxSlotCfg {
     muted: bool,
 }
 
-/// The 5 modes the virtual receiver can demodulate (mirrors the panel
+/// The 7 modes the virtual receiver can demodulate (mirrors the panel
 /// dropdown). Kept as a small enum rather than `String` so
 /// [`VrxSlotCfg`] stays `Copy`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -37,6 +37,8 @@ enum VrxModeChoice {
     Usb,
     Lsb,
     Am,
+    Fm,
+    FmNarrow,
     Ft8,
     Js8,
     Ft4,
@@ -101,6 +103,8 @@ impl VrxModeChoice {
             VrxModeChoice::Usb => "usb",
             VrxModeChoice::Lsb => "lsb",
             VrxModeChoice::Am => "am",
+            VrxModeChoice::Fm => "fm",
+            VrxModeChoice::FmNarrow => "nfm",
             VrxModeChoice::Ft8 => "ft8",
             VrxModeChoice::Js8 => "js8",
             VrxModeChoice::Ft4 => "ft4",
@@ -110,10 +114,29 @@ impl VrxModeChoice {
         match s {
             "lsb" => VrxModeChoice::Lsb,
             "am" => VrxModeChoice::Am,
+            "fm" => VrxModeChoice::Fm,
+            // Both `"nfm"` (preferred operator spelling) and `"fm_narrow"`
+            // (the `lowercase` serde wire name) map to the narrow mode.
+            "nfm" | "fmnarrow" => VrxModeChoice::FmNarrow,
             "ft8" => VrxModeChoice::Ft8,
             "js8" => VrxModeChoice::Js8,
             "ft4" => VrxModeChoice::Ft4,
             _ => VrxModeChoice::Usb,
+        }
+    }
+    /// The default channel-select bandwidth (Hz) for this mode. Used to
+    /// seed/auto-set the receiver's channel width when an FM/NFM mode is
+    /// selected (the operator can still override via the BW field).
+    fn default_bw_hz(self) -> u32 {
+        match self {
+            VrxModeChoice::Am => 8_000,
+            VrxModeChoice::Fm => 15_000,
+            VrxModeChoice::FmNarrow => 5_000,
+            VrxModeChoice::Ft8
+            | VrxModeChoice::Js8
+            | VrxModeChoice::Ft4
+            | VrxModeChoice::Usb
+            | VrxModeChoice::Lsb => 2_600,
         }
     }
 }
@@ -667,6 +690,8 @@ impl Shared {
             mode: match c.mode {
                 VrxModeChoice::Lsb => hl2_common::VrxMode::Lsb,
                 VrxModeChoice::Am => hl2_common::VrxMode::Am,
+                VrxModeChoice::Fm => hl2_common::VrxMode::Fm,
+                VrxModeChoice::FmNarrow => hl2_common::VrxMode::FmNarrow,
                 VrxModeChoice::Ft8 => hl2_common::VrxMode::Ft8,
                 VrxModeChoice::Js8 => hl2_common::VrxMode::Js8,
                 VrxModeChoice::Ft4 => hl2_common::VrxMode::Ft4,
@@ -911,6 +936,9 @@ fn vrx_cmd_msg(slot: u8, mode: &str, bw_hz: u32, gain_db: f32) -> Option<String>
     let mode = match mode {
         "lsb" => hl2_common::VrxMode::Lsb,
         "am" => hl2_common::VrxMode::Am,
+        "fm" => hl2_common::VrxMode::Fm,
+        // Narrow-mode spelling: `"nfm"` (preferred) or `"fmnarrow"` (serde wire).
+        "nfm" | "fmnarrow" => hl2_common::VrxMode::FmNarrow,
         "ft8" => hl2_common::VrxMode::Ft8,
         "js8" => hl2_common::VrxMode::Js8,
         "ft4" => hl2_common::VrxMode::Ft4,
@@ -1304,6 +1332,10 @@ fn vrx_mode_str_sideband(v: &hl2_common::VrxState) -> String {
     match v.mode {
         hl2_common::VrxMode::Lsb => "lsb".to_string(),
         hl2_common::VrxMode::Am => "am".to_string(),
+        // FM and NFM (narrow) are both symmetric-about-carrier (both sidebands
+        // pass); the canvas treats them like AM for band placement, with their
+        // own colour (`"fm"` key).
+        hl2_common::VrxMode::Fm | hl2_common::VrxMode::FmNarrow => "fm".to_string(),
         _ => "usb".to_string(),
     }
 }
@@ -1315,6 +1347,8 @@ fn vrx_mode_label(m: &hl2_common::VrxMode) -> String {
         hl2_common::VrxMode::Js8 => "JS8".to_string(),
         hl2_common::VrxMode::Ft4 => "FT4".to_string(),
         hl2_common::VrxMode::Am => "AM".to_string(),
+        hl2_common::VrxMode::Fm => "FM".to_string(),
+        hl2_common::VrxMode::FmNarrow => "NFM".to_string(),
         hl2_common::VrxMode::Usb => "USB".to_string(),
         hl2_common::VrxMode::Lsb => "LSB".to_string(),
     }
@@ -1709,36 +1743,55 @@ pub fn app() -> Html {
                       <div class="cfg-block">
                           <select
                               class="cfg-select"
-                             onchange={Callback::from(move |e: web_sys::Event| {
-                                 if let Some(dom) = e.target() {
-                                     if let Ok(sel) = dom.dyn_into::<HtmlSelectElement>() {
-                                         let v = sel.value().to_lowercase();
-                                         let choice = VrxModeChoice::parse(&v);
-                                         let slot = *sh14.vrx_slot.borrow();
-                                         { let mut cfg = sh14.vrx_cfg.borrow_mut(); if let Some(c) = cfg.get_mut(&slot) { c.mode = choice; } }
-                                         if sh14.vrx.borrow().contains_key(&slot) {
-                                             let c = sh14.cfg_for(slot);
-                                             sh14.audio.reset();
-                                             Shared::send_vrx(&sh14, choice.as_str(), c.bw_hz, c.gain_db);
-                                         }
-                                         sh14.notify();
-                                     }
-                                 }
-                             })}>
-                              <option value="usb" selected={vrx_sideband_cur == VrxModeChoice::Usb}>{"USB"}</option>
-                              <option value="lsb" selected={vrx_sideband_cur == VrxModeChoice::Lsb}>{"LSB"}</option>
-                              <option value="am" selected={vrx_sideband_cur == VrxModeChoice::Am}>{"AM"}</option>
-                              <option value="ft8" selected={vrx_sideband_cur == VrxModeChoice::Ft8}>{"FT8"}</option>
-                             <option value="js8" selected={vrx_sideband_cur == VrxModeChoice::Js8}>{"JS8"}</option>
-                             <option value="ft4" selected={vrx_sideband_cur == VrxModeChoice::Ft4}>{"FT4"}</option>
-                         </select>
+                               onchange={Callback::from(move |e: web_sys::Event| {
+                                  if let Some(dom) = e.target() {
+                                      if let Ok(sel) = dom.dyn_into::<HtmlSelectElement>() {
+                                          let v = sel.value().to_lowercase();
+                                          let choice = VrxModeChoice::parse(&v);
+                                          let slot = *sh14.vrx_slot.borrow();
+                                          { let mut cfg = sh14.vrx_cfg.borrow_mut(); if let Some(c) = cfg.get_mut(&slot) {
+                                              c.mode = choice;
+                                              // FM (15 kHz) and NFM (5 kHz) are
+                                              // the *same* demodulator and are
+                                              // distinguished ONLY by their
+                                              // channel-select bandwidth. So
+                                              // whenever the operator selects
+                                              // either FM mode we seed the BW to
+                                              // that mode's default — this is
+                                              // what makes "NFM" narrower than
+                                              // "FM", and it covers USB→FM,
+                                              // FM→NFM, and NFM→FM alike. Non-FM
+                                              // mode switches leave the operator's
+                                              // BW untouched (least surprising).
+                                              if matches!(choice, VrxModeChoice::Fm | VrxModeChoice::FmNarrow) {
+                                                  c.bw_hz = choice.default_bw_hz();
+                                              }
+                                          } }
+                                          if sh14.vrx.borrow().contains_key(&slot) {
+                                              let c = sh14.cfg_for(slot);
+                                              sh14.audio.reset();
+                                              Shared::send_vrx(&sh14, choice.as_str(), c.bw_hz, c.gain_db);
+                                          }
+                                          sh14.notify();
+                                      }
+                                  }
+                              })}>
+                               <option value="usb" selected={vrx_sideband_cur == VrxModeChoice::Usb}>{"USB"}</option>
+                               <option value="lsb" selected={vrx_sideband_cur == VrxModeChoice::Lsb}>{"LSB"}</option>
+                               <option value="am" selected={vrx_sideband_cur == VrxModeChoice::Am}>{"AM"}</option>
+                               <option value="fm" selected={vrx_sideband_cur == VrxModeChoice::Fm}>{"FM"}</option>
+                               <option value="nfm" selected={vrx_sideband_cur == VrxModeChoice::FmNarrow}>{"NFM"}</option>
+                               <option value="ft8" selected={vrx_sideband_cur == VrxModeChoice::Ft8}>{"FT8"}</option>
+                              <option value="js8" selected={vrx_sideband_cur == VrxModeChoice::Js8}>{"JS8"}</option>
+                              <option value="ft4" selected={vrx_sideband_cur == VrxModeChoice::Ft4}>{"FT4"}</option>
+                          </select>
                      </div>
                      <div class="cfg-block">
-                         <span class="cfg-label">{"BW Hz"}</span>
-                         <input type="number" min="300" max="12000" step="100" class="cfg-number"
-                             value={vrx_bw_cur.to_string()} oninput={Callback::from(move |e: web_sys::InputEvent| {
-                                 if let Some(inp) = e.target_dyn_into::<HtmlInputElement>() {
-                                     let v: u32 = inp.value().parse::<u32>().unwrap_or(2600).max(300).min(12000);
+                          <span class="cfg-label">{"BW Hz"}</span>
+                          <input type="number" min="300" max="20000" step="100" class="cfg-number"
+                              value={vrx_bw_cur.to_string()} oninput={Callback::from(move |e: web_sys::InputEvent| {
+                                  if let Some(inp) = e.target_dyn_into::<HtmlInputElement>() {
+                                      let v: u32 = inp.value().parse::<u32>().unwrap_or(2600).max(300).min(20000);
                                      let slot = *sh15.vrx_slot.borrow();
                                      { let mut cfg = sh15.vrx_cfg.borrow_mut(); if let Some(c) = cfg.get_mut(&slot) { c.bw_hz = v; } }
                                      if sh15.vrx.borrow().contains_key(&slot) {

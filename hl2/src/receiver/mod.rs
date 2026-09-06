@@ -104,6 +104,15 @@ pub enum Mode {
     /// AM (DSB-FC, full-carrier) voice. Both sidebands pass; the carrier DC
     /// is removed by the AGC DC-block step. See [`am::AmDemodulator`].
     Am,
+    /// FM (standard, ≈ 15 kHz channel) voice demod. Audio is recovered as
+    /// the phase derivative of the (LPF'd) complex baseband — see
+    /// [`FmCore`](crate::receiver::demod::FmCore). Distinct from
+    /// [`Mode::FmNarrow`] only by the default channel-select bandwidth.
+    Fm,
+    /// NFM (narrow, ≈ 5 kHz channel) voice demod — the same phase-derivative
+    /// DSP as [`Mode::Fm`] with a narrower channel-select bandwidth.
+    /// Amateur-radio "NFM".
+    FmNarrow,
     /// Single-sideband voice, with the selected sideband.
     Ssb(Sideband),
     /// Wideband complex pass-through (digital-mode placeholder).
@@ -145,6 +154,8 @@ impl Mode {
     pub fn default_bandwidth_hz(&self) -> u32 {
         match self {
             Mode::Am => 8_000,
+            Mode::Fm => 15_000,
+            Mode::FmNarrow => 5_000,
             Mode::Ssb(_) => 2_600,
             Mode::SsbWide => 2_400_000,
             Mode::Ft8 => 2_600,
@@ -159,6 +170,8 @@ impl Mode {
     pub fn sideband(&self) -> Option<Sideband> {
         match self {
             Mode::Am => None,
+            Mode::Fm => None,
+            Mode::FmNarrow => None,
             Mode::Ssb(s) => Some(*s),
             Mode::SsbWide => None,
             Mode::Ft8 => Some(Sideband::Usb),
@@ -398,6 +411,8 @@ mod tests {
         for m in [
             Mode::Ssb(Sideband::Usb),
             Mode::Ssb(Sideband::Lsb),
+            Mode::Fm,
+            Mode::FmNarrow,
             Mode::SsbWide,
         ] {
             VirtualReceiver::new(cfg(m), Box::new(VecSink::new())).expect("receiver build");

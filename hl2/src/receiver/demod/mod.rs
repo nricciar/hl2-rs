@@ -36,6 +36,7 @@ pub mod core;
 pub mod digital;
 pub mod dsp;
 pub mod engine;
+pub mod fm;
 pub mod ssb;
 
 use std::fmt;
@@ -53,6 +54,7 @@ pub use core::{DemodCore, StandardDemod};
 pub use digital::DigitalCore;
 pub use dsp::{F32Fir, F32FirState, KAISER_BETA, Nco, PolyphaseDecimator};
 pub use engine::AudioEngine;
+pub use fm::FmCore;
 pub use ssb::SsbCore;
 
 /// Legacy names for the three built-in demodulators, now expressed as the
@@ -63,6 +65,7 @@ pub use ssb::SsbCore;
 pub type SsbDemodulator = StandardDemod<SsbCore>;
 pub type AmDemodulator = StandardDemod<AmCore>;
 pub type DigitalDemodulator = StandardDemod<DigitalCore>;
+pub type FmDemodulator = StandardDemod<FmCore>;
 
 /// The source rate is too close to the audio rate to decimate cleanly.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +160,16 @@ pub fn make_demod_tap(
             .demodulator(audio, tap, meter),
         Mode::Am => am::AmCore::new(source_rate_hz, source_center_hz, bandwidth_hz, audio)
             .demodulator(audio, tap, meter),
+        // FM (standard) and NFM (narrow) share one demod core; they differ
+        // only in the channel-select bandwidth (`bandwidth_hz`), which is
+        // already resolved from `Mode::default_bandwidth_hz` (15 kHz FM /
+        // 5 kHz NFM) and may be overridden via `ReceiverConfig::bandwidth_hz`.
+        Mode::Fm => fm::FmCore::new(source_rate_hz, source_center_hz, bandwidth_hz, audio, "fm")
+            .demodulator(audio, tap, meter),
+        Mode::FmNarrow => {
+            fm::FmCore::new(source_rate_hz, source_center_hz, bandwidth_hz, audio, "nfm")
+                .demodulator(audio, tap, meter)
+        }
         Mode::Ssb(side) => {
             ssb::SsbCore::new(side, source_rate_hz, source_center_hz, bandwidth_hz, audio)
                 .demodulator(audio, tap, meter)

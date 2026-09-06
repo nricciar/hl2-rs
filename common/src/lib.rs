@@ -172,6 +172,15 @@ pub enum VrxMode {
     Lsb,
     /// AM (DSB-FC, full-carrier) voice demod.
     Am,
+    /// FM (standard, ≈ 15 kHz channel) voice demod (phase-derivative read
+    /// of a polyphase-LPF'd complex baseband).
+    Fm,
+    /// NFM (narrow, ≈ 5 kHz channel) voice demod — same DSP as [`VrxMode::Fm`],
+    /// narrower channel-select bandwidth. Amateur-radio "NFM". The on-wire
+    /// tag is `"fm_narrow"` (the `lowercase` rename); `"nfm"` is accepted as
+    /// an alias so the UI may use either spelling.
+    #[serde(alias = "nfm")]
+    FmNarrow,
     Ft8,
     Js8,
     Ft4,
@@ -1048,6 +1057,56 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<VrxState>(&serde_json::to_string(&v).unwrap()).unwrap(),
             v
+        );
+    }
+
+    #[test]
+    fn vrx_mode_fm_narrow_roundtrip() {
+        // Both FM and NFM (narrow) are voice modes: 4.8 kHz audio, ≈ 15 kHz /
+        // ≈ 5 kHz channel width respectively. The `lowercase` serde tag on
+        // `VrxMode` means the on-wire name for `Fm` is `"fm"` and for
+        // `FmNarrow` is `"fmnarrow"` (the lowercase of the Rust variant, no
+        // underscore). The UI may additionally use `"nfm"` (the operator-
+        // facing spelling); both decode to `VrxMode::FmNarrow`.
+        let std_fm = VrxState {
+            slot: 1,
+            offset_hz: 0,
+            mode: VrxMode::Fm,
+            bw_hz: 15_000,
+            gain_db: 0.0,
+            rate_hz: 4_800,
+            muted: false,
+        };
+        let narrow = VrxState {
+            mode: VrxMode::FmNarrow,
+            bw_hz: 5_000,
+            ..std_fm
+        };
+        for v in [std_fm, narrow] {
+            assert_eq!(
+                serde_json::from_str::<VrxState>(&serde_json::to_string(&v).unwrap()).unwrap(),
+                v
+            );
+        }
+        // Enum-level round-trip through the `lowercase` wire names.
+        assert_eq!(
+            serde_json::from_str::<VrxMode>("\"fm\"").unwrap(),
+            VrxMode::Fm
+        );
+        assert_eq!(
+            serde_json::from_str::<VrxMode>("\"fmnarrow\"").unwrap(),
+            VrxMode::FmNarrow
+        );
+        // And the operator-facing alias `"nfm"` must also decode to the same
+        // variant — so the UI can use either spelling without a server change.
+        assert_eq!(
+            serde_json::from_str::<VrxMode>("\"nfm\"").unwrap(),
+            VrxMode::FmNarrow
+        );
+        assert_eq!(serde_json::to_string(&VrxMode::Fm).unwrap(), "\"fm\"");
+        assert_eq!(
+            serde_json::to_string(&VrxMode::FmNarrow).unwrap(),
+            "\"fmnarrow\""
         );
     }
 

@@ -1528,6 +1528,12 @@ async fn spawn_vrx(
             None,
         ),
         VrxMode::Am => (Mode::Am, VRX_AUDIO_RATE_HZ, None, None, None),
+        // FM (standard) and NFM (narrow) are the same demod core,
+        // distinguished only by the channel-select bandwidth that
+        // `ReceiverConfig::bandwidth()` resolves (the UI's `bw_hz` wins —
+        // typically 15 kHz for FM voice, 5 kHz for NFM voice).
+        VrxMode::Fm => (Mode::Fm, VRX_AUDIO_RATE_HZ, None, None, None),
+        VrxMode::FmNarrow => (Mode::FmNarrow, VRX_AUDIO_RATE_HZ, None, None, None),
         VrxMode::Ft8 => (Mode::Ft8, VRX_FT8_RATE_HZ, Some(shared()), None, None),
         VrxMode::Js8 => (Mode::Js8, VRX_FT8_RATE_HZ, None, Some(js8_shared()), None),
         VrxMode::Ft4 => (Mode::Ft4, VRX_FT8_RATE_HZ, None, None, Some(ft4_shared())),
