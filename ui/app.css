@@ -584,12 +584,19 @@ input[type=number]:disabled {
      letter-spacing: 0.1em;
      color: var(--muted);
  }
-.cfg-select {
-    min-width: 5.5rem;
-}
-.cfg-number {
-    width: 7rem;
-}
+ .cfg-select {
+     min-width: 5.5rem;
+ }
+ .cfg-number {
+     width: 7rem;
+ }
+ /* EP4 (raw wideband) has no virtual receiver or audio, so the mode / BW /
+    gain / volume controls don't apply: dim the whole group so it reads as
+    inactive for this tab (they stay fully active on the RX1–4 tabs). */
+ .cfg-row.cfg-disabled {
+     opacity: 0.4;
+     pointer-events: none;
+ }
 
 /* Audio row: Volume slider + Mute toggle. Vol is a "device" control
    (applies to whichever slot's audio plays at the moment), so it lives by

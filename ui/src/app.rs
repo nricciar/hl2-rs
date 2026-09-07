@@ -1282,16 +1282,26 @@ fn draw_all(sh: &Shared) {
     };
     let center_hz = *sh.spectrum_center_hz.borrow();
     let span_hz = *sh.spectrum_span_hz.borrow();
+    // EP4 (raw wideband) has no NCO and is drawn folded (0 MHz on the far left);
+    // an EP6 slot is a complex baseband centred on its NCO. This flag drives
+    // both the axis layout (canvas) and whether the per-receiver passbands are
+    // meaningful here (they are positioned in the DDC'd baseband, so only the
+    // EP6 axis).
+    let folded = sh.spectrum_source.borrow().is_none();
     // Per-slot virtual receivers currently active (offset, mode, bw) —
     // each shades its own passband on the currently-displayed source.
     // (Mode → tint key via `vrx_mode_str_sideband`: LSB blue, USB/FT8 green,
-    // AM amber — a symmetric band about the tune.)
-    let vrx_bands: Vec<(i32, String, u32)> = sh
-        .vrx
-        .borrow()
-        .iter()
-        .map(|(_, v)| (v.offset_hz, vrx_mode_str_sideband(v), v.bw_hz))
-        .collect();
+    // AM amber — a symmetric band about the tune.) On EP4 there is no DDC'd
+    // baseband to place them against, so no overlays.
+    let vrx_bands: Vec<(i32, String, u32)> = if folded {
+        Vec::new()
+    } else {
+        sh.vrx
+            .borrow()
+            .iter()
+            .map(|(_, v)| (v.offset_hz, vrx_mode_str_sideband(v), v.bw_hz))
+            .collect()
+    };
 
     // Auto-decoder passbands: only for the *displayed* slot, and only when it
     // has auto-decode enabled (a non-empty monitor list). Each entry shades a
@@ -1315,7 +1325,7 @@ fn draw_all(sh: &Shared) {
     if let Some((pan, w)) = canvas_2d("panadapter", 250) {
         let mags = sh.latest.borrow().clone();
         canvas::draw_panadapter(
-            &pan, &mags, floor, ceil, w as usize, 250, center_hz, span_hz,
+            &pan, &mags, floor, ceil, w as usize, 250, center_hz, span_hz, folded,
         );
         for (offset, sb, bw) in &vrx_bands {
             canvas::draw_vrx_passband(&pan, sb, *bw, w as usize, 250, center_hz, span_hz, *offset);
@@ -1328,7 +1338,7 @@ fn draw_all(sh: &Shared) {
     if let Some((wf, w)) = canvas_2d("waterfall", 256) {
         let history = sh.history.borrow().clone();
         canvas::paint_waterfall(
-            &wf, &history, floor, ceil, w as usize, 256, center_hz, span_hz,
+            &wf, &history, floor, ceil, w as usize, 256, center_hz, span_hz, folded,
         );
         for (offset, sb, bw) in &vrx_bands {
             canvas::draw_vrx_passband(&wf, sb, *bw, w as usize, 256, center_hz, span_hz, *offset);
@@ -1626,7 +1636,7 @@ pub fn app() -> Html {
                 <a class={if active { "nav-link active" } else { "nav-link" }}
                    aria-current={if active { Some("page") } else { None }}
                    href="#"
-                    title="EP4 — raw wideband (122.88 MSps); no NCO, so the frequency readout is disabled"
+                    title="EP4 — raw wideband (76.8 MSps); no NCO, so the frequency readout is disabled"
                      onclick={Callback::from(move |_| {
                          *shc.spectrum_source.borrow_mut() = None;
                          *shc.vrx_slot.borrow_mut() = 1;
@@ -1649,7 +1659,7 @@ pub fn app() -> Html {
                 <div class="headrow">
                     <h1>{"Hermes Lite 2"}
                         <span id="notifications">
-                            { "RX1 " }
+                            <span id="audio_at"></span>
                             <span class={status_class}>
                                 {format!("{} {}", if online { "●" } else { "○" }, status)}
                             </span>
@@ -1754,9 +1764,13 @@ pub fn app() -> Html {
 
                   <div class="controls-grid">
                       <div class="col-left">
-                          {freq_stepper(sh.clone(), freq, started, sh.spectrum_source.borrow().is_none())}
+                           {freq_stepper(sh.clone(), freq, started, sh.spectrum_source.borrow().is_none())}
 
-                          <div class="cfg-row">
+                           // EP4 has no virtual receiver / audio, so the
+                           // mode / BW / gain / volume controls don't apply and
+                           // are disabled for this tab (they still work on the
+                           // RX1–4 tabs).
+                           <div class={if ep4_active { "cfg-row cfg-disabled" } else { "cfg-row" }}>
                       <div class="cfg-block">
                           <select
                               class="cfg-select"
@@ -1913,30 +1927,39 @@ pub fn app() -> Html {
                               </div>
                           </div>
 
-                           <div class="gauge">
-                               <span class="gauge-rowname gauge-rowname-top">{"S"}</span>
-                               <div class="gauge-outer-labels">
-                                   {
-                                       SMETER_TICKS.iter().map(|(lbl, frac)| {
-                                           let red = *frac > 0.6;
-                                           html! { <span class={if red {"gauge-tick red"} else {"gauge-tick"}} style={format!("left: calc({}%)", (*frac * 100.0).floor())}>{*lbl}</span> }
-                                       }).collect::<Html>()
-                                   }
-                               </div>
-                               <div class="gauge-track">
-                                   <div class="gauge-fill" style={format!("width: {}%", gauge_val)}></div>
-                               </div>
-                               <div class="gauge-inner-labels">
-                                   {
-                                       SWR_TICKS.iter().map(|(lbl, frac)| {
-                                           let red = *frac > 0.625;
-                                           html! { <span class={if red {"gauge-tick red"} else {"gauge-tick"}} style={format!("left: calc({}%)", (*frac * 100.0).floor())}>{*lbl}</span> }
-                                       }).collect::<Html>()
-                                   }
-                               </div>
-                               <span class="gauge-rowname gauge-rowname-bottom">{"SWR"}</span>
-                           </div>
-                      </div>
+                            // S-meter / SWR gauge — driven by the *virtual
+                            // receiver's* signal level + noise floor, so it has
+                            // no meaning on EP4 (no receiver, no audio). Hide
+                            // it while that tab is active.
+                            {if ep4_active {
+                                Html::default()
+                            } else {
+                                html! {
+                                <div class="gauge">
+                                <span class="gauge-rowname gauge-rowname-top">{"S"}</span>
+                                <div class="gauge-outer-labels">
+                                    {
+                                        SMETER_TICKS.iter().map(|(lbl, frac)| {
+                                            let red = *frac > 0.6;
+                                            html! { <span class={if red {"gauge-tick red"} else {"gauge-tick"}} style={format!("left: calc({}%)", (*frac * 100.0).floor())}>{*lbl}</span> }
+                                        }).collect::<Html>()
+                                    }
+                                </div>
+                                <div class="gauge-track">
+                                    <div class="gauge-fill" style={format!("width: {}%", gauge_val)}></div>
+                                </div>
+                                <div class="gauge-inner-labels">
+                                    {
+                                        SWR_TICKS.iter().map(|(lbl, frac)| {
+                                            let red = *frac > 0.625;
+                                            html! { <span class={if red {"gauge-tick red"} else {"gauge-tick"}} style={format!("left: calc({}%)", (*frac * 100.0).floor())}>{*lbl}</span> }
+                                        }).collect::<Html>()
+                                    }
+                                </div>
+                                <span class="gauge-rowname gauge-rowname-bottom">{"SWR"}</span>
+                            </div> }
+                            }}
+                       </div>
                   </div>
 
 

@@ -436,7 +436,7 @@ pub mod spot {
 /// Choose which per-adapter stream the server's spectrum pipeline (panadapter
 /// + waterfall) consumes.
 ///
-/// * `Ep4`   — the wideband real sample stream (122.88 MSps, full bandwidth).
+/// * `Ep4`   — the wideband real sample stream (76.8 MSps, full bandwidth).
 /// * `Ep6(slot)` — the DDC'd complex baseband of one receiver slot, at the
 ///   per-receiver DDC rate programmed at Start. `slot` is 1-based (RX1…RX7).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

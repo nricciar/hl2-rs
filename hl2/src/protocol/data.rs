@@ -17,7 +17,8 @@ pub const HEADER_SIZE: usize = 8;
 pub const IQ_OFFSET: usize = 0;
 
 /// Each EP4 sample is 2 bytes (16-bit little-endian single real value).
-/// HL2 wideband is a single real-valued stream sampled at 122.88 MSps ADC.
+/// HL2 wideband is a single real-valued stream sampled at 76.8 MSps ADC
+/// (`ADC_CLOCK_HZ`, PROTOCOL.md §10) — a 2048-sample block spans 0–38.4 MHz.
 pub const BYTES_PER_SAMPLE: usize = 2;
 
 /// 3×0x7F sync prefix that every EP6 (control/ACK) frame starts with.

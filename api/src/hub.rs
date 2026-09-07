@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 
 use crate::spectrum::display_mags_into;
 
-use hl2::protocol::IQ_PAIRS_PER_BLOCK;
+use hl2::protocol::{ADC_CLOCK_HZ, IQ_PAIRS_PER_BLOCK};
 use hl2::receiver::{
     AUTO_MODES, AudioConfig, AutoMode, BufSink, BufSinkHandle, DropSink, Ft4Tap, Ft8Tap,
     Js8SharedDecoder, Js8Tap, Mode, ReceiverConfig, Sideband, VirtualReceiver, closed_slot_for,
@@ -377,11 +377,19 @@ fn spectrum_center(tuning: &BTreeMap<u8, u32>, src: &SpectrumSource) -> Option<u
     }
 }
 
-/// Total displayed baseband bandwidth (Hz) for the current source
+/// Total displayed baseband bandwidth (Hz) for the current source.
+///
+/// EP4 is the ADC's *real* (I-only) wideband stream, so its full baseband
+/// bandwidth is the real sample rate — `ADC_CLOCK_HZ` (76.8 MHz). The UI
+/// shows only the positive-frequency half of that conjugate-symmetric
+/// spectrum (DC → Nyquist = 38.4 MHz), so `spectrum_span` here is the full
+/// width and the UI's "right edge" is `span / 2`. (Earlier this was
+/// mis-reported as 122.88 MHz, which would misplace the EP4 axis labels and
+/// the auto-decode in-window test — see PROTOCOL.md §10.)
 fn spectrum_span(src: &SpectrumSource) -> u32 {
     match src {
         SpectrumSource::Ep6 { .. } => 96_700,
-        SpectrumSource::Ep4 => 122_880_000,
+        SpectrumSource::Ep4 => ADC_CLOCK_HZ,
     }
 }
 
