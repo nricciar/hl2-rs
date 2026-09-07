@@ -24,9 +24,24 @@ html, body {
     padding: 1rem 1rem 3rem;
 }
 
+.headrow {
+  display: flex;
+  align-items: center; 
+  justify-content: space-between;
+  width: 100%;
+}
+
 h1 {
     font-size: 1.3rem;
     margin: 0 0 0.5rem;
+    width: 100%;
+    vertical-align: middle;
+}
+
+#notifications {
+    float: right;
+    margin-top: 1.5em; 
+    font-size: 0.4em;
 }
 
 /* Radio-selection row (replaces the old Discover button). One button per

@@ -6,13 +6,13 @@
 //! stage. It yields **zero, one, or many** decimated `f32` samples per
 //! complex input and must remember at most one pending sample between calls
 //! (drained by [`flush`](Self::flush)). It owns **none** of the audio tail:
-//! the DC-block + RMS-targeted AGC + pre-AGC [`RawSampleTap`] + S-meter +
+//! the DC-block + RMS-targeted AGC + pre-AGC [`RawSampleTap`] +
 //! `i16` sink write — that lives in [`AudioEngine`](super::engine::AudioEngine)
 //! and is shared with every mode by [`StandardDemod`] (this module).
 //!
 //! ```text
 //! complex I/Q ──► DemodCore::process ──► 0..=N f32s per block ──► AudioEngine ──► i16 → sink
-//!                     (mode DSP)                                    (AGC, tap, meter)
+//!                     (mode DSP)                                    (AGC, tap)
 //! ```
 //!
 //! This is the extension point. To add FM/NFM/CW: implement `DemodCore`
@@ -31,8 +31,8 @@ use num_complex::Complex;
 
 use super::engine::AudioEngine;
 use super::{DemodError, Demodulator, IqBlock, RawSampleTap};
+use crate::receiver::AudioConfig;
 use crate::receiver::sink::AudioSink;
-use crate::receiver::{AudioConfig, MeterHandle};
 
 /// A mode's per-sample DSP (see module docs).
 ///
@@ -68,15 +68,15 @@ pub trait DemodCore: Send + 'static {
 
     /// Compose this core with the shared audio tail into a full [`Demodulator`].
     ///
-    /// `audio` carries the decimated output rate + playback gain; `tap` and
-    /// `meter` are the optional pre-AGC raw-sample and signal-level seams.
-    /// This is the **one call site** that turns a mode's core into a ready-to-
-    /// use demodulator; new modes do not need a separate `Demodulator` impl.
+    /// `audio` carries the decimated output rate + playback gain; `tap` is the
+    /// optional pre-AGC raw-sample seam (the API's FT8/JS8/FT4 decoders *and*
+    /// its S-meter both hang off it). This is the **one call site** that turns
+    /// a mode's core into a ready-to-use demodulator; new modes do not need a
+    /// separate `Demodulator` impl.
     fn demodulator(
         self,
         audio: AudioConfig,
         tap: Option<std::sync::Arc<dyn RawSampleTap>>,
-        meter: Option<MeterHandle>,
     ) -> Box<dyn Demodulator>
     where
         Self: Sized,
@@ -84,9 +84,7 @@ pub trait DemodCore: Send + 'static {
         let kind = self.kind();
         Box::new(StandardDemod::<Self> {
             core: self,
-            engine: AudioEngine::new(audio.rate_hz, audio.gain_db, kind)
-                .with_tap(tap)
-                .with_meter(meter),
+            engine: AudioEngine::new(audio.rate_hz, audio.gain_db, kind).with_tap(tap),
         })
     }
 }
@@ -99,7 +97,7 @@ pub trait DemodCore: Send + 'static {
 pub struct StandardDemod<C: DemodCore> {
     /// The mode-specific DSP.
     core: C,
-    /// The shared audio tail (AGC, DC-block, pre-AGC tap, S-meter, sink
+    /// The shared audio tail (AGC, DC-block, pre-AGC tap, sink
     /// write). See [`AudioEngine`].
     engine: AudioEngine,
 }

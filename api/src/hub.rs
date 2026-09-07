@@ -112,6 +112,11 @@ struct Session {
     /// (the UI locks the NCO while auto is on, but a stray Tune still
     /// tears it down — the UI re-enables), or `Stop`.
     auto: std::collections::BTreeMap<u8, Vec<AutoTask>>,
+    /// The S-meter reading (level + floor, dB, and which slot they are for).
+    /// Written by `run_spectral` (which already runs the band FFT) and read
+    /// by `shared_state` into `vrx_levels` / `vrx_floors`. See
+    /// `api/src/meter.rs` and PROTOCOL.md §16.3e.
+    meter: std::sync::Arc<crate::meter::MeterState>,
 }
 
 /// A running virtual-receiver pipeline, demodulating one RX slot (optionally
@@ -125,11 +130,6 @@ struct VrxTask {
     /// Mute flag shared with the audio fan-out task. Set via
     /// `ClientCmd::SetVrxMute`; while true the fan-out drains + discards
     muted: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Signal-level meter — the demod writes the pre-AGC in-band RMS, in
-    /// dB FS (one-pole smoothed), into this atomic on every emit. The hub
-    /// reads it back in `shared_state` and re-broadcasts on a fast tick so
-    /// the UI's per-slot S-meter stays alive.
-    meter: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// The demod std thread — owns the `VirtualReceiver` and reads the
     /// shared `BasebandRing` it was spawned against. `JoinHandle` lets
     /// `stop` flush + join. The hub re-spawns this whole task whenever the
@@ -321,20 +321,19 @@ impl std::ops::Drop for VrxTask {
 
 impl Session {
     fn shared_state(&self, state_at: u64, src: &SpectrumSource) -> SharedState {
-        // Per-slot signal-level meter (dB FS) — the demod writes these
-        // atomics every emit; we read and re-broadcast on a fast tick so
-        // the UI's per-slot gauge animates. The floor (−140 dBFS) is
-        // already applied by `meter_tick`; an uninitialised (−120) value
-        // means "silent — gauge at its bottom", the correct resting state.
-        let vrx_levels = self
-            .vrx
-            .iter()
-            .map(|(slot, t)| {
-                let bits = t.meter.load(std::sync::atomic::Ordering::Relaxed);
-                let db = f64::from_bits(bits);
-                (*slot, if db.is_finite() { db } else { -140.0 })
-            })
-            .collect::<std::collections::BTreeMap<u8, f64>>();
+        // The S-meter (signal level + noise floor, both in dB relative to
+        // full-scale) for the currently-displayed EP6 slot, written by the
+        // `run_spectral` band-FFT loop and read here into the shared
+        // contract's `vrx_levels` / `vrx_floors`. A slot of `0` (EP4 wideband
+        // or no vrx running) means "no reading" — the UI parks the gauge at
+        // its bottom.
+        let (slot, lev, fl) = self.meter.read();
+        let mut vrx_levels = std::collections::BTreeMap::new();
+        let mut vrx_floors = std::collections::BTreeMap::new();
+        if slot != 0 {
+            vrx_levels.insert(slot, lev);
+            vrx_floors.insert(slot, fl);
+        }
         SharedState {
             started: self.started,
             rx_count: self.rx_count,
@@ -349,6 +348,7 @@ impl Session {
             spectrum_span_hz: spectrum_span(src),
             vrx: self.vrx.values().map(|t| (t.state.slot, t.state)).collect(),
             vrx_levels,
+            vrx_floors,
             auto_monitors: self
                 .auto
                 .iter()
@@ -413,6 +413,16 @@ pub struct RadioHub {
     /// Bumped every time `spectrum_source` is replaced so the accumulator in
     /// `run_spectral` knows to discard samples from the previous source.
     spectrum_rev: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The S-meter reading for the *currently displayed* slot, written by
+    /// the `run_spectral` loop (which already runs the band FFT) and read by
+    /// `Session::shared_state` into `vrx_levels` / `vrx_floors`. See
+    /// `api/src/meter.rs` and PROTOCOL.md §16.3e. Live for the whole process
+    /// so a fresh client's `welcome` still carries the last reading.
+    meter: std::sync::Arc<crate::meter::MeterState>,
+    /// The channel-select bandwidth (Hz) of the running virtual receiver on
+    /// the displayed slot, written by `set_vrx` / `ensure_vrx` and read by
+    /// `run_spectral` to size the S-meter's passband window. `0` = no vrx.
+    passband_bw: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// PSK Reporter sink (spot queue + station identity + send bookkeeping),
     /// shared with the `pskrep_hook` UDP send task. The hub appends
     /// spot-able FT8/JS8 decodes into it (see `spawn_ft8_decode` /
@@ -439,6 +449,8 @@ impl RadioHub {
             levels_task: std::sync::Arc::new(std::sync::Mutex::new(None)),
             spectrum_source: std::sync::Arc::new(std::sync::Mutex::new(SpectrumSource::default())),
             spectrum_rev: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            meter: std::sync::Arc::new(crate::meter::MeterState::new()),
+            passband_bw: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pskrep,
         }
     }
@@ -576,6 +588,7 @@ impl RadioHub {
                     vrx: std::collections::BTreeMap::new(),
                     auto_monitors: std::collections::BTreeMap::new(),
                     vrx_levels: std::collections::BTreeMap::new(),
+                    vrx_floors: std::collections::BTreeMap::new(),
                 },
                 None,
             ),
@@ -689,6 +702,7 @@ impl RadioHub {
                     device,
                     vrx: std::collections::BTreeMap::new(),
                     auto: std::collections::BTreeMap::new(),
+                    meter: self.meter.clone(),
                 };
 
                 if let Some(t) = initial_tuning {
@@ -711,10 +725,11 @@ impl RadioHub {
                 let fanout = self.fanout.clone();
                 let src = self.spectrum_source.clone();
                 let src_rev = self.spectrum_rev.clone();
-                let handle =
-                    tokio::spawn(
-                        async move { run_spectral(cfg, ev_rx, fanout, src, src_rev).await },
-                    );
+                let meter = self.meter.clone();
+                let passband_bw = self.passband_bw.clone();
+                let handle = tokio::spawn(async move {
+                    run_spectral(cfg, ev_rx, fanout, src, src_rev, meter, passband_bw).await
+                });
                 *self.task.lock().unwrap() = Some(handle);
 
                 // Start the periodic S-meter re-broadcast task.
@@ -1084,6 +1099,8 @@ impl RadioHub {
                                     c.slot, c.offset_hz
                                 );
                             }
+                            self.passband_bw
+                                .store(c.bw_hz as u64, std::sync::atomic::Ordering::Relaxed);
                             let (state, _) = self.snapshot().await;
                             ServerResponse::ok(id, &state)
                         }
@@ -1577,25 +1594,24 @@ async fn spawn_vrx(
             pskrep,
         )
     });
-    let tap = if let Some(dec) = &ft8_dec {
-        Some(std::sync::Arc::new(Ft8Tap::from_shared(dec.clone()))
-            as std::sync::Arc<dyn hl2::receiver::RawSampleTap>)
-    } else if let Some(dec) = &js8_dec {
-        Some(std::sync::Arc::new(Js8Tap::from_shared(dec.clone()))
-            as std::sync::Arc<dyn hl2::receiver::RawSampleTap>)
-    } else if let Some(dec) = &ft4_dec {
-        Some(std::sync::Arc::new(Ft4Tap::from_shared(dec.clone()))
-            as std::sync::Arc<dyn hl2::receiver::RawSampleTap>)
-    } else {
-        None
-    };
-
-    // One atomic the demod writes the pre-AGC in-band dB-FS level into on
-    // every emit. The API reads it back in `shared_state` (via `vrx_levels`)
-    // and re-broadcasts on a fast tick (`run_vrx_levels`) to keep the UI's
-    // per-slot S-meter alive — the demod thread owns the value, so the hub
-    // needs a lock-free shared handle.
-    let meter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new((-120.0f64).to_bits()));
+    // The demod's pre-AGC `RawSampleTap` seam carries only the digital-mode
+    // decoders (FT8/JS8/FT4). Voice modes (SSB/AM/FM) have no decoder → no
+    // tap. The S-meter no longer hangs off this seam — it is a *consumer of
+    // the band spectrum* (see `api/src/meter.rs` and `run_spectral`), which
+    // is the one source that has a correct band-noise floor for every mode.
+    let tap: Option<std::sync::Arc<dyn hl2::receiver::RawSampleTap>> =
+        if let Some(dec) = ft8_dec.as_ref() {
+            Some(std::sync::Arc::new(Ft8Tap::from_shared(dec.clone()))
+                as std::sync::Arc<dyn hl2::receiver::RawSampleTap>)
+        } else if let Some(dec) = js8_dec.as_ref() {
+            Some(std::sync::Arc::new(Js8Tap::from_shared(dec.clone()))
+                as std::sync::Arc<dyn hl2::receiver::RawSampleTap>)
+        } else if let Some(dec) = ft4_dec.as_ref() {
+            Some(std::sync::Arc::new(Ft4Tap::from_shared(dec.clone()))
+                as std::sync::Arc<dyn hl2::receiver::RawSampleTap>)
+        } else {
+            None
+        };
     let rx_cfg = ReceiverConfig {
         mode,
         source_rate_hz: VRX_SOURCE_RATE_HZ,
@@ -1616,7 +1632,6 @@ async fn spawn_vrx(
             gain_db: cfg.gain_db,
         },
         tap,
-        meter: Some(meter.clone()),
     };
     let (sink, buf) = BufSink::pair(hl2::receiver::BUF_SINK_DEFAULT_CAP);
     let rx = VirtualReceiver::new(rx_cfg, Box::new(sink))
@@ -1705,7 +1720,6 @@ async fn spawn_vrx(
         buf,
         stop,
         muted,
-        meter,
         demod: Some(demod),
         fanout: Some(fanout_task),
         ft8: ft8_task,
@@ -1814,7 +1828,6 @@ async fn spawn_auto(
             gain_db: 0.0,
         },
         tap: Some(tap),
-        meter: None,
     };
     let rx = hl2::receiver::VirtualReceiver::new(rx_cfg, Box::new(DropSink::new()))
         .map_err(|e| format!("auto vrx build failed: {e}"))?;
@@ -2256,6 +2269,8 @@ async fn run_spectral(
     fanout: std::sync::Arc<tokio::sync::broadcast::Sender<WsEvent>>,
     spectrum_source: std::sync::Arc<std::sync::Mutex<SpectrumSource>>,
     spectrum_rev: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    meter: std::sync::Arc<crate::meter::MeterState>,
+    passband_bw: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
     let n_fft = cfg.accumulate_blocks * IQ_PAIRS_PER_BLOCK;
     use num_complex::Complex;
@@ -2379,6 +2394,37 @@ async fn run_spectral(
 
             _ = tick.tick() => {
                 if let Some((seq, mags)) = latest.take() {
+                    // S-meter: for an EP6 (per-slot) display, the band
+                    // spectrum's *quietest bins* are the noise floor and the
+                    // *passband peak* is the signal — both mode-agnostic
+                    // (see `crate::meter::compute_s_meter`). The passband
+                    // window is the running receiver's channel bandwidth
+                    // mapped to display bins.
+                    {
+                        let cur_src = spectrum_source.lock().unwrap().clone();
+                        if let SpectrumSource::Ep6 { slot } = cur_src {
+                            let bw_hz = passband_bw.load(std::sync::atomic::Ordering::Relaxed);
+                            if bw_hz > 0 {
+                                // Each display bin spans `(span / bins)` Hz
+                                // (full-bandwidth baseband, `span` ≈ source
+                                // rate). Half the passband in display bins =
+                                // (bw / 2) / bin_span.
+                                let span_hz = spectrum_span(&SpectrumSource::Ep6 { slot }) as f64;
+                                let bin_span = span_hz / mags.len() as f64;
+                                let half = if bin_span > 0.0 {
+                                    (((bw_hz as f64 / 2.0) / bin_span) as usize).max(1)
+                                } else {
+                                    1
+                                };
+                                let (lev, fl) = crate::meter::compute_s_meter(&mags, half, 25);
+                                meter.set(slot, lev, fl);
+                            } else {
+                                meter.set(0, -120.0, -120.0);
+                            }
+                        } else {
+                            meter.set(0, -120.0, -120.0);
+                        }
+                    }
                     let _ = fanout.send(WsEvent::Wideband { seq, mags });
                 }
             }

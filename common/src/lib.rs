@@ -109,15 +109,35 @@ pub struct SharedState {
     /// with a simple `contains_key`.
     #[serde(default)]
     pub auto_monitors: BTreeMap<u8, Vec<AutoMonitor>>,
-    /// Per-slot demod signal level, in dB FS of the pre-AGC channel input.
-    /// This is the raw S-meter level: the S-unit mapping (S1 = near the
-    /// noise floor, +6 dB per S unit, red past S9 / +20 dB) is applied by
-    /// the client. A missing slot = no live virtual receiver on that slot
-    /// right now. The value is republished by the server's periodic state
-    /// heartbeat, so the UI's S-meter needle tracks the live level without
-    /// any command traffic.
+    /// Per-slot signal level, in **dB relative to the band spectrum's full
+    /// scale** (the same reference as `vrx_floors`). Computed server-side
+    /// from the *displayed slot's* band spectrum (the FFT we already run for
+    /// the panadapter): the highest magnitude inside the running receiver's
+    /// channel passband window around the tuned frequency. This is
+    /// *signal + noise* in dB. The S-unit map (S1 = at the floor, +6 dB per
+    /// S unit, red past S9 / +20 dB) is applied by the client from
+    /// `vrx_levels[slot] − vrx_floors[slot]`. A missing slot = the display
+    /// source is not an EP6 per-slot stream (EP4 wideband, or that slot is
+    /// not currently being displayed). The value is republished by the
+    /// server's periodic state heartbeat (~100 ms), so the UI's S-meter
+    /// needle tracks the live reading without any command traffic.
     #[serde(default)]
     pub vrx_levels: BTreeMap<u8, f64>,
+    /// Per-slot **band noise floor**, in the same dB reference as
+    /// `vrx_levels`. Computed as the 25th percentile of the *whole
+    /// displayed band's* magnitudes — a strong signal occupies only a few
+    /// of the hundreds of noise bins, so the percentile lands on the noise
+    /// regardless of where (or whether) the signal sits, and regardless of
+    /// the mode (SSB sideband, AM carrier, FM deviation, FT8 tones — all
+    /// read as "elevated spectral energy vs. the noise floor"). The UI uses
+    /// `vrx_levels[slot] − vrx_floors[slot]` (dB of signal over the band
+    /// floor) as the S-meter gauge's input. Before this field existed the
+    /// UI self-calibrated the floor from its own level samples
+    /// (`track_floors` in ui/src/app.rs), which broke for carriers
+    /// (continuous signals never dip to noise, so the floor crept up to the
+    /// carrier and `level − floor → 0`).
+    #[serde(default)]
+    pub vrx_floors: BTreeMap<u8, f64>,
 }
 
 impl SharedState {
@@ -137,6 +157,7 @@ impl SharedState {
             vrx: BTreeMap::new(),
             auto_monitors: BTreeMap::new(),
             vrx_levels: BTreeMap::new(),
+            vrx_floors: BTreeMap::new(),
         }
     }
 }
@@ -864,6 +885,30 @@ mod tests {
         assert!(p.vrx_levels.is_empty());
         let e = serde_json::to_string(&SharedState::new(4)).unwrap();
         assert!(e.contains(r#""vrx_levels":{}"#), "got: {e}");
+    }
+
+    #[test]
+    fn vrx_floors_roundtrip_and_default() {
+        // `vrx_floors` mirrors `vrx_levels` (per-slot, dB FS) — the server's
+        // noise-floor estimate the UI pairs with the raw level to render the
+        // S-meter. It must round-trip and default to empty when absent
+        // (older servers).
+        let mut st = SharedState::new(4);
+        let mut fl = std::collections::BTreeMap::new();
+        fl.insert(1u8, -62.3_f64);
+        fl.insert(2u8, -71.0_f64);
+        st.vrx_floors = fl.clone();
+        let j = serde_json::to_string(&st).unwrap();
+        let p = serde_json::from_str::<SharedState>(&j).unwrap();
+        assert_eq!(p.vrx_floors, fl);
+        // Backward-compat: a legacy payload without `vrx_floors` still decodes.
+        let legacy = r#"{"started":true,"rx_count":4,"tuning":{},"sample_format":"sample16","adc_sample_rate_hz":76800000,"lna_gain_db":6,"oc_bits":0,"spectrum_source":"ep4","state_at":0,"vrx_levels":{"1":-40.5}}"#;
+        let p = serde_json::from_str::<SharedState>(legacy).unwrap();
+        assert!(p.vrx_floors.is_empty());
+        assert!(!p.vrx_levels.is_empty());
+        // And the empty map round-trips in the serialised form.
+        let e = serde_json::to_string(&SharedState::new(4)).unwrap();
+        assert!(e.contains(r#""vrx_floors":{}"#), "got: {e}");
     }
 
     #[test]

@@ -418,9 +418,20 @@ impl Shared {
             // `welcome` re-broadcast the hub sends on a ~100 ms tick while
             // any receiver is running (see `RadioHub::run_levels`).
             *sh.vrx_levels.borrow_mut() = resp.state.vrx_levels.clone();
-            // Track each slot's noise floor from the fresh level samples so
-            // the S-meter maps signal strength against the live band floor.
+            // Self-calibrate a per-slot noise-floor fallback (see
+            // `track_floors`) in case an older server does not publish one…
             sh.track_floors();
+            // …then let the server's own `vrx_floors` win where it supplies a
+            // value. The server computes the floor from the pre-AGC stream in
+            // the same reference as `vrx_levels`, so it is the authoritative
+            // S-meter floor (see `api/src/meter.rs`); `vrx_floors` defaults to
+            // empty for legacy servers, so slots it omits keep the fallback.
+            if !resp.state.vrx_floors.is_empty() {
+                let mut floors = sh.vrx_floor_db.borrow_mut();
+                for (slot, fl) in resp.state.vrx_floors.clone() {
+                    floors.insert(slot, fl);
+                }
+            }
             // Mirror the per-slot auto-decode monitors (headless digital-mode
             // decoders the server is running against known band frequencies).
             *sh.auto_monitors.borrow_mut() = resp.state.auto_monitors.clone();
@@ -1635,7 +1646,16 @@ pub fn app() -> Html {
 
     html! {
             <div class={format!("app{offline_class}")}>
-                <h1>{"Hermes Lite 2"}</h1>
+                <div class="headrow">
+                    <h1>{"Hermes Lite 2"}
+                        <span id="notifications">
+                            { "RX1 " }
+                            <span class={status_class}>
+                                {format!("{} {}", if online { "●" } else { "○" }, status)}
+                            </span>
+                        </span>
+                    </h1>
+                </div>
 
                 <div class="devrow">
                     {if devices.is_empty() {
@@ -1668,9 +1688,6 @@ pub fn app() -> Html {
                             }
                         }).collect::<Html>()
                     }}
-                    <span class={status_class}>
-                        {format!("{} {}", if online { "●" } else { "○" }, status)}
-                    </span>
                 </div>
 
                 <ul class="nav nav-tabs">

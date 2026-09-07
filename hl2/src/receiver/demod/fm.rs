@@ -58,7 +58,7 @@
 //! no work left to do beyond removing any small residual offset.
 //!
 //! The audio tail (DC-block + RMS-target AGC + pre-AGC
-//! [`RawSampleTap`](super::RawSampleTap) + S-meter + `i16` sink write) is
+//! [`RawSampleTap`](super::RawSampleTap) + `i16` sink write) is
 //! shared with every mode by the
 //! [`AudioEngine`](super::AudioEngine), attached via
 //! [`DemodCore::demodulator`](super::DemodCore::demodulator).
@@ -216,7 +216,7 @@ mod tests {
             rate_hz: 4_800,
             gain_db: 0.0,
         };
-        FmCore::new(rate, center, bw, cfg, label).demodulator(cfg, None, None)
+        FmCore::new(rate, center, bw, cfg, label).demodulator(cfg, None)
     }
 
     /// Goertzel: power at a single frequency (no FFT needed). Used by the

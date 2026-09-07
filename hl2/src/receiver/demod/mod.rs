@@ -12,7 +12,7 @@
 //!
 //! ```text
 //! complex I/Q ──► DemodCore::process ──► 0..=N f32s ──► AudioEngine ──► i16 → sink
-//!                    (per-mode DSP)                      (AGC, tap, meter)
+//!                    (per-mode DSP)                      (AGC, tap)
 //!                    ┐ SsbCore ┐ AmCore ┐ DigitalCore ┐    (shared, once)
 //!                    └──────────────────────────────────────┴─► demodulator()
 //! ```
@@ -20,7 +20,7 @@
 //! * **`DemodCore`** — the one method a new mode has to implement: per-sample
 //!   DSP. See [`core`].
 //! * **`AudioEngine`** — the mode-agnostic tail (DC-block + RMS AGC +
-//!   pre-AGC [`RawSampleTap`] + S-meter + `i16` sink write). See [`engine`].
+//!   pre-AGC [`RawSampleTap`] + `i16` sink write). See [`engine`].
 //! * **`StandardDemod<C>`** — composes the two into a full [`Demodulator`].
 //!   This is the only `Demodulator` impl in the crate; a new mode does not
 //!   need one.
@@ -93,7 +93,7 @@ pub type DemodError = Box<dyn std::error::Error + Send + Sync>;
 /// a new-mode `DemodCore` impl consumes this as-is.
 pub type IqBlock = Vec<Complex<f32>>;
 
-use crate::receiver::{AudioConfig, MeterHandle, Mode, Sideband};
+use crate::receiver::{AudioConfig, Mode, Sideband};
 
 /// Guard: the polyphase decimation factor must be ≥ 4 (the cores compute
 /// `m = source / audio` with plain integer division, so a too-close rate would
@@ -132,15 +132,15 @@ pub fn make_demod(
         bandwidth_hz,
         audio,
         None,
-        None,
     )
 }
 
-/// [`make_demod`] plus an optional pre-AGC [`RawSampleTap`] (`tap`) and
-/// signal-level meter (`meter`). This is the seam the FT8/JS8/FT4 slot
-/// decoders hang off: the demod still emits AGC'd `i16` to the `CH_AUDIO`
-/// sink (the operator hears the same audio being decoded), while `tap` copies
-/// the untouched pre-AGC `f32` stream to the decoder.
+/// [`make_demod`] plus an optional pre-AGC [`RawSampleTap`] (`tap`). This is
+/// the seam the FT8/JS8/FT4 slot decoders hang off: the demod still emits
+/// AGC'd `i16` to the `CH_AUDIO` sink (the operator hears the same audio
+/// being decoded), while `tap` copies the untouched pre-AGC `f32` stream to
+/// the decoder. The API's per-receiver signal-level S-meter also hangs off
+/// `tap` (see `api/src/meter.rs`) — the engine needs no meter of its own.
 pub fn make_demod_tap(
     mode: Mode,
     source_rate_hz: u32,
@@ -148,31 +148,30 @@ pub fn make_demod_tap(
     bandwidth_hz: u32,
     audio: AudioConfig,
     tap: Option<std::sync::Arc<dyn RawSampleTap>>,
-    meter: Option<MeterHandle>,
 ) -> Result<Box<dyn Demodulator>, DemodError> {
     ensure_decimable(source_rate_hz, audio)?;
     Ok(match mode {
         Mode::Ft8 => digital::DigitalCore::new(source_rate_hz, source_center_hz, audio, "ft8")
-            .demodulator(audio, tap, meter),
+            .demodulator(audio, tap),
         Mode::Js8 => digital::DigitalCore::new(source_rate_hz, source_center_hz, audio, "js8")
-            .demodulator(audio, tap, meter),
+            .demodulator(audio, tap),
         Mode::Ft4 => digital::DigitalCore::new(source_rate_hz, source_center_hz, audio, "ft4")
-            .demodulator(audio, tap, meter),
+            .demodulator(audio, tap),
         Mode::Am => am::AmCore::new(source_rate_hz, source_center_hz, bandwidth_hz, audio)
-            .demodulator(audio, tap, meter),
+            .demodulator(audio, tap),
         // FM (standard) and NFM (narrow) share one demod core; they differ
         // only in the channel-select bandwidth (`bandwidth_hz`), which is
         // already resolved from `Mode::default_bandwidth_hz` (15 kHz FM /
         // 5 kHz NFM) and may be overridden via `ReceiverConfig::bandwidth_hz`.
         Mode::Fm => fm::FmCore::new(source_rate_hz, source_center_hz, bandwidth_hz, audio, "fm")
-            .demodulator(audio, tap, meter),
+            .demodulator(audio, tap),
         Mode::FmNarrow => {
             fm::FmCore::new(source_rate_hz, source_center_hz, bandwidth_hz, audio, "nfm")
-                .demodulator(audio, tap, meter)
+                .demodulator(audio, tap)
         }
         Mode::Ssb(side) => {
             ssb::SsbCore::new(side, source_rate_hz, source_center_hz, bandwidth_hz, audio)
-                .demodulator(audio, tap, meter)
+                .demodulator(audio, tap)
         }
         // `SsbWide` is the wideband-complex pass-through placeholder; it runs
         // through the USB SSB pipeline today (PROTOCOL.md §16.3).
@@ -183,7 +182,7 @@ pub fn make_demod_tap(
             bandwidth_hz,
             audio,
         )
-        .demodulator(audio, tap, meter),
+        .demodulator(audio, tap),
     })
 }
 

@@ -1,28 +1,30 @@
 //! The shared **audio tail**: everything that a demodulated sample runs through
-//! after the mode-specific DSP — the pre-AGC [`RawSampleTap`] seam, the S-meter,
-//! the AC/DC-block + RMS-targeted AGC normalisation, and the `i16` sink write.
+//! after the mode-specific DSP — the pre-AGC [`RawSampleTap`] seam, the
+//! AC/DC-block + RMS-targeted AGC normalisation, and the `i16` sink write.
 //!
 //! Before this module this logic was copy-pasted into `ssb.rs`, `am.rs` and
 //! `digital.rs` (identical `emit` / `flush_full_blocks` / `flush_audio` bodies,
-//! identical `agc_gain` / `audio_buf` / `tap` / `meter` / `meter_smooth`
-//! fields). It is identical for every mode — the only per-mode difference in the
-//! whole pipeline is the single sample the core produces per complex input, and
-//! that now flows in through [`AudioEngine::push`].
+//! identical `agc_gain` / `audio_buf` / `tap` fields). It is identical for every
+//! mode — the only per-mode difference in the whole pipeline is the single
+//! sample the core produces per complex input, and that now flows in through
+//! [`AudioEngine::push`].
 //!
 //! A [`DemodCore`](super::core::DemodCore) decides *what* the decimated real
 //! sample is (USB arm / LSB Hilbert / envelope / phase rate / …); the
 //! [`AudioEngine`] decides how it is normalised and delivered. [`StandardDemod`]
-//! ([`super::standard`]) composes the two into a full [`Demodulator`].
+//! ([`super::core`]) composes the two into a full [`Demodulator`].
 //!
 //! The normalisation itself — DC block, slow RMS-targeted AGC, gain — is in
-//! [`normalize_to_i16_with_agc`]; the S-meter smoothing is [`meter_tick`]. Both
-//! are unchanged from the old per-mode copies (see PROTOCOL.md §16.3).
+//! [`normalize_to_i16_with_agc`], unchanged from the old per-mode copies (see
+//! PROTOCOL.md §16.3). The signal-level S-meter is **not** part of this tail:
+//! it hangs off the pre-AGC [`RawSampleTap`] seam from the API layer (see
+//! `api/src/meter.rs`), so the `hl2` crate keeps no level bookkeeping.
 
 use std::sync::atomic::AtomicUsize;
 
 use super::RawSampleTap;
+use crate::receiver::AudioConfig;
 use crate::receiver::sink::AudioSink;
-use crate::receiver::{AudioConfig, MeterHandle, meter_write};
 
 /// Minimum decimated samples to accumulate before a block is normalised and
 /// emitted. A single wire chunk (63 complex samples at a 192 kHz → 4.8 kHz
@@ -48,14 +50,10 @@ pub struct AudioEngine {
     audio_buf: Vec<f32>,
     /// Optional pre-AGC raw-sample tap (e.g. FT8 decode). `Arc` so the API
     /// layer can keep one handle for the demod and hand a clone to the decode
-    /// task.
+    /// task. The API's signal-level meter hangs off this same seam too — as
+    /// another `RawSampleTap` (see `api/src/meter.rs`) — so the tail needs no
+    /// meter of its own.
     tap: Option<std::sync::Arc<dyn RawSampleTap>>,
-    /// Optional signal-level meter: a one-pole smoothed pre-AGC in-band RMS in
-    /// dB FS, written to this atomic on every emit.
-    meter: Option<MeterHandle>,
-    /// Running smoothed level (dB FS), for the one-pole filter. Initialised to
-    /// a deep floor so the first emit moves the gauge quickly.
-    meter_smooth: f64,
     /// A short label for the HL2_DEBUG gated emit trace (`"ssb"` / `"am"` / …).
     mode_label: &'static str,
 }
@@ -70,8 +68,6 @@ impl AudioEngine {
             agc_gain: 1000.0,
             audio_buf: Vec::with_capacity(256),
             tap: None,
-            meter: None,
-            meter_smooth: -120.0,
             mode_label,
         }
     }
@@ -81,15 +77,6 @@ impl AudioEngine {
     pub fn with_tap(mut self, tap: Option<std::sync::Arc<dyn RawSampleTap>>) -> Self {
         if let Some(t) = tap {
             self.tap = Some(t);
-        }
-        self
-    }
-
-    /// Attach a signal-level meter (builder; a cheap `Arc` clone). Pass
-    /// `None` to keep no meter (the default).
-    pub fn with_meter(mut self, meter: Option<MeterHandle>) -> Self {
-        if let Some(m) = meter {
-            self.meter = Some(m);
         }
         self
     }
@@ -141,15 +128,10 @@ impl AudioEngine {
         slice: &[f32],
         sink: &mut dyn AudioSink,
     ) -> Result<usize, super::DemodError> {
-        // Pre-AGC raw-sample tap (FT8/JS8/FT4 decode): the untouched decimated
-        // `f32` stream, in arrival order.
+        // Pre-AGC raw-sample tap (FT8/JS8/FT4 decode, and the API's S-meter):
+        // the untouched decimated `f32` stream, in arrival order.
         if let Some(tap) = self.tap.as_ref() {
             tap.append(slice);
-        }
-        // S-meter: advance the one-pole smoothed level from the pre-AGC
-        // decimated stream (before the AGC rescales it).
-        if let Some(meter) = self.meter.as_ref() {
-            meter_tick(meter, &mut self.meter_smooth, slice);
         }
         let mut out = vec![0i16; slice.len()];
         let written =
@@ -170,32 +152,6 @@ impl AudioEngine {
         }
         sink.write(&out[..written])
     }
-}
-
-/// Advance the one-pole smoothed S-meter: compute the in-band RMS of the
-/// pre-AGC decimated `f32` stream, express it in dB FS (0 dBFS = full-scale
-/// i16 — the natural "1.0" amplitude maps to −∞ dB, the AGC target
-/// of 0.1 × 32767 maps to ≈ −20 dBFS), apply fast-attack / slow-release
-/// one-pole smoothing, and store the result into the meter atomic.
-///
-/// `now_db` is floored at −140 dBFS: below that the receiver is "silent"
-/// (only the ADI chain's inherent quantisation noise) and it's kinder to
-/// the gauge to pin the needle at its bottom instead of dropping into the
-/// f64 noise floor.
-fn meter_tick(meter: &MeterHandle, smooth: &mut f64, slice: &[f32]) {
-    if slice.is_empty() {
-        return;
-    }
-    let mut ss = 0.0f64;
-    for v in slice {
-        let x = *v as f64;
-        ss += x * x;
-    }
-    let rms = (ss / slice.len() as f64).sqrt();
-    let now_db = (20.0 * (rms.max(1e-7).log10())).max(-140.0).min(0.0);
-    let alpha = if now_db > *smooth { 0.5 } else { 0.05 };
-    *smooth += alpha * (now_db - *smooth);
-    meter_write(meter, *smooth);
 }
 
 /// Normalise an `f32` audio block to `i16`. The audio comes in "natural"

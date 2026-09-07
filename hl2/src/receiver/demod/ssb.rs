@@ -3,9 +3,10 @@
 //! The SSB path is **NCO → product-discriminate (USB: in-phase, LSB: Hilbert
 //! quadrature) → polyphase anti-alias/decimate**. This module implements only
 //! that per-sample DSP as a [`DemodCore`]. The audio tail (DC-block +
-//! RMS-target AGC + pre-AGC [`RawSampleTap`] + S-meter + `i16` sink write) is
+//! RMS-target AGC + pre-AGC [`RawSampleTap`] + `i16` sink write) is
 //! shared with every mode by the [`AudioEngine`], which [`StandardDemod`]
-//! attaches here via [`DemodCore::demodulator`].
+//! attaches here via [`DemodCore::demodulator`]. The API's S-meter hangs off
+//! that same [`RawSampleTap`] (see `api/src/meter.rs`).
 //!
 //! The USB/LSB distinction is carried by which post-NCO arm is kept: a
 //! positive-frequency NCO moves the upper sideband to baseband on the
@@ -30,7 +31,7 @@ use crate::receiver::Sideband;
 ///
 /// Holds: an NCO (to bring the carrier/selected sideband to baseband), a
 /// 90° (Hilbert) phase-shifter for LSB, and the polyphase anti-alias /
-/// decimation stage (`lp`). The audio tail (AGC/DC-block/tap/meter/sink) is
+/// decimation stage (`lp`). The audio tail (AGC/DC-block/tap/sink) is
 /// attached by [`DemodCore::demodulator`] into the shared [`AudioEngine`].
 pub struct SsbCore {
     sideband: Sideband,
@@ -178,7 +179,7 @@ mod tests {
             rate_hz: 4_800,
             gain_db: 0.0,
         };
-        SsbCore::new(sideband, rate, center, bw, cfg).demodulator(cfg, None, None)
+        SsbCore::new(sideband, rate, center, bw, cfg).demodulator(cfg, None)
     }
 
     #[test]

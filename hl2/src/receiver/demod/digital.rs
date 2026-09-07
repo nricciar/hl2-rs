@@ -3,8 +3,8 @@
 //! The FT8/JS8/FT4 path is **NCO → in-phase (USB) arm → polyphase
 //! anti-alias/decimate**. The audio tail (AGC + DC-block, pre-AGC
 //! [`RawSampleTap`] — which `Ft8Tap` / `Js8Tap` / `Ft4Tap` attach to for the
-//! slot decoders, S-meter, `i16` sink write) is shared with every mode via
-//! the [`AudioEngine`]; this module implements only the USB in-phase core.
+//! slot decoders, `i16` sink write) is shared with every mode via the
+//! [`AudioEngine`]; this module implements only the USB in-phase core.
 //!
 //! The FT8 passband (~1.4–2.9 kHz) sits in the *in-phase* arm after the USB
 //! NCO, so the quadrature synthesis an LSB SSB demod needs is pure overhead
@@ -25,7 +25,7 @@ use crate::receiver::AudioConfig;
 
 /// The FT8/JS8/FT4 demodulator **core**: USB SSB mix at a 12 kHz output
 /// rate (the `mfsk-core` / JS8 decoder's fixed-window rate), decimated by
-/// the polyphase anti-alias stage. The audio tail (AGC, pre-AGC tap, S-meter,
+/// the polyphase anti-alias stage. The audio tail (AGC, pre-AGC tap,
 /// sink write) is attached by [`DemodCore::demodulator`] into the shared
 /// [`AudioEngine`].
 ///
@@ -167,7 +167,7 @@ mod tests {
             rate_hz: 12_000,
             gain_db: 0.0,
         };
-        DigitalCore::new(rate, nco_hz, cfg, label).demodulator(cfg, tap, None)
+        DigitalCore::new(rate, nco_hz, cfg, label).demodulator(cfg, tap)
     }
 
     /// The DigitalCore must produce 12 kHz monitor audio (AGC'd), and

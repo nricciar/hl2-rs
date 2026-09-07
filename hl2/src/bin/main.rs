@@ -353,7 +353,6 @@ async fn main() {
                         gain_db: 0.0,
                     },
                     tap: None,
-                    meter: None,
                 };
                 VirtualReceiver::new(cfg, sink).expect("build virtual receiver")
             };
@@ -571,7 +570,6 @@ async fn main() {
                     gain_db: 0.0,
                 },
                 tap,
-                meter: None,
             };
             let rx = VirtualReceiver::new(cfg, Box::new(DropSink::new()))
                 .expect("build ft8 virtual receiver");

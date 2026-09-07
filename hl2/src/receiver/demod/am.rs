@@ -11,8 +11,9 @@
 //! ```
 //!
 //! The audio tail (AGC DC-block + RMS target, pre-AGC [`RawSampleTap`],
-//! S-meter, `i16` sink write) is shared with every mode via the
-//! [`AudioEngine`]; this module implements only the envelope-detection core.
+//! `i16` sink write) is shared with every mode via the [`AudioEngine`];
+//! this module implements only the envelope-detection core. The API's
+//! S-meter hangs off that same [`RawSampleTap`] (see `api/src/meter.rs`).
 //!
 //! ## Why envelope detection (not "keep the in-phase arm")
 //!
@@ -166,7 +167,7 @@ mod tests {
             rate_hz: 4_800,
             gain_db: 0.0,
         };
-        AmCore::new(rate, center, bw, cfg).demodulator(cfg, None, None)
+        AmCore::new(rate, center, bw, cfg).demodulator(cfg, None)
     }
 
     #[test]
