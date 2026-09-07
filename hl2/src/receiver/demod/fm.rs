@@ -11,7 +11,7 @@
 //!
 //! The HL2 EP6 wire delivers **genuine complex I/Q**, so both arms carry
 //! signal energy in every configuration — a Hilbert phase-shifter (as the
-//! SSB core uses for real-SDR input) would be pure overhead here.
+//! SSB core uses for sideband selection) would be pure overhead here.
 //!
 //! After the NCO brings the FM carrier to baseband the sample is
 //! `A·e^{j·φ(t)}`, where the *phase* `φ(t)` carries the audio (the FM

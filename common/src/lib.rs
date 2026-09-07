@@ -112,15 +112,18 @@ pub struct SharedState {
     /// Per-slot signal level, in **dB relative to the band spectrum's full
     /// scale** (the same reference as `vrx_floors`). Computed server-side
     /// from the *displayed slot's* band spectrum (the FFT we already run for
-    /// the panadapter): the highest magnitude inside the running receiver's
-    /// channel passband window around the tuned frequency. This is
-    /// *signal + noise* in dB. The S-unit map (S1 = at the floor, +6 dB per
-    /// S unit, red past S9 / +20 dB) is applied by the client from
-    /// `vrx_levels[slot] − vrx_floors[slot]`. A missing slot = the display
-    /// source is not an EP6 per-slot stream (EP4 wideband, or that slot is
-    /// not currently being displayed). The value is republished by the
-    /// server's periodic state heartbeat (~100 ms), so the UI's S-meter
-    /// needle tracks the live reading without any command traffic.
+    /// the panadapter): the **root-mean-square spectral energy** inside the
+    /// running receiver's **mode-oriented** channel passband (USB/digital →
+    /// above the tune, LSB → below, AM/FM/NFM → both sides; the same band the
+    /// UI shades on the panadapter). Measuring energy rather than a single
+    /// peak bin is what makes an AM reading track the audio **modulation**
+    /// (speech vs. silence) instead of the constant carrier. The S-unit map
+    /// (S1 = at the floor, +6 dB per S unit, red past S9 / +20 dB) is applied
+    /// by the client from `vrx_levels[slot] − vrx_floors[slot]`. A missing
+    /// slot = the display source is not an EP6 per-slot stream (EP4 wideband,
+    /// or that slot is not currently being displayed). The value is republished
+    /// by the server's periodic state heartbeat (~100 ms), so the UI's
+    /// S-meter needle tracks the live reading without any command traffic.
     #[serde(default)]
     pub vrx_levels: BTreeMap<u8, f64>,
     /// Per-slot **band noise floor**, in the same dB reference as

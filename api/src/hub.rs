@@ -431,6 +431,11 @@ pub struct RadioHub {
     /// the displayed slot, written by `set_vrx` / `ensure_vrx` and read by
     /// `run_spectral` to size the S-meter's passband window. `0` = no vrx.
     passband_bw: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Which side(s) of the tune the running receiver's passband occupies,
+    /// as a [`VrxMode`] discriminant (`0` = Usb, `1` = Lsb, …). Written by
+    /// `set_vrx` and read by `run_spectral` to select the S-meter's
+    /// [`crate::meter::PassbandShape`].
+    passband_mode: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// PSK Reporter sink (spot queue + station identity + send bookkeeping),
     /// shared with the `pskrep_hook` UDP send task. The hub appends
     /// spot-able FT8/JS8 decodes into it (see `spawn_ft8_decode` /
@@ -459,6 +464,9 @@ impl RadioHub {
             spectrum_rev: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             meter: std::sync::Arc::new(crate::meter::MeterState::new()),
             passband_bw: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            passband_mode: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
+                crate::meter::PassbandShape::Centered.as_u32(),
+            )),
             pskrep,
         }
     }
@@ -735,8 +743,19 @@ impl RadioHub {
                 let src_rev = self.spectrum_rev.clone();
                 let meter = self.meter.clone();
                 let passband_bw = self.passband_bw.clone();
+                let passband_mode = self.passband_mode.clone();
                 let handle = tokio::spawn(async move {
-                    run_spectral(cfg, ev_rx, fanout, src, src_rev, meter, passband_bw).await
+                    run_spectral(
+                        cfg,
+                        ev_rx,
+                        fanout,
+                        src,
+                        src_rev,
+                        meter,
+                        passband_bw,
+                        passband_mode,
+                    )
+                    .await
                 });
                 *self.task.lock().unwrap() = Some(handle);
 
@@ -1109,6 +1128,9 @@ impl RadioHub {
                             }
                             self.passband_bw
                                 .store(c.bw_hz as u64, std::sync::atomic::Ordering::Relaxed);
+                            let shape = crate::meter::shape_for_mode(&c.mode);
+                            self.passband_mode
+                                .store(shape.as_u32(), std::sync::atomic::Ordering::Relaxed);
                             let (state, _) = self.snapshot().await;
                             ServerResponse::ok(id, &state)
                         }
@@ -2279,6 +2301,7 @@ async fn run_spectral(
     spectrum_rev: std::sync::Arc<std::sync::atomic::AtomicU64>,
     meter: std::sync::Arc<crate::meter::MeterState>,
     passband_bw: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    passband_mode: std::sync::Arc<std::sync::atomic::AtomicU32>,
 ) {
     let n_fft = cfg.accumulate_blocks * IQ_PAIRS_PER_BLOCK;
     use num_complex::Complex;
@@ -2415,16 +2438,20 @@ async fn run_spectral(
                             if bw_hz > 0 {
                                 // Each display bin spans `(span / bins)` Hz
                                 // (full-bandwidth baseband, `span` ≈ source
-                                // rate). Half the passband in display bins =
-                                // (bw / 2) / bin_span.
+                                // rate). The passband in display bins =
+                                // bw / bin_span.
                                 let span_hz = spectrum_span(&SpectrumSource::Ep6 { slot }) as f64;
                                 let bin_span = span_hz / mags.len() as f64;
-                                let half = if bin_span > 0.0 {
-                                    (((bw_hz as f64 / 2.0) / bin_span) as usize).max(1)
+                                let width = if bin_span > 0.0 {
+                                    ((bw_hz as f64 / bin_span) as usize).max(1)
                                 } else {
                                     1
                                 };
-                                let (lev, fl) = crate::meter::compute_s_meter(&mags, half, 25);
+                                let shape = crate::meter::PassbandShape::from_u32(
+                                    passband_mode.load(std::sync::atomic::Ordering::Relaxed),
+                                );
+                                let (lev, fl) =
+                                    crate::meter::compute_s_meter(&mags, width, shape, 25);
                                 meter.set(slot, lev, fl);
                             } else {
                                 meter.set(0, -120.0, -120.0);

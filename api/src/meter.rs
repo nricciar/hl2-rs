@@ -3,8 +3,13 @@
 //!
 //! The S-meter reads **signal over noise** in dB:
 //!
-//!   * **level** = the highest spectral magnitude inside the tuned passband
-//!     window — *the signal + the noise that lives under it*.
+//!   * **level** = the *root-mean-square* spectral energy inside the running
+//!     receiver's channel passband — *the signal's average power (including
+//!     the modulation that carries the audio) plus the noise under it*.
+//!     Measuring energy, not a single peak bin, means an AM carrier's huge
+//!     DC line is blended with its sidebands, so the reading rises and falls
+//!     with the **modulation** (speech vs. silence) rather than latching onto
+//!     the constant carrier.
 //!
 //!   * **floor** = the 25th percentile of the whole band's magnitudes,
 //!     which is an unbiased *band noise floor* (independent of whether the
@@ -13,18 +18,31 @@
 //!     regardless of mode.
 //!
 //!   * **S-unit reading** = `level − floor` — a clean, scale-independent
-//!     dB of "signal above the band floor". This is the classic
-//!     signal-over-noise-ratio definition and is **mode-agnostic**: SSB
-//!     sideband, AM carrier, FM deviation, FT8 tones — all read as
-//!     "elevated spectral energy vs. the band floor", no per-mode
-//!     calibration required.
+//!     dB of *band signal energy above the band floor*. This is a true
+//!     signal-over-noise-ratio and is **mode-agnostic**: SSB sideband, AM
+//!     carrier + sidebands, FM deviation, FT8 tones — all read as "elevated
+//!     spectral energy vs. the band floor", no per-mode calibration.
 //!
-//! The two `f32` magnitudes are scaled to `u16` in
-//! [`crate::spectrum::display_mags_into`] — full-scale is `65_535`. We
-//! convert to dB relative to that, then publish:
+//! # Passband orientation
 //!
-//!   * [`SharedState::vrx_levels`] — the *peak* spectral energy inside the
-//!     passband, in dB (relative to full scale).
+//! The passband window is **not** centred for every mode — it mirrors the
+//! running receiver's actual channel-select passband (the same band the UI
+//! shades on the panadapter, see `draw_vrx_passband`):
+//!
+//!   * **Upper** (USB, and the digital modes whose audio lives above the
+//!     carrier — FT8 / FT4 / JS8) → `[centre, centre + bw]`
+//!   * **Lower** (LSB) → `[centre − bw, centre]`
+//!   * **Centered** (AM, FM, NFM — both sidebands) → `[centre − bw, centre + bw]`
+//!
+//! Passing the wrong orientation is what used to make USB and LSB read
+//! identically (the meter latched onto the *other* sideband's carrier, which
+//! the receiver never passes); the [`PassbandShape`] selects the window.
+//!
+//! The magnitudes are scaled to `u16` in [`crate::spectrum::display_mags_into`]
+//! — full-scale is `65_535`. We convert to dB relative to that, then publish:
+//!
+//!   * [`SharedState::vrx_levels`] — the *RMS passband energy*, in dB
+//!     (relative to full scale).
 //!   * [`SharedState::vrx_floors`] — the *band noise floor*, in dB (same
 //!     reference).
 //!
@@ -126,14 +144,80 @@ fn mag_to_db(m: u16) -> f64 {
     db
 }
 
-/// Compute (level_db, floor_db) for one frame.
+/// The side(s) of the tuned frequency the running receiver's channel-select
+/// passband occupies. Selects the passband window used for the S-meter
+/// level, mirroring the band the UI shades on the panadapter
+/// (`canvas::draw_vrx_passband`) rather than assuming everything is centred
+/// on the tune.
+///
+/// Round-trips to `u32` for atomic storage in `hub.rs`; the hub stores the
+/// *shape* (not the wire mode's disc), so this enum is the single source of
+/// truth for "which side of the tune is the passband on".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassbandShape {
+    /// Passband is `[centre, centre + bw]`: USB voice, and the digital modes
+    /// (FT8 / FT4 / JS8), whose audio lives *above* the carrier.
+    Upper,
+    /// Passband is `[centre − bw, centre]`: LSB voice.
+    Lower,
+    /// Passband is `[centre − bw, centre + bw]`: AM (DSB-FC), FM, NFM (both).
+    Centered,
+}
+
+impl PassbandShape {
+    /// Stable on-wire `u32` (used to store in the hub's `AtomicU32`).
+    pub const fn as_u32(self) -> u32 {
+        match self {
+            PassbandShape::Upper => 1,
+            PassbandShape::Lower => 2,
+            PassbandShape::Centered => 3,
+        }
+    }
+    /// Reconstruct from a stored `u32`. Unknown values fall back to
+    /// [`PassbandShape::Centered`] (symmetric — the most conservative
+    /// reading for an unrecognised mode).
+    pub const fn from_u32(v: u32) -> Self {
+        match v {
+            1 => PassbandShape::Upper,
+            2 => PassbandShape::Lower,
+            _ => PassbandShape::Centered,
+        }
+    }
+}
+
+/// Map a wire receiver mode to its [`PassbandShape`] — the *single* place
+/// in the server that maps `VrxMode` to an S-meter window, mirroring
+/// `canvas::draw_vrx_passband` (the authoritative channel-select band the
+/// UI already draws).
+///
+/// The digital modes are demodulated as USB (audio above the carrier), so
+/// they take [`PassbandShape::Upper`], same as plain `Usb`.
+pub fn shape_for_mode(mode: &hl2_common::VrxMode) -> PassbandShape {
+    match mode {
+        hl2_common::VrxMode::Lsb => PassbandShape::Lower,
+        hl2_common::VrxMode::Am | hl2_common::VrxMode::Fm | hl2_common::VrxMode::FmNarrow => {
+            PassbandShape::Centered
+        }
+        hl2_common::VrxMode::Usb
+        | hl2_common::VrxMode::Ft8
+        | hl2_common::VrxMode::Ft4
+        | hl2_common::VrxMode::Js8 => PassbandShape::Upper,
+    }
+}
+
+/// Compute `(level_db, floor_db)` for one frame.
 ///
 /// * `mags` — the *displayed* band magnitudes (centered: DC at `len/2`).
 ///   Length is `cfg.wideband_bins`, values scaled `0..=65_535`.
-/// * `passband_half_width_bins` — half the passband window, **in bins**,
-///   around the display centre (= the tuned frequency). The caller
-///   computes this from the running RX's channel-select bandwidth +
+/// * `passband_width_bins` — the passband window width, **in bins**, on the
+///   passband side(s) of the display centre (= the tuned frequency). The
+///   caller computes this from the running RX's channel-select bandwidth +
 ///   offset, the FFT size, and the bin count: see `hub.rs::run_spectral`.
+///   For [`PassbandShape::Upper`] / [`PassbandShape::Lower`] this is the
+///   one-sided width `[0, w]` / `[-w, 0]`; for [`PassbandShape::Centered`]
+///   it is the half-width, window `[−w, +w]`.
+/// * `shape` — which side(s) of the tune the passband occupies
+///   (see [`PassbandShape`]).
 /// * `floor_percentile` — the band floor as a quantile of the *whole*
 ///   display. `25` (percent) gives the robust band-noise estimate.
 ///
@@ -141,34 +225,47 @@ fn mag_to_db(m: u16) -> f64 {
 /// (65_535 = 0 dB). The UI reads the signal-over-floor margin as
 /// `level_db − floor_db`.
 ///
-/// Invariant: `level_db >= floor_db`. The level is the peak *inside* the
-/// passband window and the floor is the *25th percentile* of the *whole*
-/// display, so the peak can only fall below the floor when the *entire*
-/// display is below it — and then the peak is also the floor (equal).
+/// `level` is the **RMS** (root-mean-square) magnitude over the passband
+/// window — the window's *average spectral power*, not a single peak bin.
+/// That is what lets an AM carrier (a huge, near-constant DC line) blend
+/// with its audio-modulated sidebands so the reading tracks the modulation
+/// rather than latching onto the carrier.
 pub fn compute_s_meter(
     mags: &[u16],
-    passband_half_width_bins: usize,
+    passband_width_bins: usize,
+    shape: PassbandShape,
     floor_percentile: usize,
 ) -> (f64, f64) {
-    if mags.is_empty() {
+    if mags.is_empty() || passband_width_bins == 0 {
         return (-120.0, -120.0);
     }
     let n = mags.len();
     let c = n / 2;
-    let lo = c.saturating_sub(passband_half_width_bins);
-    let hi = (c + passband_half_width_bins).min(n - 1);
+    let w = passband_width_bins.min(n);
+    // Window bounds depend on which sideband the receiver actually passes.
+    let (lo, hi) = match shape {
+        PassbandShape::Lower => (c.saturating_sub(w), c),
+        PassbandShape::Upper => (c, (c + w).min(n - 1)),
+        PassbandShape::Centered => (c.saturating_sub(w), (c + w).min(n - 1)),
+    };
     if hi < lo {
         return (-120.0, -120.0);
     }
 
-    // Level: max magnitude inside the passband window.
-    let mut peak = 0u16;
+    // Level: RMS magnitude over the passband window (its average power).
+    // Sum the *squared* magnitudes then take the root, so the dB conversion
+    // is `20·log10(rms / full-scale)`.
+    let mut sum_sq = 0f64;
     for &m in &mags[lo..=hi] {
-        if m > peak {
-            peak = m;
-        }
+        let v = m as f64;
+        sum_sq += v * v;
     }
-    let level_db = mag_to_db(peak);
+    let rms = (sum_sq / (hi - lo + 1) as f64).sqrt();
+    let level_db = if rms <= 1.0 {
+        -120.0
+    } else {
+        (20.0f64 * (rms / 65_535.0).log10()).clamp(-120.0, 0.0)
+    };
 
     // Floor: `floor_percentile`-th percentile of the *whole* display.
     // A single passband peak sits in a handfull of bins out of thousands of
@@ -204,20 +301,20 @@ mod tests {
         vec![mag; n_bins]
     }
 
-    /// A single strong carrier at the display centre (DC), with the
-    /// remaining `n_bins − 1` bins at a weak background `noise_mag`.
-    fn carrier_at_dc(n_bins: usize, noise_mag: u16, carrier_mag: u16) -> Vec<u16> {
+    /// A single strong carrier at the display centre (DC) spanning `width`
+    /// bins, with the remaining bins at a weak background `noise_mag`.
+    fn carrier_at_dc(n_bins: usize, width: usize, noise_mag: u16, carrier_mag: u16) -> Vec<u16> {
         let mut m = vec![noise_mag; n_bins];
         let c = n_bins / 2;
-        // The real passband of a strong AM carrier spans a *handful* of
-        // bins; put the carrier in the 3 bins around the display centre to
-        // simulate that (in a real `display_mags_into` the peak is in one
-        // bin with adjacent rollover).
-        for d in 1..=1 {
-            *m.get_mut(c - d).unwrap() = carrier_mag;
-            *m.get_mut(c + d).unwrap() = carrier_mag;
+        // The real passband of a strong carrier spans a *handful* of bins;
+        // paint `width` bins around the display centre to simulate that
+        // (in a real `display_mags_into` the peak is in one bin with
+        // adjacent rollover).
+        for d in 0..width {
+            if let Some(bin) = m.get_mut(c + d - width / 2) {
+                *bin = carrier_mag;
+            }
         }
-        m[c] = carrier_mag;
         m
     }
 
@@ -226,7 +323,7 @@ mod tests {
         // A uniform-weak display: the whole display is the same magnitude,
         // so level = floor exactly (S margin = 0, the "S1" resting read).
         let mags = quiet_band(1024, 200);
-        let (lev, fl) = compute_s_meter(&mags, 64, 25);
+        let (lev, fl) = compute_s_meter(&mags, 64, PassbandShape::Centered, 25);
         assert!(
             (lev as f64 - fl as f64).abs() < 1e-9,
             "quiet band: level ({lev}) ≈ floor ({fl})"
@@ -236,42 +333,43 @@ mod tests {
 
     #[test]
     fn carrier_well_above_floor_in_passband() {
-        // A full-scale carrier inside the passband; the rest of the display
-        // is weak noise. The level (peak in the passband) must be well
-        // above the floor (25th percentile of the whole display, which is
-        // noise).
-        let mags = carrier_at_dc(1024, 100, 60_000);
-        let (lev, fl) = compute_s_meter(&mags, 64, 25);
+        // A near-full-scale carrier inside the (centred) passband; the rest
+        // of the display is weak noise. The level (RMS in the passband) must
+        // be well above the floor (25th percentile of the whole display,
+        // which is noise).
+        let mags = carrier_at_dc(1024, 3, 100, 60_000);
+        let (lev, fl) = compute_s_meter(&mags, 64, PassbandShape::Centered, 25);
         assert!(
             lev > fl + 20.0,
             "carrier-in-band: level {lev} dB must be >20 dB over floor {fl} dB (S-margin)"
         );
         assert!(
             fl < 20.0,
-            "floor should be near full scale minus a lot (≈ −6 dB from a 100/65535 mag) — got {fl}"
+            "floor should be near the noise magnitude — got {fl} dB"
         );
-        // A 60_000/65_535 mag is ≈ full scale → level ≈ 0 dB FS.
+        // A 3-bin 60_000 carrier in a 129-bin window: RMS is below full
+        // scale, so level is a negative dB FS (but high over the floor).
         assert!(
-            lev > -1.0 && lev <= 1.0,
-            "a 60_000/65_535 mag is ≈ −0 dBFS — level {lev} dB"
+            (lev - 0.0).abs() <= 0.5 || lev < 0.0,
+            "3-bin carrier in a 129-bin window: level {lev} dB should be ≤ full scale"
         );
     }
 
     #[test]
     fn floor_is_not_pulled_up_by_signal_outside_passband() {
         // A strong carrier *outside* the passband (e.g. an adjacent
-        // station) sits in a handfull of the `n` bins. The 25th
-        // percentile still lands on the noise.
+        // station) sits in a handful of the `n` bins. The 25th percentile
+        // still lands on the noise, and the RMS level does not see it.
         let n_bins = 1024;
         let mut m = vec![100u16; n_bins];
         let c = n_bins / 2;
         // A strong carrier ± 80 bins from the passband centre (outside a
-        // 64-bin-half-width window).
+        // 64-bin window).
         for d in 70..=90 {
             m[(c + d) % n_bins] = 60_000;
             m[(c - d + n_bins) % n_bins] = 60_000;
         }
-        let (lev, fl) = compute_s_meter(&m, 64, 25);
+        let (lev, fl) = compute_s_meter(&m, 64, PassbandShape::Centered, 25);
         // The passband window [c-64, c+64] does NOT include the [c-90, c+90]
         // carrier, so the level is the noise. But the floor is the 25th
         // percentile of the whole display — still noise.
@@ -279,9 +377,145 @@ mod tests {
             lev < 20.0,
             "level outside the passband window should be ≈ noise — got {lev} dB"
         );
+        assert!(fl < 20.0, "floor must be the band noise — got {fl} dB");
+    }
+
+    #[test]
+    fn usb_reads_signal_lsb_reads_floor() {
+        // The reported bug: the *same* physical signal (a strong chunk of
+        // the *upper* half of the display, i.e. the USB side) must read
+        // **strong** in USB and **≈ floor** in LSB. LSB's window is
+        // `[c−w, c−1]`, which does *not* overlap the `[c+1, c+w]` USB line
+        // (the boundary bin `c` = carrier DC = noise, since SSB suppresses it).
+        let n_bins = 1024;
+        let c = n_bins / 2;
+        let w = 32usize;
+        let noise = 100u16;
+        let sig = 60_000u16;
+        // A USB line at `c+1..c+w` (strictly *above* the carrier bin `c`).
+        let mut usb = vec![noise; n_bins];
+        for d in 1..=w {
+            usb[c + d] = sig;
+        }
+        // Compute using the *true* SSB passband windows:
+        //   USB → `[c, c+w]` (which contains the `[c+1, c+w]` line).
+        //   LSB → `[c−w, c]` (which does NOT — bin `c` is the carrier,
+        //         which SSB suppresses = noise).
+        let (u_lev, u_fl) = compute_s_meter(&usb, w, PassbandShape::Upper, 25);
+        let (l_lev, l_fl) = compute_s_meter(&usb, w, PassbandShape::Lower, 25);
+
+        // USB: the line is in `[c+1, c+w]` ⊂ USB window, so level >> floor.
         assert!(
-            fl < 20.0,
-            "floor must be the band noise (≈ −6 dB) — got {fl} dB"
+            u_lev > u_fl + 20.0,
+            "USB should read the upper-side line: level {u_lev} > floor {u_fl} + 20"
+        );
+
+        // LSB: `[c−w, c]` has only noise (bin `c` = carrier = noise in SSB),
+        // so level ≈ floor.
+        assert!(
+            (l_lev - l_fl).abs() < 6.0,
+            "LSB should ≈ floor (line is out of passband): level {l_lev} floor {l_fl}"
+        );
+
+        // And the two readings must *differ* now (the old bug was "identical").
+        assert!(
+            (u_lev - u_fl) - (l_lev - l_fl) > 15.0,
+            "USB margin {:+.1} dB must exceed LSB margin {:+.1} dB by >15 dB",
+            u_lev - u_fl,
+            l_lev - l_fl
+        );
+    }
+
+    #[test]
+    fn lsb_reads_signal_in_lower_side() {
+        // Mirror of the previous test: a strong line in the *lower* half
+        // reads strong in LSB and ≈ floor in USB.
+        let n_bins = 1024;
+        let c = n_bins / 2;
+        let w = 32usize;
+        let noise = 100u16;
+        let sig = 60_000u16;
+        let mut lsb = vec![noise; n_bins];
+        for d in 1..=w {
+            lsb[c - d] = sig;
+        }
+        let (l_lev, l_fl) = compute_s_meter(&lsb, w, PassbandShape::Lower, 25);
+        let (u_lev, u_fl) = compute_s_meter(&lsb, w, PassbandShape::Upper, 25);
+        assert!(
+            l_lev > l_fl + 20.0,
+            "LSB should read the lower-side line: level {l_lev} > floor {l_fl} + 20"
+        );
+        assert!(
+            (u_lev - u_fl).abs() < 6.0,
+            "USB should ≈ floor (line is out of passband): level {u_lev} floor {u_fl}"
+        );
+    }
+
+    #[test]
+    fn am_level_tracks_modulation_not_carrier() {
+        // An AM signal = a large constant carrier at DC plus sidebands whose
+        // energy is the *audio modulation*. With an RMS (not peak) level, the
+        // reading must be dominated by the **modulation**: a quiet frame
+        // (small sidebands) reads lower than a loud frame (large sidebands),
+        // even though the carrier is identical in both.
+        let n_bins = 1024usize;
+        let c = n_bins / 2;
+        let noise = 100u16;
+        let carrier = 40_000u16; // constant, both frames
+        let side_quiet = 3_000u16;
+        let side_loud = 20_000u16;
+        let span = 40usize; // sideband bins around the carrier
+
+        let am_frame = |side: u16| -> Vec<u16> {
+            let mut m = vec![noise; n_bins];
+            m[c] = carrier;
+            for d in 1..=span {
+                m[c - d] = side;
+                m[c + d] = side;
+            }
+            m
+        };
+
+        let quiet = am_frame(side_quiet);
+        let loud = am_frame(side_loud);
+        let (q_lev, q_fl) = compute_s_meter(&quiet, span, PassbandShape::Centered, 25);
+        let (l_lev, l_fl) = compute_s_meter(&loud, span, PassbandShape::Centered, 25);
+
+        // Both frames sit above their floor (there is a real signal present).
+        assert!(q_lev > q_fl, "quiet AM: level {q_lev} above floor {q_fl}");
+        assert!(l_lev > l_fl, "loud AM: level {l_lev} above floor {l_fl}");
+        // And the loud frame must read clearly higher than the quiet one —
+        // the meter reacts to audio level, it is not latched on the carrier.
+        assert!(
+            l_lev - l_fl > q_lev - q_fl + 6.0,
+            "loud AM margin {:+.1} dB must exceed quiet AM margin {:+.1} dB by >6 dB",
+            l_lev - l_fl,
+            q_lev - q_fl
+        );
+    }
+
+    #[test]
+    fn digital_tone_reads_below_its_peak() {
+        // A single narrow line in an RMS window reads ~10·log10(1/w) dB
+        // *below* its own peak (energy spread over `w` bins). That is the
+        // accepted rescale: a CW/FT8 tone sits below where the old *peak*
+        // reading would place it, but is still far above the noise floor and
+        // correctly *oriented* (upper side for FT8).
+        let n_bins = 1024;
+        let c = n_bins / 2;
+        let w = 32usize;
+        let noise = 100u16;
+        let sig = 60_000u16;
+        let mut tone = vec![noise; n_bins];
+        tone[c] = sig; // one line at the carrier bin (upper-side window start)
+        let (lev, _fl) = compute_s_meter(&tone, w, PassbandShape::Upper, 25);
+        // level is `20·log10(sig / sqrt(w) / full)` roughly; peak was sig.
+        let expected_damping = 10.0 * (w as f64).log10();
+        let sig_peak_db = 20.0 * ((sig as f64 / 65_535.0).log10());
+        assert!(
+            (lev - (sig_peak_db - expected_damping)).abs() < 1.5,
+            "one-line RMS level {lev} dB ≈ peak {sig_peak_dB:.1} − {expected_damping:.1} dB",
+            sig_peak_dB = sig_peak_db
         );
     }
 }

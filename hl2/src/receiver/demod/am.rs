@@ -16,12 +16,11 @@
 //!
 //! ## Why envelope detection (not "keep the in-phase arm")
 //!
-//! Keeping only the real arm (`post.re`) — as SSB-USB does — works for a
-//! perfect NCO, but the residual carrier offset `Δf` rotates the baseband
-//! phasor and multiplies the audio by `cos(2π·Δf·t)` — a low-frequency
-//! warble that stutters the AGC ("popping"). Envelope detection
-//! `√(I²+Q²) = (A/2)·[1+m(t)]` is invariant to that rotation, so the offset
-//! drops out.
+//! Keeping only one arm (`post.re`) works for a perfect NCO, but the
+//! residual carrier offset `Δf` rotates the baseband phasor and multiplies
+//! the audio by `cos(2π·Δf·t)` — a low-frequency warble that stutters the
+//! AGC ("popping"). Envelope detection `√(I²+Q²) = (A/2)·[1+m(t)]` is
+//! invariant to that rotation, so the offset drops out.
 //!
 //! The full-carrier term `A/2` plus the antenna-fade envelope ride at
 //! baseband DC; the AGC's DC-block then chases a *moving* target on the

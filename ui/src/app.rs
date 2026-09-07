@@ -81,11 +81,17 @@ const SWR_TICKS: [(&'static str, f32); 6] = [
     ("4:1", 1.000),
 ];
 
-/// Normalise a pre-AGC dBFS reading against the running noise-floor estimate
-/// to a 0..=100.0 bar position.  Mirrors [`SMETER_TICKS`]: S1 = the floor,
-/// S9 = floor + 54 dB → 60 % bar position (the S region is the first 60 % of
-/// the bar); past S9 the +20/+40/+60 overload region (another 60 dB) compresses
-/// into the final 40 %, so +60 dB pins the full 100 %.
+/// Normalise a band-signal level against the band noise-floor estimate to a
+/// 0..=100.0 S-meter bar position. `level_dbfs` is the S-meter *level* (the
+/// passband **band-energy**, dB relative to full scale — see the server's
+/// `compute_s_meter`, which measures RMS energy over the receiver's channel
+/// passband); `floor_db` is the band noise floor (same reference).
+/// `above_floor = level − floor` is therefore dB of **band signal energy
+/// over the band noise floor** (a band SNR), not a single-bin peak.
+/// Mirrors [`SMETER_TICKS`]: S1 = the floor, S9 = floor + 54 dB → 60 % bar
+/// position (the S region is the first 60 % of the bar); past S9 the
+/// +20/+40/+60 overload region (another 60 dB) compresses into the final
+/// 40 %, so +60 dB above the floor pins the full 100 %.
 fn smeter_pos(level_dbfs: f64, floor_db: f64) -> f64 {
     let above_floor = (level_dbfs - floor_db).max(0.0);
     if above_floor <= 48.0 {

@@ -150,15 +150,16 @@ impl F32Fir {
 
     /// Build a **quadrature (90°) phase-shifter** FIR — the discrete Hilbert
     /// transform. Applied to a real signal `r(t)` it yields `q(t) = H{r}(t)`,
-    /// the 90°-rotated version (`H{cos ωt} = sin ωt`). Combined with `r` it
-    /// forms the analytic signal `r + j·q`, the one-sided (positive-frequency)
-    /// version of `r`.
+    /// the 90°-rotated version (`H{cos ωt} = sin ωt`, `H{sin ωt} = −cos ωt`),
+    /// i.e. `H ≡ −j` on positive-frequency tones.
     ///
-    /// This is what makes SSB demod possible from a **real** baseband stream
-    /// (Q arm ≈ 0, which is what the HL2 "real SDR" DDC produces): we
-    /// *synthesize* the missing quadrature component here, then use
-    /// product-discrimination to pick the USB or LSB. See
-    /// [`super::ssb::SsbDemodulator::demod`]. The ideal (windowless) impulse
+    /// In the SSB demod the HL2 EP6 wire already delivers **genuine complex
+    /// I/Q** (both arms carry energy, no "real SDR" / Q≈0 special case). The
+    /// Hilbert transform is applied to that *complex* Q arm so the two arms
+    /// can be combined (`I ± H{Q}`) to pass one sideband and reject the other
+    /// (the **phasing method**) — see [`super::ssb`](super::ssb). It is *not*
+    /// synthesising a missing quadrature arm; it is the 90° phase element of
+    /// the one-sided / two-sided selection. The ideal (windowless) impulse
     /// response is `h[m] = 0` for even `m`, `h[m] = 2/(π·m)` for odd `m`
     /// (about an odd centre tap); we window with the same Kaiser window as
     /// [`F32Fir::lowpass`].

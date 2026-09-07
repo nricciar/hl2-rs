@@ -86,7 +86,7 @@ pub type DemodError = Box<dyn std::error::Error + Send + Sync>;
 /// A block of complex I/Q baseband samples: `Vec<Complex<f32>>`.
 pub type IqBlock = Vec<Complex<f32>>;
 
-use crate::receiver::{AudioConfig, Mode, Sideband};
+use crate::receiver::{AudioConfig, Mode};
 
 /// Guard: the polyphase decimation factor must be ≥ 4 (the cores compute
 /// `m = source / audio` with plain integer division, so a too-close rate would
@@ -164,16 +164,6 @@ pub fn make_demod_tap(
             ssb::SsbCore::new(side, source_rate_hz, source_center_hz, bandwidth_hz, audio)
                 .demodulator(audio, tap)
         }
-        // `SsbWide` is the wideband-complex pass-through placeholder; it runs
-        // through the USB SSB pipeline today (PROTOCOL.md §16.3).
-        Mode::SsbWide => ssb::SsbCore::new(
-            Sideband::Usb,
-            source_rate_hz,
-            source_center_hz,
-            bandwidth_hz,
-            audio,
-        )
-        .demodulator(audio, tap),
     })
 }
 

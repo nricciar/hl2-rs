@@ -91,9 +91,8 @@ pub enum Sideband {
 /// The modulation / decode mode of a virtual receiver.
 ///
 /// Adding a mode: extend this enum, add a [`Demodulator`] impl, and a branch
-/// in [`make_demod`]. `SsbWide` is a placeholder for "pass the wideband
-/// complex through unfiltered" (digital work sits here — see the
-/// `BasebandTap` idea in PROTOCOL.md §16.3).
+/// in [`make_demod`]. `Ssb`'s passband is set by its channel-select
+/// `bandwidth_hz` override, so a wide SSB passband needs no dedicated mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// AM (DSB-FC, full-carrier) voice. Both sidebands pass; the carrier DC
@@ -108,10 +107,10 @@ pub enum Mode {
     /// DSP as [`Mode::Fm`] with a narrower channel-select bandwidth.
     /// Amateur-radio "NFM".
     FmNarrow,
-    /// Single-sideband voice, with the selected sideband.
+    /// Single-sideband voice, with the selected sideband. The passband is
+    /// the mode's `bandwidth_hz` (a wide passband is just a large override —
+    /// no dedicated wide mode needed).
     Ssb(Sideband),
-    /// Wideband complex pass-through (digital-mode placeholder).
-    SsbWide,
     /// FT8: USB SSB audio at 12 kHz, decoded externally in `hl2-api`
     /// ([`hl2::receiver::Ft8Decoder`]) on a wall-clock-aligned 15 s slot.
     /// Mode is SSB/USB at a 12 kHz output rate; the flag tells the API layer
@@ -128,16 +127,15 @@ pub enum Mode {
 impl Mode {
     /// The default channel-select bandwidth for this mode (`Hz`).
     ///
-    /// SSB uses a typical voice band (≈ 2.6 kHz); wide pass-through uses half
-    /// the source rate (Nyquist). A [`ReceiverConfig`] may override this with
-    /// `bandwidth_hz`.
+    /// SSB / voice / digital modes use typical voice bands (≈ 2.6–15 kHz); a
+    /// wide passband is set by a `bandwidth_hz` override on
+    /// [`ReceiverConfig`].
     pub fn default_bandwidth_hz(&self) -> u32 {
         match self {
             Mode::Am => 8_000,
             Mode::Fm => 15_000,
             Mode::FmNarrow => 5_000,
             Mode::Ssb(_) => 2_600,
-            Mode::SsbWide => 2_400_000,
             Mode::Ft8 => 2_600,
             Mode::Js8 => 2_600,
             Mode::Ft4 => 2_600,
@@ -153,7 +151,6 @@ impl Mode {
             Mode::Fm => None,
             Mode::FmNarrow => None,
             Mode::Ssb(s) => Some(*s),
-            Mode::SsbWide => None,
             Mode::Ft8 => Some(Sideband::Usb),
             Mode::Js8 => Some(Sideband::Usb),
             Mode::Ft4 => Some(Sideband::Usb),
@@ -354,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn virtual_receiver_lsb_and_wide_build() {
+    fn virtual_receiver_sidebands_and_modes_build() {
         let cfg = |m: Mode| ReceiverConfig {
             mode: m,
             source_rate_hz: 192_000,
@@ -365,7 +362,6 @@ mod tests {
             Mode::Ssb(Sideband::Lsb),
             Mode::Fm,
             Mode::FmNarrow,
-            Mode::SsbWide,
         ] {
             VirtualReceiver::new(cfg(m), Box::new(VecSink::new())).expect("receiver build");
         }
