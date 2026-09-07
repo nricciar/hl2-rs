@@ -1,8 +1,7 @@
 //! # Virtual receiver (audio channel demod)
 //!
-//! This module is the software audio receiver for the HL2: it takes the
-//! radio's per-slot **complex I/Q baseband** and demodulates it to **audio**
-//! (`i16` mono), for SSB (USB/LSB) today and (AM, FM, FT8, CW…) later.
+//! The software audio receiver for the HL2: takes the radio's per-slot
+//! **complex I/Q baseband** and demodulates it to **audio** (`i16` mono).
 //!
 //! ## Pipeline
 //!
@@ -14,11 +13,9 @@
 //!
 //! The three ends are separate traits so each can be swapped independently:
 //!
-//! * `BasebandSource` — where the I/Q comes from (socket, file, synth). The
-//!   production socket-backed source is a follow-up (PROTOCOL.md §16).
-//! * `Demodulator` — the mode DSP. `SsbDemodulator` is built-in; new modes
-//!   are added by implementing this trait and extending [`Mode`] /
-//!   [`make_demod`].
+//! * `BasebandSource` — where the I/Q comes from (socket, file, synth).
+//! * `Demodulator` — the mode DSP. New modes implement [`DemodCore`] and are
+//!   added by extending [`Mode`] / [`make_demod`].
 //! * `AudioSink` — where the audio goes. `VecSink` (capture) and
 //!   `AlsaSink` (playback, `alsa` feature) are built-in.
 //!
@@ -26,11 +23,9 @@
 //!
 //! ## Layering note
 //!
-//! This is DSP, not wire protocol, so unlike the `protocol` module it may be
-//! used from `hl2-api` / `hl2-ui` without touching the byte layout. The
-//! layering rule still applies: nothing here writes or reads protocol bytes
-//! — the incoming `BasebandSource` is the only seam that meets the wire
-//! (and it is abstract, not socket-specific).
+//! This is DSP, not wire protocol: it may be used from `hl2-api` / `hl2-ui`
+//! without touching the byte layout. The only seam that meets the wire is
+//! the abstract (not socket-specific) `BasebandSource`.
 
 pub mod audio_scale;
 pub mod auto;
@@ -48,9 +43,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub use auto::{AUTO_MODES, AutoMode};
 pub use baseband_ring::{BASEBAND_RING_CAP, BasebandRing};
+pub use demod::AudioEngine;
 pub use demod::{
-    Demodulator, DigitalDemodulator, F32Fir, F32FirState, IqBlock, Nco, PolyphaseDecimator,
-    RawSampleTap, SsbDemodulator, make_demod, make_demod_tap,
+    AmCore, AmDemodulator, DemodCore, Demodulator, DigitalCore, DigitalDemodulator, F32Fir,
+    F32FirState, IqBlock, Nco, PolyphaseDecimator, RawSampleTap, SsbCore, SsbDemodulator,
+    StandardDemod, make_demod, make_demod_tap,
 };
 pub use fanout::BasebandFanout;
 pub use ft4::{
@@ -93,54 +90,52 @@ pub enum Sideband {
 
 /// The modulation / decode mode of a virtual receiver.
 ///
-/// Adding a mode is: extend this enum, add a `Demodulator`, and a branch in
-/// [`make_demod`]. `SsbWide` is a placeholder for "pass the wideband complex
-/// through unfiltered" (FT8/other digital work sits here — see the
-/// `BasebandTap` idea in PROTOCOL.md §16.3).
+/// Adding a mode: extend this enum, add a [`Demodulator`] impl, and a branch
+/// in [`make_demod`]. `Ssb`'s passband is set by its channel-select
+/// `bandwidth_hz` override, so a wide SSB passband needs no dedicated mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// Single-sideband voice, with the selected sideband.
+    /// AM (DSB-FC, full-carrier) voice. Both sidebands pass; the carrier DC
+    /// is removed by the AGC DC-block step. See [`am::AmDemodulator`].
+    Am,
+    /// FM (standard, ≈ 15 kHz channel) voice demod. Audio is recovered as
+    /// the phase derivative of the (LPF'd) complex baseband — see
+    /// [`FmCore`](crate::receiver::demod::FmCore). Distinct from
+    /// [`Mode::FmNarrow`] only by the default channel-select bandwidth.
+    Fm,
+    /// NFM (narrow, ≈ 5 kHz channel) voice demod — the same phase-derivative
+    /// DSP as [`Mode::Fm`] with a narrower channel-select bandwidth.
+    /// Amateur-radio "NFM".
+    FmNarrow,
+    /// Single-sideband voice, with the selected sideband. The passband is
+    /// the mode's `bandwidth_hz` (a wide passband is just a large override —
+    /// no dedicated wide mode needed).
     Ssb(Sideband),
-    /// Wideband complex pass-through (digital-mode placeholder).
-    SsbWide,
-    /// FT8: USB SSB audio at 12 kHz, plus an external FT8 decode pass (in
-    /// `hl2-api`, via [`hl2::receiver::Ft8Decoder`]). The demodulator itself
-    /// is the SSB/USB pipeline at a 12 kHz output rate; `Ft8` is a *mode
-    /// flag* that tells the API layer (a) to drive the demod at 12 kHz, and
-    /// (b) to spin up a wall-clock-aligned 15-second slot decode task.
-    ///
-    /// See the FT8 section in PROTOCOL.md for the slot / wall-clock
-    /// alignment details, and [`hl2::receiver::Ft8Decoder`] for the
-    /// decoder itself.
+    /// FT8: USB SSB audio at 12 kHz, decoded externally in `hl2-api`
+    /// ([`hl2::receiver::Ft8Decoder`]) on a wall-clock-aligned 15 s slot.
+    /// Mode is SSB/USB at a 12 kHz output rate; the flag tells the API layer
+    /// what rate to drive and when to decode. Slot details in PROTOCOL.md.
     Ft8,
-    /// JS8Call (Mode A): USB SSB audio at 12 kHz, plus an external
-    /// JS8 decode pass (in `hl2-api`, via
-    /// [`Js8Decoder`]). The demodulator is the same USB/12 kHz pipeline as
-    /// [`Mode::Ft8`]; `Js8` is a *mode flag* that tells the API layer to
-    /// spawn a wall-clock-aligned 15-second slot decode task. See the
-    /// JS8Call section in PROTOCOL.md and [`Js8Decoder`] for details.
+    /// JS8Call (Mode A): same USB/12 kHz pipeline as [`Mode::Ft8`], decoded
+    /// in `hl2-api` ([`Js8Decoder`]) on a 15 s slot.
     Js8,
-    /// FT4: USB SSB audio at 12 kHz, plus an external FT4 decode pass (in
-    /// `hl2-api`, via [`Ft4Decoder`]). The demodulator is the same USB/12 kHz
-    /// pipeline as [`Mode::Ft8`]; `Ft4` is a *mode flag* that tells the API
-    /// layer (a) to drive the demod at 12 kHz, and (b) to spin up a
-    /// wall-clock-aligned 7.5-second slot decode task.
-    ///
-    /// See the FT4 section in PROTOCOL.md for the slot / wall-clock
-    /// alignment details, and [`Ft4Decoder`] for the decoder itself.
+    /// FT4: same USB/12 kHz pipeline as [`Mode::Ft8`], decoded in `hl2-api`
+    /// ([`Ft4Decoder`]) on a 7.5 s slot.
     Ft4,
 }
 
 impl Mode {
     /// The default channel-select bandwidth for this mode (`Hz`).
     ///
-    /// SSB uses a typical voice band (≈ 2.6 kHz); wide pass-through uses half
-    /// the source rate (Nyquist). A [`ReceiverConfig`] may override this with
-    /// `bandwidth_hz`.
+    /// SSB / voice / digital modes use typical voice bands (≈ 2.6–15 kHz); a
+    /// wide passband is set by a `bandwidth_hz` override on
+    /// [`ReceiverConfig`].
     pub fn default_bandwidth_hz(&self) -> u32 {
         match self {
+            Mode::Am => 8_000,
+            Mode::Fm => 15_000,
+            Mode::FmNarrow => 5_000,
             Mode::Ssb(_) => 2_600,
-            Mode::SsbWide => 2_400_000,
             Mode::Ft8 => 2_600,
             Mode::Js8 => 2_600,
             Mode::Ft4 => 2_600,
@@ -152,8 +147,10 @@ impl Mode {
     /// `Ft8`.
     pub fn sideband(&self) -> Option<Sideband> {
         match self {
+            Mode::Am => None,
+            Mode::Fm => None,
+            Mode::FmNarrow => None,
             Mode::Ssb(s) => Some(*s),
-            Mode::SsbWide => None,
             Mode::Ft8 => Some(Sideband::Usb),
             Mode::Js8 => Some(Sideband::Usb),
             Mode::Ft4 => Some(Sideband::Usb),
@@ -195,8 +192,8 @@ pub struct ReceiverConfig {
     pub bandwidth_hz: Option<u32>,
     /// Audio output config.
     pub audio: AudioConfig,
-    /// Optional pre-AGC raw-sample tap (FT8 decode — see
-    /// [`RawSampleTap`]). `None` for plain SSB / wide pass-through.
+    /// Optional pre-AGC raw-sample tap for FT8/JS8/FT4 decode (see
+    /// [`RawSampleTap`]). `None` for plain SSB / AM / FM.
     pub tap: Option<std::sync::Arc<dyn RawSampleTap>>,
 }
 
@@ -354,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn virtual_receiver_lsb_and_wide_build() {
+    fn virtual_receiver_sidebands_and_modes_build() {
         let cfg = |m: Mode| ReceiverConfig {
             mode: m,
             source_rate_hz: 192_000,
@@ -363,7 +360,8 @@ mod tests {
         for m in [
             Mode::Ssb(Sideband::Usb),
             Mode::Ssb(Sideband::Lsb),
-            Mode::SsbWide,
+            Mode::Fm,
+            Mode::FmNarrow,
         ] {
             VirtualReceiver::new(cfg(m), Box::new(VecSink::new())).expect("receiver build");
         }

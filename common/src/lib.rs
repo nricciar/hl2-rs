@@ -109,6 +109,38 @@ pub struct SharedState {
     /// with a simple `contains_key`.
     #[serde(default)]
     pub auto_monitors: BTreeMap<u8, Vec<AutoMonitor>>,
+    /// Per-slot signal level, in **dB relative to the band spectrum's full
+    /// scale** (the same reference as `vrx_floors`). Computed server-side
+    /// from the *displayed slot's* band spectrum (the FFT we already run for
+    /// the panadapter): the **root-mean-square spectral energy** inside the
+    /// running receiver's **mode-oriented** channel passband (USB/digital →
+    /// above the tune, LSB → below, AM/FM/NFM → both sides; the same band the
+    /// UI shades on the panadapter). Measuring energy rather than a single
+    /// peak bin is what makes an AM reading track the audio **modulation**
+    /// (speech vs. silence) instead of the constant carrier. The S-unit map
+    /// (S1 = at the floor, +6 dB per S unit, red past S9 / +20 dB) is applied
+    /// by the client from `vrx_levels[slot] − vrx_floors[slot]`. A missing
+    /// slot = the display source is not an EP6 per-slot stream (EP4 wideband,
+    /// or that slot is not currently being displayed). The value is republished
+    /// by the server's periodic state heartbeat (~100 ms), so the UI's
+    /// S-meter needle tracks the live reading without any command traffic.
+    #[serde(default)]
+    pub vrx_levels: BTreeMap<u8, f64>,
+    /// Per-slot **band noise floor**, in the same dB reference as
+    /// `vrx_levels`. Computed as the 25th percentile of the *whole
+    /// displayed band's* magnitudes — a strong signal occupies only a few
+    /// of the hundreds of noise bins, so the percentile lands on the noise
+    /// regardless of where (or whether) the signal sits, and regardless of
+    /// the mode (SSB sideband, AM carrier, FM deviation, FT8 tones — all
+    /// read as "elevated spectral energy vs. the noise floor"). The UI uses
+    /// `vrx_levels[slot] − vrx_floors[slot]` (dB of signal over the band
+    /// floor) as the S-meter gauge's input. Before this field existed the
+    /// UI self-calibrated the floor from its own level samples
+    /// (`track_floors` in ui/src/app.rs), which broke for carriers
+    /// (continuous signals never dip to noise, so the floor crept up to the
+    /// carrier and `level − floor → 0`).
+    #[serde(default)]
+    pub vrx_floors: BTreeMap<u8, f64>,
 }
 
 impl SharedState {
@@ -127,6 +159,8 @@ impl SharedState {
             spectrum_span_hz: 0,
             vrx: BTreeMap::new(),
             auto_monitors: BTreeMap::new(),
+            vrx_levels: BTreeMap::new(),
+            vrx_floors: BTreeMap::new(),
         }
     }
 }
@@ -160,6 +194,17 @@ pub struct AutoMonitor {
 pub enum VrxMode {
     Usb,
     Lsb,
+    /// AM (DSB-FC, full-carrier) voice demod.
+    Am,
+    /// FM (standard, ≈ 15 kHz channel) voice demod (phase-derivative read
+    /// of a polyphase-LPF'd complex baseband).
+    Fm,
+    /// NFM (narrow, ≈ 5 kHz channel) voice demod — same DSP as [`VrxMode::Fm`],
+    /// narrower channel-select bandwidth. Amateur-radio "NFM". The on-wire
+    /// tag is `"fm_narrow"` (the `lowercase` rename); `"nfm"` is accepted as
+    /// an alias so the UI may use either spelling.
+    #[serde(alias = "nfm")]
+    FmNarrow,
     Ft8,
     Js8,
     Ft4,
@@ -394,7 +439,7 @@ pub mod spot {
 /// Choose which per-adapter stream the server's spectrum pipeline (panadapter
 /// + waterfall) consumes.
 ///
-/// * `Ep4`   — the wideband real sample stream (122.88 MSps, full bandwidth).
+/// * `Ep4`   — the wideband real sample stream (76.8 MSps, full bandwidth).
 /// * `Ep6(slot)` — the DDC'd complex baseband of one receiver slot, at the
 ///   per-receiver DDC rate programmed at Start. `slot` is 1-based (RX1…RX7).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -821,6 +866,55 @@ mod tests {
     }
 
     #[test]
+    fn vrx_levels_roundtrip_and_default() {
+        // `vrx_levels` is a per-slot map of signal levels (dB FS) the UI
+        // renders as the S-meter. It must round-trip and default to empty
+        // when absent (older servers) so the UI gracefully shows no meter.
+        let mut st = SharedState::new(4);
+        let mut lv = std::collections::BTreeMap::new();
+        lv.insert(1u8, -42.5_f64);
+        lv.insert(2u8, -30.0_f64);
+        st.vrx_levels = lv.clone();
+        let j = serde_json::to_string(&st).unwrap();
+        let p = serde_json::from_str::<SharedState>(&j).unwrap();
+        assert_eq!(p.vrx_levels, lv);
+        // A value appears literally in the serialized form (keys are strings,
+        // values are JSON numbers).
+        assert!(j.contains(r#""1":-42.5"#), "got: {j}");
+        // An older payload without `vrx_levels` still decodes (defaults empty),
+        // and the empty map round-trips.
+        let legacy = r#"{"started":true,"rx_count":4,"tuning":{},"sample_format":"sample16","adc_sample_rate_hz":76800000,"lna_gain_db":6,"oc_bits":0,"spectrum_source":"ep4","state_at":0}"#;
+        let p = serde_json::from_str::<SharedState>(legacy).unwrap();
+        assert!(p.vrx_levels.is_empty());
+        let e = serde_json::to_string(&SharedState::new(4)).unwrap();
+        assert!(e.contains(r#""vrx_levels":{}"#), "got: {e}");
+    }
+
+    #[test]
+    fn vrx_floors_roundtrip_and_default() {
+        // `vrx_floors` mirrors `vrx_levels` (per-slot, dB FS) — the server's
+        // noise-floor estimate the UI pairs with the raw level to render the
+        // S-meter. It must round-trip and default to empty when absent
+        // (older servers).
+        let mut st = SharedState::new(4);
+        let mut fl = std::collections::BTreeMap::new();
+        fl.insert(1u8, -62.3_f64);
+        fl.insert(2u8, -71.0_f64);
+        st.vrx_floors = fl.clone();
+        let j = serde_json::to_string(&st).unwrap();
+        let p = serde_json::from_str::<SharedState>(&j).unwrap();
+        assert_eq!(p.vrx_floors, fl);
+        // Backward-compat: a legacy payload without `vrx_floors` still decodes.
+        let legacy = r#"{"started":true,"rx_count":4,"tuning":{},"sample_format":"sample16","adc_sample_rate_hz":76800000,"lna_gain_db":6,"oc_bits":0,"spectrum_source":"ep4","state_at":0,"vrx_levels":{"1":-40.5}}"#;
+        let p = serde_json::from_str::<SharedState>(legacy).unwrap();
+        assert!(p.vrx_floors.is_empty());
+        assert!(!p.vrx_levels.is_empty());
+        // And the empty map round-trips in the serialised form.
+        let e = serde_json::to_string(&SharedState::new(4)).unwrap();
+        assert!(e.contains(r#""vrx_floors":{}"#), "got: {e}");
+    }
+
+    #[test]
     fn decode_row_roundtrip() {
         // One unified row: FT8-shaped (mode visible only via `vrx.mode`) and
         // a JS8-shaped row in the same batch — proving the wire carries both
@@ -1011,6 +1105,56 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<VrxState>(&serde_json::to_string(&v).unwrap()).unwrap(),
             v
+        );
+    }
+
+    #[test]
+    fn vrx_mode_fm_narrow_roundtrip() {
+        // Both FM and NFM (narrow) are voice modes: 4.8 kHz audio, ≈ 15 kHz /
+        // ≈ 5 kHz channel width respectively. The `lowercase` serde tag on
+        // `VrxMode` means the on-wire name for `Fm` is `"fm"` and for
+        // `FmNarrow` is `"fmnarrow"` (the lowercase of the Rust variant, no
+        // underscore). The UI may additionally use `"nfm"` (the operator-
+        // facing spelling); both decode to `VrxMode::FmNarrow`.
+        let std_fm = VrxState {
+            slot: 1,
+            offset_hz: 0,
+            mode: VrxMode::Fm,
+            bw_hz: 15_000,
+            gain_db: 0.0,
+            rate_hz: 4_800,
+            muted: false,
+        };
+        let narrow = VrxState {
+            mode: VrxMode::FmNarrow,
+            bw_hz: 5_000,
+            ..std_fm
+        };
+        for v in [std_fm, narrow] {
+            assert_eq!(
+                serde_json::from_str::<VrxState>(&serde_json::to_string(&v).unwrap()).unwrap(),
+                v
+            );
+        }
+        // Enum-level round-trip through the `lowercase` wire names.
+        assert_eq!(
+            serde_json::from_str::<VrxMode>("\"fm\"").unwrap(),
+            VrxMode::Fm
+        );
+        assert_eq!(
+            serde_json::from_str::<VrxMode>("\"fmnarrow\"").unwrap(),
+            VrxMode::FmNarrow
+        );
+        // And the operator-facing alias `"nfm"` must also decode to the same
+        // variant — so the UI can use either spelling without a server change.
+        assert_eq!(
+            serde_json::from_str::<VrxMode>("\"nfm\"").unwrap(),
+            VrxMode::FmNarrow
+        );
+        assert_eq!(serde_json::to_string(&VrxMode::Fm).unwrap(), "\"fm\"");
+        assert_eq!(
+            serde_json::to_string(&VrxMode::FmNarrow).unwrap(),
+            "\"fmnarrow\""
         );
     }
 

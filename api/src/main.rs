@@ -4,6 +4,7 @@
 //! the `/api/ws` WebSocket route.
 
 mod hub;
+mod meter;
 mod pskrep_hook;
 mod spectrum;
 mod ws;

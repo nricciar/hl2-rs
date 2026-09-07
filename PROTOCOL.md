@@ -764,7 +764,7 @@ WebSocket (server↔client) contract, in `common/src/lib.rs`:
   | `AudioFrame` | `{slot, seq, rate_hz, samples}` | Binary **audio** payload on `CH_AUDIO`; `slot` routes the block to a virtual receiver | `lib.rs:470` |
   | `VrxCfg` | `{slot, offset_hz, mode, bw_hz, gain_db}` | Requested virtual-receiver config | `lib.rs:201` |
   | `VrxState` | `{slot, offset_hz, mode, bw_hz, gain_db, rate_hz, muted}` | Echo of the active receiver (see `SharedState.vrx`) | `lib.rs:217` |
-   | `VrxMode` | `Usb \| Lsb \| Ft8 \| Js8` | Demod mode (renamed `usb`/`lsb`/`ft8`/`js8` on the wire) | `lib.rs` |
+    | `VrxMode` | `Usb \| Lsb \| Am \| Ft8 \| Js8 \| Ft4` | Demod mode (renamed `usb`/`lsb`/`am`/`ft8`/`js8`/`ft4` on the wire) | `lib.rs` |
   | `SharedState.vrx` | `BTreeMap<u8, VrxState>` | Per-slot active virtual receivers (keyed by RX slot). Mirrored into the UI panel + spectrum passband overlay. Re-echoed on every `SharedState` like `oc_bits`, so all tabs converge. | `lib.rs:146` |
   | `ClientCmd::SetVrx` | `setvrx { cfg: Option<VrxCfg> }` | Create / update the virtual receiver on `cfg.slot`. `cfg: null` tears down that slot. | `lib.rs:345` |
   | `ClientCmd::SetVrxMute` | `setvrxmute { slot, muted }` | Mute / unmute a slot's receiver without rebuilding. | `lib.rs:353` |
@@ -821,7 +821,8 @@ reference-grade:
 A software **audio receiver** lives in the `hl2` crate (`hl2/src/receiver/`):
 it takes the radio's per-slot **complex I/Q baseband** (`num_complex::Complex<f32>`
 pairs at a DDC rate — tests use 192 kHz) and demodulates it to **`i16` mono
-audio** for listening, SSB (USB/LSB) today and AM / FM / FT8 / CW later.
+audio** for listening, SSB (USB/LSB) and AM (DSB-FC) today plus FT8 / JS8 /
+FT4 digital modes; FM and CW later.
 
 > **Status:** the DSP, the three trait seams (`BasebandSource`,
 > `Demodulator`, `AudioSink`), a live EP6 `BasebandSource` and the working
@@ -898,7 +899,9 @@ is on the left, the tune (NCO) is at the centre, and "high RF" is on the right:
 * display bin `m-1` (right edge)   =  `center_hz + span/2`   — furthest above the NCO
 
 with `m = 1024` display bins and `span = SharedState.spectrum_span_hz` (96.7
-kHz for the EP6 source on the 192 kHz option, or 122.88 MHz for EP4). The UI
+kHz for the EP6 source on the 192 kHz option, or 76.8 MHz for EP4 — the
+real ADC rate, `ADC_CLOCK_HZ`, whose Nyquist is 38.4 MHz; the UI shows only
+the positive half, DC→38.4 MHz). The UI
 (→ `ui/src/canvas.rs::draw_center_cursor_and_ruler`) draws a vertical
 cursor at the centre (the tune) and a frequency ruler (band-left / NCO /
 band-right) on each panel, using exactly these values, so the user can read
@@ -918,94 +921,404 @@ without touching the others (`hl2/src/receiver/mod.rs`):
 BasebandSource               Demodulator                      AudioSink
 (complex I/Q f32 @ddc)  ──► (NCO + channel-select +  ──►  (play to ALSA |
    e.g. VecSource                audio LPF + decimate)     capture to Vec)
-    source.rs:18                demod.rs:75                 sink.rs:30
+      source.rs:18                demod/mod.rs:172            sink.rs:30
  ```
  
- * [`BasebandSource`](hl2/src/receiver/source.rs:18) — where the I/Q comes from
-   (socket, file, synth). `VecSource` (source.rs:41) is the in-memory stand-in
-   used by tests; `next_block` (source.rs:72) returns `usize` pairs into a
-   caller buffer. The socket source is a follow-up (see §16.5).
- * [`Demodulator`](hl2/src/receiver/demod.rs:75) — the mode DSP.
-   `SsbDemodulator` (demod.rs:241) is built-in; new modes add a `Demodulator`
-   plus a `Mode` variant and a branch in [`make_demod`](hl2/src/receiver/demod.rs:339).
- * [`AudioSink`](hl2/src/receiver/sink.rs:30) — where the audio goes.
-   `VecSink` (sink.rs:45) captures for tests; `AlsaSink` (sink.rs:135) plays
-   via `cpal`, gated on the `alsa` feature.
+  * [`BasebandSource`](hl2/src/receiver/source.rs:18) — where the I/Q comes from
+    (socket, file, synth). `VecSource` (source.rs:41) is the in-memory stand-in
+    used by tests; `next_block` (source.rs:72) returns `usize` pairs into a
+    caller buffer. The socket source is a follow-up (see §16.5).
+   * [`Demodulator`](hl2/src/receiver/demod/mod.rs:172) — the mode DSP. The
+     stable public contract is the `Box<dyn Demodulator>` held by
+     `VirtualReceiver`; its **only impl** is the generic
+     [`StandardDemod<C: DemodCore>`](hl2/src/receiver/demod/core.rs:96). New
+     modes add a `DemodCore` impl (≤ 30 lines) + a `Mode` variant + a match arm
+     in [`make_demod_tap`](hl2/src/receiver/demod/mod.rs:133) — see the
+     layering in the next section.
+  * [`AudioSink`](hl2/src/receiver/sink.rs:30) — where the audio goes.
+    `VecSink` (sink.rs:45) captures for tests; `AlsaSink` (sink.rs:135) plays
+    via `cpal`, gated on the `alsa` feature.
+  
+  [`VirtualReceiver`](hl2/src/receiver/mod.rs:266) wires them together:
+  `new(cfg, sink)` (mod.rs:275) constructs the demodulator via
+  `make_demod_tap`, and either `process(iq)` (mod.rs:309) feeds one block,
+  `flush()` (mod.rs:317) drains the demod/sink residual tails, or
+  `run(&mut source)` (mod.rs:327) drains an entire `BasebandSource`.
+  `ReceiverConfig` (mod.rs:210) carries `mode` / `source_rate_hz` /
+  `source_center_hz` / `bandwidth_hz` / `audio` (`AudioConfig`, mod.rs:192 —
+   `rate_hz`, `gain_db`). `Mode` (mod.rs:103) is `Am` (full-carrier DSB voice),
+   `Ssb(Usb|Lsb)`, or `Ft8` / `Js8` / `Ft4` (12 kHz USB digital + a slot decode
+   task). A wide SSB passband is just a large `bandwidth_hz` override — no
+   dedicated wide mode. The sideband enum is `Sideband` (mod.rs:89).
+   `Mode::default_bandwidth_hz`
+  (mod.rs:145) supplies the channel-select width when `bandwidth_hz` is
+  `None`.
+
+### 16.3 Demodulator layering (per-mode core + shared audio tail)
+
+   The demod layer is split so **every mode reuses the same audio tail** — the
+  part that is *mode-agnostic* (DC-block + RMS-targeted AGC + pre-AGC
+   [`RawSampleTap`](hl2/src/receiver/demod/mod.rs:248) + `i16` sink
+   write) — and each mode contributes only its per-complex-sample DSP. The
+   pre-AGC [`RawSampleTap`](hl2/src/receiver/demod/mod.rs:248) seam now
+   carries the FT8/JS8/FT4 decoders only. The S-meter is **not** part of this
+   `hl2` tail either — it is an API-layer consumer of the displayed slot's
+   *band spectrum* (see §16.3e), which has a correct band-noise floor for
+   every mode.
+
+  ```text
+  complex I/Q ──► DemodCore::process ──► 0..=N f32s per block ──► AudioEngine ──► i16 → sink
+                     (per-mode DSP)                                  (AGC, tap)
+  ```
+
+  * **`DemodCore`** ([`demod/core.rs:41`](hl2/src/receiver/demod/core.rs:41)) —
+    the one method a mode implements: `process(Complex<f32>) -> Option<f32>`
+    (per-sample DSP; `M−1` of every `M` inputs return `None`), an optional
+    `flush() -> Option<f32>` (drains a *pending* sample, used by the AM
+    envelope path), and `kind()` (a debug label). `DemodCore::demodulator`
+    (core.rs:72) composes the core with the shared tail and returns the
+    `Box<dyn Demodulator>` — the **single call site** a new mode needs; it does
+    not need its own `Demodulator` impl.
+  * **`StandardDemod<C: DemodCore>`**
+    ([`demod/core.rs:96`](hl2/src/receiver/demod/core.rs:96)) — the **only**
+    `Demodulator` impl in the crate. `demod` (core.rs:104) runs `core.process`
+    per input sample, feeds each `Some` into the engine, then
+    `engine.emit_full_blocks`; `flush_audio` (core.rs:120) drains the core's
+    pending sample + the engine's residual partial block.
+  * **`AudioEngine`** ([`demod/engine.rs:41`](hl2/src/receiver/demod/engine.rs:41)) —
+    the shared tail. `push` (engine.rs:110) accumulates decimated `f32`s;
+    `emit_full_blocks` (engine.rs:117) normalises + emits whole
+    `AUDIO_EMIN`-complete 1024-sample chunks; `flush_residue` (engine.rs:129)
+    drains the sub-threshold tail. The per-chunk body — `emit`
+    (engine.rs:139) — is the pre-AGC
+    [`RawSampleTap`](hl2/src/receiver/demod/mod.rs:248)
+    copy (engine.rs:134) + the DC-block / RMS AGC normaliser
+    (`normalize_to_i16_with_agc`, engine.rs:177) + the `i16` sink write
+    (engine.rs:153), all unchanged from the old per-mode copies.
+    `AUDIO_EMIN = 240` (engine.rs:34) and the AGC constants
+    (`TARGET_RMS_I16 = 0.1×32767`, alpha `0.4`/`0.08`, clamp `[1.0, 1e7]`)
+    live here.
+  * **The three cores** — `SsbCore`
+    ([`demod/ssb.rs:65`](hl2/src/receiver/demod/ssb.rs:65), USB/LSB
+    phasing-discriminate), `AmCore`
+    ([`demod/am.rs:65`](hl2/src/receiver/demod/am.rs:65), envelope
+    detection), and `DigitalCore`
+    ([`demod/digital.rs:39`](hl2/src/receiver/demod/digital.rs:39), 12 kHz
+    USB) — each `impl DemodCore` holds only its NCO + channel-select
+    decimator (see §16.3a / §16.3b / §16.3c for the DSP). The `pub type` aliases
+    `SsbDemodulator` / `AmDemodulator` / `DigitalDemodulator`
+    (demod/mod.rs:63–65) are now `StandardDemod<SsbCore>` etc., so existing
+    names keep resolving to the real full-tail demod type.
+  * **`make_demod` / `make_demod_tap`**
+    ([`demod/mod.rs:118`](hl2/src/receiver/demod/mod.rs:118) /
+    [`:133`](hl2/src/receiver/demod/mod.rs:133)) — the single per-`Mode`
+    dispatch. `ensure_decimable` (demod/mod.rs:98) enforces the
+    `RateTooClose` guard (`source / audio ≥ 4`, demod/mod.rs:69) that the
+    per-mode constructors used to own; then the arm picks the `DemodCore`,
+    builds it, and hands it to the shared tail via
+    `DemodCore::demodulator`. To add FM/NFM/CW: implement `DemodCore`, add a
+    `Mode` variant + a `default_bandwidth_hz` arm (receiver/mod.rs:145), and a
+    match arm here — **nothing else changes**.
+
+### 16.3a SSB demodulation (the DSP that's implemented)
+
+ The SSB core is `SsbCore::process`
+ ([`demod/ssb.rs:145`](hl2/src/receiver/demod/ssb.rs:145)): an **NCO +
+  phasing-metho discriminator (Hilbert of Q + I-delayed) + real channel-select LPF + polyphase
+ decimator**. It is a [`DemodCore`](hl2/src/receiver/demod/core.rs:41) — the
+ per-sample DSP only — and the audio tail (AGC / DC-block / tap / meter →
+ `i16`) is the shared [`AudioEngine`](hl2/src/receiver/demod/engine.rs:41)
+ attached by [`StandardDemod`](hl2/src/receiver/demod/core.rs:96) (see §16.3a):
  
- [`VirtualReceiver`](hl2/src/receiver/mod.rs:158) wires them together:
- `new(cfg, sink)` (mod.rs:167) constructs the demodulator via `make_demod`, and
- either `process(iq)` (mod.rs:199) feeds one block or `run(&mut source)`
- (mod.rs:210) drains an entire `BasebandSource`. `ReceiverConfig`
- (mod.rs:117) carries `mode` / `source_rate_hz` / `source_center_hz` /
- `bandwidth_hz` / `audio` (`AudioConfig`, mod.rs:99 — `rate_hz`, `gain_db`).
- `Mode` (mod.rs:68) is `Ssb(Usb|Lsb)` (sideband enum, mod.rs:54) or `SsbWide`
- (the complex pass-through placeholder for digital modes);
- `Mode::default_bandwidth_hz` (mod.rs:81) supplies the channel-select width.
+ ```text
+  each complex pair (I,Q) → SsbCore::process (per-sample):
+    1  NCO multiply       post = x · e^(−j·φ)       demod/ssb.rs:149
+    2  Hilbert(Q)         q_h = H{post.im}          demod/ssb.rs:156
+    3  I-arm group-delay  i_delayed = I[n−D]       demod/ssb.rs:160 (D=(len−1)/2)
+    4  phasing combine    USB: r0 = i_delayed + q_h  demod/ssb.rs:181  (passes −f)
+                           LSB: r0 = i_delayed − q_h  demod/ssb.rs:183  (passes +f)
+    5  LPF+decimate       lp.push(r0) → Option<f32> demod/ssb.rs:189
+  per input block → StandardDemod::demod (core.rs:97):
+    6  accumulate    engine.push(sample)            demod/core.rs:100
+    7  AGC + DC      i16 = DC-block · AGC · gain    demod/engine.rs:221
+  ```
 
-### 16.3 SSB demodulation (the DSP that's implemented)
+  * **NCO** (phase-recurrence, stepped via [`Nco::step`](hl2/src/receiver/demod/dsp.rs:87)).
+    `φ̇ = 2π·source_center_hz / fs` (installed in `SsbCore::new`,
+    [`demod/ssb.rs:95`](hl2/src/receiver/demod/ssb.rs:95)). With a baseband source
+    `source_center_hz == 0` so `nco_step == 0` and the multiply is the identity —
+    the USB/LSB distinction is then purely the phasing combine below. In the full
+    stack (where the DDC hands down an *offset* carrier) a non-zero `nco_step`
+    rotates the carrier to baseband; the USB/LSB choice is the combine sign.
+  * **Phasing combine** — a **product-discriminator / phasing method** on the
+    genuine complex baseband: the Q arm is Hilbert-shifted (`H{Q}`,
+    `F32Fir::hilbert`, [`demod/dsp.rs:165`](hl2/src/receiver/demod/dsp.rs:165);
+    `H{cos}=sin`, `H{sin}=−cos`), the I arm is delayed by the Hilbert FIR's
+    group delay `D=(len−1)/2`, and the two are combined:
+    `USB: I + H{Q}` (passes −f / real-USB) and `LSB: I − H{Q}` (passes +f /
+    real-LSB). This HL2 DDC is **frequency-inverted** (above-NCO → negative
+    complex frequency; below-NCO → positive), so the mapping is the *inverse*
+    of the textbook sign convention: `I + H{Q}` passes −f and `I − H{Q}`
+    passes +f. **Both arms are used for both sidebands** — the older "USB keeps
+    `post.re`, LSB keeps Hilbert(`post.re`)" implementation discarded Q and had
+    0 dB image rejection (see the `image_rejection_by_sideband` test); the
+    phasing combine reuses Q to cancel the image sideband. A legacy real
+    (Q≈0) stream yields `H{Q}=0`, so both branches reduce to `I` (correct — a
+    real stream carries both sidebands).
+  * **Channel-select** — a symmetric, unit-gain, windowed-sinc **real** low-pass
+    FIR designed by [`F32Fir::lowpass`](hl2/src/receiver/demod/dsp.rs:123). Tap count
+    is forced *odd* (≥17) so the impulse response is centred on a whole sample
+    (linear phase, `H(0)=1`). `SsbCore::new`
+    ([`demod/ssb.rs:95`](hl2/src/receiver/demod/ssb.rs:95)) picks **257 taps** for
+    the voice band and the Hilbert (`taps.max(257)`), over a `bandwidth_ratio`
+    clamped to `[1e-3, 0.4]`. The FIR is split into `M` polyphase branches and
+    convolved through
+    [`PolyphaseDecimator::push`](hl2/src/receiver/demod/dsp.rs:385) (built on the
+    fixed, pre-allocated ring of [`F32FirState::convolve`](hl2/src/receiver/demod/dsp.rs:278));
+    the old `Vec::push`/`Vec::drain` rolling buffer is gone, giving
+    ≈ `1/M` the tap-multiplies per sample with the same
+    zero-padded onset as [`F32Fir::apply`](hl2/src/receiver/demod/dsp.rs:201), which
+    remains the reference implementation (the `firstate_matches_reference_apply`
+    test locks the two together).
+    * **Decimate** — the polyphase anti-alias / decimate stage
+      ([`PolyphaseDecimator`](hl2/src/receiver/demod/dsp.rs:351)), `rate_in ≥ 4·rate_out`
+     (the `RateTooClose` guard, [`demod/mod.rs:98`](hl2/src/receiver/demod/mod.rs:98),
+     struct at [`:69`](hl2/src/receiver/demod/mod.rs:69)). Keeps the
+     post-decimate Nyquist well below the band edge.
+   * **Normalise** — DC-block, then apply a slow **RMS-targeted AGC** (fast
+     attack / slow release) to map each audio block onto target RMS `i16`, on
+     top of the user's `gain_db`
+     ([`normalize_to_i16_with_agc`](hl2/src/receiver/demod/engine.rs:221), the AGC
+     state living in [`AudioEngine::agc_gain`](hl2/src/receiver/demod/engine.rs:44)).
+     Shared with every mode (see §16.3a); replaces the original per-block peak
+     normaliser, which let the noise floor ride the signal envelope — the
+     "loud static" symptom. See §16.5.
+ 
+ `IqBlock` is just `Vec<Complex<f32>>`
+ ([`demod/mod.rs:91`](hl2/src/receiver/demod/mod.rs:91)). Error types are
+ `RateTooClose` (demod/mod.rs:69) boxed into `DemodError` (demod/mod.rs:85).
+  Tests in `demod/{ssb,dsp,digital,am}.rs` cover in-band USB **and** LSB tones
+  producing audio, in-band-pass/out-of-band-reject, the NCO moving an off-band
+  tone into band, the FIR ring / polyphase identities, the digital path
+  out-of-band rejection (≥80 dB), and the AM tone / real-baseband / reject /
+  NCO-offset cases; `ssb::tests::image_rejection_by_sideband` guards the
+  phasing combine — a real-USB tone (complex −f) must be passable by the USB
+  demod and rejected (≥ 3×) by the LSB demod, and vice versa, which the
+  pre-phasing code failed (0 dB image rejection). `mod.rs` tests cover the
+  full `VirtualReceiver` over a `VecSource`.
 
-The actual SSB chain, in `SsbDemodulator::demod`
-([`demod.rs:559`](hl2/src/receiver/demod.rs:559)), is an **NCO +
-product-discriminator (Hilbert) + real channel-select LPF + audio decimator**:
+### 16.3b AM demodulation (DSB-FC)
+ 
+ The AM core is `AmCore::process`
+ ([`demod/am.rs:106`](hl2/src/receiver/demod/am.rs:106)): **envelope
+ detection** — NCO → LPF/decimate *both* the I and Q arms → take their
+ magnitude. It is **not** the "keep the in-phase arm" half of SSB; it
+ deliberately discards the SSB/Hilbert discriminator and reads the envelope
+ instead, which is invariant to a residual carrier offset (the NCO is never
+ exactly on-carrier, and `post.re` alone would be multiplicatively warbled by
+ `cos(2π·Δf·t)` — the "popping" symptom; the magnitude `√(I²+Q²)` is
+ rotation-invariant). The audio tail is the shared [`AudioEngine`](hl2/src/receiver/demod/engine.rs:41):
+ 
+ ```text
+ each complex pair (I,Q) → AmCore::process (per-sample):
+   1  NCO multiply  post = x · e^(−j·φ)          demod/am.rs:107
+   2  LPF+decimate  i = lp_i.push(post.re) [polyphase] demod/am.rs:122
+                     q = lp_q.push(post.im) [polyphase] demod/am.rs:123
+   3  envelope      Some(√(i²+q²)) when both emit demod/am.rs:124
+ per input block → StandardDemod::demod (core.rs:104):
+   4  AGC + DC      i16 = DC-block · AGC · gain   demod/engine.rs:221
+ ```
+ 
+ Full-carrier AM is `A·[1+m(t)]·cos(2πf_c t)`; down-converting and
+ low-passing both arms carries `A/2·[1+m(t)]` (the modulated envelope) as
+ the magnitude of the baseband I/Q pair, and the AGC DC-block step removes the
+ carrier DC. **No Hilbert and no sideband selection** — both sidebands pass
+ the LPF symmetrically. `AmCore::new` (demod/am.rs:81) uses two identical
+ `PolyphaseDecimator` instances (`lp_i` / `lp_q`, same taps + `M`) so they
+ emit in lock-step and the magnitude aligns sample-for-sample. Default voice
+ bandwidth 8 kHz (`Mode::Am::default_bandwidth_hz`, receiver/mod.rs:145).
+ Dispatch: `Mode::Am` → `AmCore::new(…).demodulator(…)` in
+ [`make_demod_tap`](hl2/src/receiver/demod/mod.rs:133).
 
-```text
-each complex pair (I,j):
-  1  NCO multiply  post = Re(x · e^(−j·φ))            demod.rs:590-604
-  2  discriminate  USB: r0 = post
-                   LSB: r0 = Hilbert(post)            demod.rs:609-613
-  3  real LPF      r  = filter.convolve(r0)           demod.rs:616
-  4  decimate      audio_buf += Decimator::push(r)    demod.rs:619
-per block (when enough has accumulated):
-  5  AGC + DC      i16 = DC-block · AGC · gain        demod.rs:626, 513
-```
+### 16.3c Digital demodulation (FT8 / JS8 / FT4, 12 kHz USB)
+ 
+ The digital core is `DigitalCore::process`
+ ([`demod/digital.rs:87`](hl2/src/receiver/demod/digital.rs:87)): **NCO →
+ in-phase (USB) arm → polyphase LPF/decimate to 12 kHz**. This is the SSB-USB
+ pipeline with the Hilbert/quadrature synthesis dropped (pure overhead — the
+ 8-GFSK tones sit in the in-phase arm after the USB NCO) and the output rate
+ fixed at the `mfsk` / JS8 decoder's 12 kHz window rate. `mode_label`
+ (`"ft8"` / `"js8"` / `"ft4"`) is surfaced as `kind()`. The 511-tap
+ (→ 513 odd) Kaiser β=12 filter floor is ~107 dB of out-of-band rejection,
+ well past the 80 dB the
+ `ft8_js8_path_rejects_out_of_passband_signal_by_at_least_80_db` regression
+ guards. Default bandwidth 2.6 kHz; `source_rate_hz` must be an integer
+ multiple of 12 kHz of at least 4×. The pre-AGC raw f32 stream is the
+  [`RawSampleTap`](hl2/src/receiver/demod/mod.rs:248) the `Ft8Tap` / `Js8Tap`
+ / `Ft4Tap` slot decoders attach to (the AGC'd `i16` is still emitted to
+ `CH_AUDIO` for the operator). Dispatch: `Mode::{Ft8,Js8,Ft4}` →
+ `DigitalCore::new(…, <label>).demodulator(…)` in
+ [`make_demod_tap`](hl2/src/receiver/demod/mod.rs:133).
 
-* **NCO** (`nco_step`/`nco_phase`, stepped + phase-wrapped at
-  [`demod.rs:593-604`](hl2/src/receiver/demod.rs:593)).
-  `φ̇ = 2π·source_center_hz / fs` (`make_demod`,
-  [`demod.rs:675`](hl2/src/receiver/demod.rs:675)). With a baseband source
-  `source_center_hz == 0` so `nco_step == 0` and the multiply is the identity —
-  the USB/LSB distinction is then purely the discriminator below. In the full
-  stack (where the DDC hands down an *offset* carrier) a non-zero `nco_step`
-  rotates the carrier to baseband; **which arm the discriminator keeps** is
-what separates USB from LSB (the reference keeps the in-phase arm for USB and
-conjugates it for LSB).
-* **Product discriminator** — the USB keeps the **in-phase** post-NCO arm
-  (`post`); the LSB keeps the **quadrature** arm, synthesised as a 90° (Hilbert)
-  phase-shift of `post` (`F32Fir::hilbert`,
-  [`demod.rs:257`](hl2/src/receiver/demod.rs:257)) — the missing `e^{j·90°}` a
-  real (Q≈0) baseband never had. The Hilbert is **only run for LSB** (it is
-  pure overhead for USB, which discards it).
-* **Channel-select** — a symmetric, unit-gain, windowed-sinc **real** low-pass
-  FIR designed by [`F32Fir::lowpass`](hl2/src/receiver/demod.rs:215). Tap count
-  is forced *odd* (≥17) so the impulse response is centred on a whole sample
-  (linear phase, `H(0)=1`). `make_demod`
-  ([`demod.rs:667-673`](hl2/src/receiver/demod.rs:667)) picks **257 taps** for
-  the voice band and the Hilbert (`taps.max(257)`), over a `bandwidth_ratio`
-  clamped to `[1e-3, 0.4]`. Convolution runs through
-  [`F32FirState::convolve`](hl2/src/receiver/demod.rs:361) — a fixed,
-  pre-allocated history ring (the old `Vec::push`/`Vec::drain` rolling buffer
-  is gone), giving O(T) per sample with no reallocation and the same
-  zero-padded onset as [`F32Fir::apply`](hl2/src/receiver/demod.rs:293), which
-  remains the reference implementation (the `firstate_matches_reference_apply`
-  test locks the two together).
-  * **Decimate** — a one-pole LPF + rate reducer
-    ([`Decimator`](hl2/src/receiver/demod.rs:115)), `rate_in ≥ 4·rate_out`
-    ([`demod.rs:140`](hl2/src/receiver/demod.rs:140)). Keeps the post-decimate
-    Nyquist well below the band edge.
-  * **Normalise** — DC-block, then apply a slow **RMS-targeted AGC** (fast
-    attack / slow release) to map each audio block onto target RMS `i16`, on
-    top of the user's `gain_db`
-    ([`normalize_to_i16_with_agc`](hl2/src/receiver/demod.rs:513), state held
-    in `SsbDemodulator.agc_gain`). Replaces the original per-block peak
-    normaliser, which let the noise floor ride the signal envelope — the
-    "loud static" symptom. See §16.5.
+### 16.3d FM / NFM demodulation (phase derivative of a polyphase-LPF'd complex baseband)
 
-`IqBlock` is just `Vec<Complex<f32>>` (demod.rs:67). Error types are
-`InvalidBlockLength` / `RateTooClose` (demod.rs:38, 48) boxed into
-`DemodError` (demod.rs:64). Tests in `demod.rs` cover in-band USB **and** LSB
-tones producing audio, in-band-pass/out-of-band-reject, and NCO moving an
-off-band tone into band; `mod.rs` tests cover the full `VirtualReceiver` over a
-`VecSource`.
+  The FM core is `FmCore::process`
+  ([`demod/fm.rs:148`](hl2/src/receiver/demod/fm.rs:148)); standard FM
+  ([`Mode::Fm`](hl2/src/receiver/mod.rs:111), ≈ 15 kHz channel) and NFM
+  (`FmNarrow`, ≈ 5 kHz channel) share it — they are the **same DSP**,
+  distinguished only by the channel-select bandwidth `FmCore::new` tunes the
+  anti-alias / decimate LPF to (`Mode::default_bandwidth_hz`,
+  receiver/mod.rs:157–158). It is a
+  [`DemodCore`](hl2/src/receiver/demod/core.rs:41); the audio tail is the
+  shared [`AudioEngine`](hl2/src/receiver/demod/engine.rs:41):
+
+  ```text
+  each complex pair (I,Q) → FmCore::process (per-sample):
+    1  NCO multiply  post = x · e^(−j·φ)                                  demod/fm.rs:149
+    2  band-limit + decimate, per-arm:
+         i_dec = lp_i.push(post.re)   (lp_i = PolyphaseDecimator, channel BW)
+         q_dec = lp_q.push(post.im)   (lp_q = same taps, same M)            demod/fm.rs:153–154
+    3  on each (i_dec, q_dec) group boundary:                             demod/fm.rs:160–172
+         phase  = atan2(q, i)                     ∈ (−π, π]
+         delta  = wrap(phase − prev_phase)        ∈ (−π, π]   (radians)
+         emit   = delta
+  per input block → StandardDemod::demod (core.rs:108):
+    4  AGC + DC      i16 = DC-block · AGC · gain                          demod/engine.rs:221
+  ```
+
+  The HL2 EP6 wire always delivers **genuine complex I/Q** — the decoder
+  ([`parse_baseband_chunk`](hl2/src/protocol/data.rs:164)) writes
+  `Complex::new(i_re, q_im)` from two independent 24-bit words per I/Q
+  record, so **both** arms carry real signal energy in every
+  configuration. There is no "real (Q≈0)" mode to special-case; the SSB
+  core's Hilbert 90°-phase-shifter (which synthesises the missing
+  quadrature arm for legacy real-SDR input) is pure overhead here and is
+  deliberately not used.
+
+  The audio is the FM **deviation**, i.e. the instantaneous frequency —
+  the time-derivative of the phase. The demod reads the phase of each
+  decimated complex sample as `atan2(q, i)` and diffs it against the
+  previous phase, wrapping to the principal value `(−π, π]`. That wrapped
+  difference *is* the audio, in radians per decimated sample.
+
+  Two properties make this the correct choice for the HL2:
+
+  * **Band-limit first, then read phase.** The per-arm polyphase LPF is a
+    windowed-sinc, unit-gain low-pass at the channel-select bandwidth,
+    split into `M = source_rate / audio_rate` branches by
+    [`PolyphaseDecimator`](hl2/src/receiver/demod/dsp.rs:375). Running it
+    **before** `atan2` removes out-of-band and adjacent-channel noise so
+    the phase is well-defined and smooth over the audio band; reading the
+    phase on the unfiltered full-rate stream would mix wideband noise
+    into every sample and the `delta` would be dominated by noise rather
+    than by the deviation. The two arms share identical taps and the
+    same decimation factor, so their group boundaries line up (every
+    `M`-th input index) and the `(i, q)` pair at each boundary is a true
+    complex sample.
+
+  * **Phase (not magnitude) is the observable.** `atan2` returns a phase
+    regardless of carrier magnitude, so the demod is **naturally
+    amplitude-invariant** — a weak carrier and a strong one produce the
+    same `delta` for the same deviation. This sidesteps the
+    *amplitude-scaling* problem that broke the previous
+    "cross-product + divide-by-magnitude" version of this core: the
+    quad-mod numerator `|z|·|z′|·sin Δφ` scales as `A²`, and on the HL2's
+    weak DDC output (carrier amplitude ~ 1e-3) that lands ~ 1e-6, under
+    the AGC's useful range — *silent at any gain* while the S-meter showed
+    a loud signal. The phase-derivative read is O(1) in `A` for any
+    `A > 0`, which is exactly what the shared AGC (engine.rs:221) needs.
+
+  The deviation `[−f_dev, +f_dev]` is symmetric about DC, so the audio is
+  zero-mean for symmetric deviation and the AGC's DC-block has no work
+  left to do beyond removing a small residual offset.
+
+  Regression guards (all in the `fm.rs` `tests` module):
+  `inband_fm_produces_audio` / `nfm_narrow_channel_passes_in_band_deviation`
+  (peak level at a full-scale carrier), `weak_complex_baseband_fm_produces_audio`
+  / `weak_complex_baseband_nfm_produces_audio` (`A = 1e-3` — the HL2's
+  weak DDC output; asserts the output still reaches the AGC target), and
+  `weak_complex_fm_is_clean_tone` (Goertzel at 1.5 kHz vs. 3.0 kHz and
+  5.0 kHz — the voice bin must dominate its 2× harmonic *and* any
+  broadband floor, so a demod that leaks image at 2f — the "static, no
+  tone" symptom — fails the test).
+
+  Dispatch: `Mode::{Fm,FmNarrow}` →
+  `FmCore::new(…, "fm"|"nfm").demodulator(…)` in
+  [`make_demod_tap`](hl2/src/receiver/demod/mod.rs:167).
+
+### 16.3e — The S-meter: a consumer of the displayed slot's *band spectrum*
+
+The S-meter is **not** part of the `hl2` DSP tail any more (the in-engine
+`meter_tick` is gone). It is an `hl2-api` consumer of the **band spectrum**
+that `run_spectral` already produces for the panadapter/waterfall — a
+single, mode-agnostic source of both the *signal* and the *noise floor*.
+
+The core insight is that a band spectrum has two cleanly separable
+quantities, and *mode enters only to select the passband window*:
+
+* **level** = the **root-mean-square** spectral energy *inside* the running
+  receiver's channel passband. Measuring **energy, not a single peak bin**,
+  means an AM carrier (a huge, near-constant DC line) blends with its
+  sidebands, so the reading rises and falls with the **modulation** (speech
+  vs. silence) instead of latching onto the constant carrier. The window the
+  RMS is taken over is *mode-oriented* — it mirrors the band the UI shades on
+  the panadapter (see `draw_vrx_passband`), so it is the band the receiver
+  actually passes:
+
+  | mode          | passband window          |
+  | ------------- | ------------------------ |
+  | USB, FT8/FT4/JS8 | `[centre, centre+bw]`  |
+  | LSB           | `[centre−bw, centre]`     |
+  | AM, FM, NFM   | `[centre−bw, centre+bw]`  |
+
+  This orientation is the single source of the `VrxMode → PassbandShape`
+  mapping (`crate::meter::shape_for_mode`, written to
+  `RadioHub::passband_mode` on `set_vrx`). Without it USB and LSB read
+  identically (the meter latched onto the *other* sideband's carrier, which
+  the receiver never passes).
+* **floor** = the 25th percentile of the *whole* display's magnitudes. A
+  single carrier/tone sits in a handful of the hundreds of noise bins, so the
+  percentile lands on the **noise** regardless of where — or whether — the
+  signal is. This is the band's ambient floor.
+
+Both are computed **per FFT frame** by the pure function
+[`compute_s_meter`](api/src/meter.rs) — `mags` (the displayed band
+magnitudes, scaled `0..=65535`) + the passband width (in display bins,
+derived in `run_spectral` from the running receiver's channel bandwidth,
+`RadioHub::passband_bw`) + the [`PassbandShape`](api/src/meter.rs) + a `25`
+percentile. The reading the UI renders is `level − floor`, in dB of *band
+signal energy over the noise floor* — a mode-agnostic band SNR that works
+identically for SSB, AM, FM, NFM and the digital modes (tones read as
+in-band energy over the noise). Measuring RMS rather than the peak also
+**rescales the absolute level reading**: a single narrow line (CW / FT8) is
+`10·log10(bins)` dB below where the old *peak* reading placed it, and an AM
+carrier's DC line no longer dominates. The relative S-unit ordering against
+the noise floor is preserved — only the numeric values shift.
+
+Concretely:
+
+* **`vrx_levels`** ([`common/src/lib.rs`](common/src/lib.rs)) — the passband
+  peak, dB relative to the band's full scale.
+* **`vrx_floors`** ([`common/src/lib.rs`](common/src/lib.rs)) — the band
+  noise floor, dB, same reference.
+
+The reading the UI renders is **`vrx_levels[slot] − vrx_floors[slot]`, in dB
+of signal over the band floor** — a scale-independent SNR that works
+identically for SSB, AM, FM, NFM, and the digital modes (FT8/JS8/FT4 tones
+read as passband energy over the noise).
+
+Wiring: `run_spectral` already runs the FFT every frame and owns the band
+magnitudes, so it computes the meter when the displayed source is an EP6
+per-slot stream (`SpectrumSource::Ep6 { slot }`) and pushes it into a
+`MeterState` (three lock-free `AtomicU64`s: slot, level, floor —
+[`api/src/meter.rs`](api/src/meter.rs)). `Session::shared_state` reads that
+back into `vrx_levels` / `vrx_floors` (only for the slot currently on
+display), and the ~100 ms `run_levels` task re-broadcasts so a freshly-opened
+client's `welcome`/`get_state` carries the live reading. The demod's pre-AGC
+`RawSampleTap` seam now carries **only** the FT8/JS8/FT4 decoders — no
+composite, no meter. UI-side `track_floors`
+([`ui/src/app.rs`](ui/src/app.rs)) remains a *fallback* for old servers; the
+server-supplied `vrx_floors` wins when present.
 
 ### 16.4 Sinks
 
@@ -1091,7 +1404,7 @@ Verified against a live HL2: ` iq:audio ` tracks ` rate/2 : 4800 ` exactly
  ### 16.7 Server (`hl2-api`) + UI (`hl2-ui`) implementation
 
  The full audio path is wired. Each layer sits on the one already-built in
- `hl2` — the DSP (§16.3) and the `BasebandRing` hand-off — without touching
+ `hl2` — the DSP (§16.3a) and the `BasebandRing` hand-off — without touching
  them.
 
   **Wire contract** (`hl2-common`, shared by server + browser):
@@ -1211,7 +1524,7 @@ Verified against a live HL2: ` iq:audio ` tracks ` rate/2 : 4800 ` exactly
        `canvas::draw_vrx_passband` below).
   * `ui/src/canvas.rs` — `draw_vrx_passband` shades **each receiver's**
      channel-select passband (centred at `center + offset`) on **both** the
-     panadapter and the waterfall. The demod (§16.3) is USB =
+     panadapter and the waterfall. The demod (§16.3a) is USB =
      `[centre, centre+bw]` (above the tune + offset), LSB =
      `[centre−bw, centre]` (below) — the overlay matches that band exactly.
      Green = USB, blue = LSB. Passbands entirely off the displayed span are
@@ -1346,7 +1659,7 @@ the `slot` byte (§16.7 audio layout).
 ### 16.10 FT8 (digital mode, implemented)
 
 The virtual receiver supports a third mode, `VrxMode::Ft8`, alongside USB /
-LSB (§16.3), and two more, `VrxMode::Js8` (§16.11) and `VrxMode::Ft4` (§16.11).
+LSB (§16.3a), and two more, `VrxMode::Js8` (§16.11) and `VrxMode::Ft4` (§16.11).
 All three are WSJT-family digital decoders. FT8 is decoded by the [`mfsk-core`](https://crates.io/crates/mfsk-core)
 `Ft8` decoder (`hl2/src/receiver/ft8.rs`) — the same one WSJT-X uses — run
 per 15 s slot against the demodulator's raw tap. FT4 uses the same `mfsk-core`
@@ -1358,11 +1671,13 @@ rate (the mfsk-core FT8 reference rate), not the SSB audio path. The
 `CH_AUDIO` stream still carries what the demod emits, so the mode is audibly
 silent but the *decode* task is what the user waits on.
 
-**Raw-sample tap.** `SsbDemodulator` carries an optional
-`RawSampleTap` (an `Arc<dyn RawSampleTap>`) installed in `make_demod_tap`
-([`hl2/src/receiver/demod.rs`](hl2/src/receiver/demod.rs)). The demod invokes
-it with each pre-AGC, decimated `f32` block, so the FT8 decoder sees the same
-samples the SSB/USB LSB path hears, before the RMS-AGC rescales. `Ft8Tap`
+**Raw-sample tap.** The shared [`AudioEngine`](hl2/src/receiver/demod/engine.rs:41)
+carries an optional `RawSampleTap` (an `Arc<dyn RawSampleTap>`,
+[`demod/mod.rs:220`](hl2/src/receiver/demod/mod.rs:220)) installed in
+`make_demod_tap` (demod/mod.rs:133). Its `emit`
+([engine.rs:139](hl2/src/receiver/demod/engine.rs:139)) invokes the tap with
+each pre-AGC, decimated `f32` block, so the FT8 decoder sees the same samples
+the SSB/USB path hears, before the RMS-AGC rescales. `Ft8Tap`
 (`hl2/src/receiver/ft8.rs`) is the concrete `RawSampleTap`: it appends into a
 bounded ring behind `Arc<Mutex<SharedDecoder>>` (the `SharedDecoder` handle is
 shared with the decode task). The `ReceiverConfig.tap` field is `Option<…>`;
@@ -1461,7 +1776,7 @@ boundary, so the reference decodes **as the data becomes ready**
 is exactly what `js8_step` reproduces.
 
 **Mode + sample rate.** `VrxMode::Js8` selects the same **12 kHz** baseband
-path as FT8 (`make_demod_tap`, `hl2/src/receiver/demod.rs` — the demod is the
+path as FT8 (`make_demod_tap`, `hl2/src/receiver/demod/mod.rs` — the demod is the
 FT8/USB pipeline; `Mode::Js8` is a mode flag that makes `hl2-api` attach the
 JS8 tap instead of the FT8 tap). The `CH_AUDIO` stream still carries the
 demod output.

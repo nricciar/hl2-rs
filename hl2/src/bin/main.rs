@@ -923,8 +923,7 @@ fn audio_band_fingerprint(win: &[f32], rate_hz: u32) -> Option<String> {
 /// so the thread does not busy-spin when the ring is empty.
 ///
 /// When `HL2_DEBUG` is set, also prints a rolling `[dlg] pair_rate` and a
-/// per-second spectral report (same `dbg_spectral` function used before the
-/// decoupling change).
+/// per-second spectral report via `dbg_spectral`.
 ///
 /// Exits when `stop` is set to `true` (checked at the top of each loop
 /// iteration). On the way out, flushes `rx` so any partial audio block is

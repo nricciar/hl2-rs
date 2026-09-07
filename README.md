@@ -17,6 +17,9 @@ Hermes Lite 2 SDR client implemented in Rust. Project is a work in progress with
 
 ## Supported Modes
 
+* AM
+* FM
+* NFM
 * SSB (USB/LSB)
 * FT8 - mfsk-core provided ft8 decoder
 * FT4 - mfsk-core provided ft4 decoder
@@ -37,6 +40,6 @@ Most of the code in this repo was auto generated with Qwen 3.8 27b and OpenCode.
 
 ## TODO
 
-* Modes [CW, FM, AM, NFM, and more]
+* Modes [CW, and more]
 * TX
 * Teensy support

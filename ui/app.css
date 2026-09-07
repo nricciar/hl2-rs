@@ -24,9 +24,24 @@ html, body {
     padding: 1rem 1rem 3rem;
 }
 
+.headrow {
+  display: flex;
+  align-items: center; 
+  justify-content: space-between;
+  width: 100%;
+}
+
 h1 {
     font-size: 1.3rem;
     margin: 0 0 0.5rem;
+    width: 100%;
+    vertical-align: middle;
+}
+
+#notifications {
+    float: right;
+    margin-top: 1.5em; 
+    font-size: 0.4em;
 }
 
 /* Radio-selection row (replaces the old Discover button). One button per
@@ -338,9 +353,363 @@ input[type=number]:disabled {
     cursor: default;
 }
 
-/* Virtual-receiver (SSB audio) panel */
-.vrx-panel h3 {
-    margin: 0 0 0.4rem;
+/* Decode log — appears in the bottom "decode" panel whenever any slot is
+   demodulating a digital mode (FT8 / FT4 / JS8). Kept as its own panel; the
+   earlier "Virtual receiver" panel has been decomposed into three rows (the
+   gauge, the mode/BW/gain config row, the audio/mute row), so the panel now
+   hosts only the decode table. */
+.decode-panel {
+    margin-top: 1rem;
+}
+.decode-panel .ft8-log {
+    margin-top: 0;
+    padding-top: 0;
+    border-top: none;
+}
+
+/* Two-column control layout, asymmetric on purpose:
+   Left column grows (`1fr`) so it has room for the frequency readout and the
+   Mode / BW / Gain row on a single line. Right column is content-sized
+   (`auto`) so the RX filter-bank / LNA panel keeps its natural width (no
+   white space), and the S/SWR gauge sits directly under it at the same width.
+   On narrow widths the grid collapses to a single column. */
+ .controls-grid {
+     display: grid;
+     grid-template-columns: minmax(0, 1fr) auto;
+     gap: 1.25rem;
+     margin: 1.1rem 0 0.5rem;
+     align-items: start;
+ }
+ @media (max-width: 680px) {
+     .controls-grid {
+         grid-template-columns: 1fr;
+     }
+ }
+ .col-left {
+     display: flex;
+     flex-direction: column;
+     gap: 1rem;
+     align-items: flex-start;
+ }
+ .col-left > .fstep {
+     margin: 0;
+ }
+ .col-right {
+     display: flex;
+     flex-direction: column;
+     gap: 1rem;
+ }
+
+ /* The S/SWR gauge. A single bar with two label rows: S1..S9 +
+    +20/+40/+60 along the top; 1:1..4:1 along the bottom. Only one of RX/TX
+    can be active at a time, so this one instrument serves both roles and the
+    operator reads whichever half is meaningful for the current mode. The
+    fill div is the live needle — its width is the current reading (0..100 %).
+    Past S9 (≥60 %) the track's red tail lights up; past 2.5:1 (≥62.5 %) the
+    same tail is the SWR red zone. Width is set by the parent column (see
+    `.col-right`) — no box/border; just the bar + labels. */
+  .gauge {
+      position: relative;
+      padding: 1.45rem 0.35rem;
+      /* Width of the left gutter reserved for the "S" / "SWR" row names.
+         The track and both tick rows shift right by this amount so they
+         start after the row names (see `.gauge-track` / `.gauge-*-labels`);
+         the row names themselves sit in this strip (`.gauge-rowname`). */
+      --gauge-gutter: 2.7rem;
+  }
+/* Outer S scale: `left: <frac> %` pins each label to its fractional position
+   on the underlying bar. The track is 14 px tall, centred in the
+   .gauge's content box. */
+.gauge-track {
+    position: relative;
+    /* Shift the bar right so it starts after the "S"/"SWR" row-name gutter
+       (reserved in `.gauge` as `--gauge-gutter`). The bar gets slightly
+       shorter on the left; the tick rows below are shifted by the same
+       amount so they stay aligned to this bar's ends. */
+    margin-left: var(--gauge-gutter);
+    height: 14px;
+    border-radius: 3px;
+    background: #0a0e15;
+    border: 1px solid var(--border);
+    box-shadow: inset 0 0 0 1px rgba(0,0,0,0.35);
+    overflow: visible;
+}
+/* Green → amber → red sweep across the track. The S scale occupies the
+   first 60 % (S9 = 60 %); past that the +20/+40/+60 overload region runs to
+   100 %. The fill is colour-coded by position: solid green while the needle
+   is in the S region, amber in the lower overload band, red at the
+   +40/+60 end. The SWR half shares the bar — its red zone (≥2.5:1 → 62.5 %)
+   sits just past the S9 boundary, so the same amber/red tail reads the SWR
+   warning. */
+.gauge-fill {
+    position: absolute;
+    top: 1px;
+    bottom: 1px;
+    left: 1px;
+    border-radius: 2px;
+    background:
+        linear-gradient(90deg,
+            rgba(76,175,125,0.4) 0%,
+            rgba(76,175,125,0.85) 60%,
+            rgba(213,165,58,0.85) 75%,
+            rgba(224,91,91,0.85) 90%,
+            rgba(224,91,91,0.9) 100%);
+    box-shadow: 0 0 4px rgba(76,175,125,0.35) inset;
+    height: calc(100% - 2px);
+    transition: width 80ms linear;
+}
+/* Tick labels above the track (S scale). */
+ .gauge-outer-labels {
+     position: absolute;
+     top: 0;
+     /* Start after the "S"/"SWR" row-name gutter (the track is shifted right
+        by the same `--gauge-gutter` via `margin-left`), keeping the original
+        0.4rem inset so the S ticks still line up with the track's ends. */
+     left: calc(0.4rem + var(--gauge-gutter));
+     right: 0.4rem;
+     height: 1.4rem;
+     pointer-events: none;
+ }
+/* Tick labels below the track (SWR scale). Mirrors the top row:
+   `align-items: flex-end` pins each tick span to the container's bottom
+   edge (adjacent to the track's bottom border), so its `::after` stub
+   hangs **up** out of the track — exactly the vertical distance that the
+   top row's stub hangs *down* in — instead of the spans sitting at the top
+   of the container and their stubs overlapping the track. */
+ .gauge-inner-labels {
+     position: absolute;
+     bottom: 0;
+     /* Same left/right offset as the top row: shifted right by the
+        `--gauge-gutter` row-name strip so the SWR ticks line up with the
+        shifted track's ends. */
+     left: calc(0.4rem + var(--gauge-gutter));
+     right: 0.4rem;
+     height: 1.4rem;
+     pointer-events: none;
+     display: flex;
+     align-items: flex-end;
+ }
+/* Tick labels above the track (S scale) and below it (SWR scale). Both rows
+   share the same .gauge-tick styling; positional classes place the marker
+   stub on the right side of the label — downward stub for the top row,
+   upward stub for the bottom row. */
+.gauge-tick {
+    position: absolute;
+    transform: translateX(-50%);
+    /* A fixed 1em line box (one text line tall) even when the label is
+       empty: this is what keeps the `::after` tick stub — which hangs off
+       `top:100%`/`bottom:100%` of *this* element — at the same height on a
+       labelled tick as on a label-less (stub-only) one. Without it an
+       unlabelled span has zero height, so its stub would sit at the text
+       band instead of the baseline line. */
+    display: block;
+    height: 1em;
+    line-height: 1;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.62rem;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    pointer-events: none;
+    user-select: none;
+}
+.gauge-tick::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    width: 1px;
+    height: 5px;
+    background: var(--border);
+    transform: translateX(-50%);
+}
+.gauge-outer-labels .gauge-tick::after {
+    top: 100%;
+    margin-top: 2px;
+}
+.gauge-inner-labels .gauge-tick::after {
+    bottom: 100%;
+    margin-bottom: 2px;
+}
+ .gauge-tick.red {
+    color: var(--err);
+ }
+ .gauge-tick.red::after {
+    background: rgba(224,91,91,0.6);
+ }
+ /* The "S" / "SWR" row names: sit in the left gutter (reserved on `.gauge`
+    as `--gauge-gutter`), right-aligned up against the track, and share the
+    exact text metrics of `.gauge-tick` (size / font / colour) so they read
+    as the row's name for the same scale. No tick stub — they are a label,
+    not a position marker. */
+ .gauge-rowname {
+    position: absolute;
+    left: 0.35rem;
+    width: var(--gauge-gutter);
+    box-sizing: border-box;
+    text-align: left;
+    height: 1em;
+    line-height: 1;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.62rem;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    pointer-events: none;
+    user-select: none;
+ }
+ .gauge-rowname-top {
+     top: 0;
+ }
+ .gauge-rowname-bottom {
+     bottom: 0;
+ }
+
+/* Config row: Mode / BW / Gain for the active tab's receiver. Sized to the
+   gauge width by virtue of being full-width; each block has its own label +
+   control pair. */
+ .cfg-row {
+     display: inline-flex;
+     align-items: center;
+     gap: 0.6rem;
+     flex-wrap: wrap;
+ }
+ .cfg-block {
+     display: inline-flex;
+     align-items: center;
+     gap: 0.3rem;
+ }
+ .cfg-label {
+     font-size: 0.66rem;
+     text-transform: uppercase;
+     letter-spacing: 0.1em;
+     color: var(--muted);
+ }
+ .cfg-select {
+     min-width: 5.5rem;
+ }
+ .cfg-number {
+     width: 7rem;
+ }
+ /* EP4 (raw wideband) has no virtual receiver or audio, so the mode / BW /
+    gain / volume controls don't apply: dim the whole group so it reads as
+    inactive for this tab (they stay fully active on the RX1–4 tabs). */
+ .cfg-row.cfg-disabled {
+     opacity: 0.4;
+     pointer-events: none;
+ }
+
+/* Audio row: Volume slider + Mute toggle. Vol is a "device" control
+   (applies to whichever slot's audio plays at the moment), so it lives by
+   itself — no other slot-scoped things next to it. */
+.audio-row {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+    margin: 0.5rem 0;
+    padding: 0.55rem 0.7rem;
+    background: #10151f;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: inset 0 0 0 1px rgba(0,0,0,0.25);
+}
+.audio-label {
+    font-size: 0.66rem;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--muted);
+}
+.audio-sep {
+    width: 1px;
+    height: 1.4rem;
+    background: var(--border);
+    margin: 0 0.25rem;
+}
+.vol-slider {
+    -webkit-appearance: none;
+    appearance: none;
+    flex: 1 1 auto;
+    min-width: 10rem;
+    max-width: 22rem;
+    height: 6px;
+    border-radius: 999px;
+    background:
+        linear-gradient(90deg,
+            rgba(76,175,125,0.95) 0%,
+            rgba(76,175,125,0.95) var(--fill, 50%),
+            rgba(115,138,178,0.18) var(--fill, 50%),
+            rgba(115,138,178,0.18) 100%);
+    outline: none;
+    cursor: pointer;
+    box-shadow: inset 0 0 0 1px rgba(0,0,0,0.35);
+}
+.vol-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: #eaf6ef;
+    border: 2px solid var(--ok);
+    box-shadow: 0 0 6px 0 rgba(76,175,125,0.7);
+    cursor: pointer;
+    margin-top: -4px;
+    transition: transform 0.08s ease;
+}
+.vol-slider::-webkit-slider-thumb:hover {
+    transform: scale(1.12);
+}
+.vol-slider::-webkit-slider-runnable-track {
+    height: 6px;
+    border-radius: 999px;
+}
+.vol-slider::-moz-range-track {
+    height: 6px;
+    border-radius: 999px;
+    background: rgba(115,138,178,0.18);
+}
+.vol-slider::-moz-range-progress {
+    height: 6px;
+    border-radius: 999px;
+    background: rgba(76,175,125,0.95);
+}
+.vol-slider::-moz-range-thumb {
+    width: 13px;
+    height: 13px;
+    border-radius: 50%;
+    background: #eaf6ef;
+    border: 2px solid var(--ok);
+    box-shadow: 0 0 6px 0 rgba(76,175,125,0.7);
+    cursor: pointer;
+}
+.vol-val {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.85rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--fg);
+    min-width: 3.5rem;
+    text-align: right;
+}
+.mute-btn {
+    min-width: 5.5rem;
+    padding: 0.35rem 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+}
+.mute-btn.muted {
+    background: #1f2839;
+    color: var(--muted);
+    border-color: var(--border);
+}
+.mute-btn.muted:hover:not(:disabled) {
+    background: #273349;
+}
+.mute-btn:not(.muted) {
+    background: #1d2a3d;
+    color: var(--fg);
+    border-color: rgba(76,175,125,0.55);
+}
+.mute-btn:not(.muted):hover:not(:disabled) {
+    background: #263650;
 }
 
 /* Frequency readout — 8-digit stepper in `14.074.000` groups. The digits
@@ -374,25 +743,7 @@ input[type=number]:disabled {
     pointer-events: none;
 }
 
-/* The tune row: the frequency readout on the left, and the filter-bank +
-   LNA panel on the right. Both are vertically centred against each other,
-   and the panel is sized so it stays within the frequency control's height. */
-.tune-row {
-    display: flex;
-    align-items: center;
-    gap: 1.25rem;
-    flex-wrap: wrap;
-    margin: 1.1rem 0 1rem;
-}
-.tune-row > .fstep {
-    margin: 0;
-}
-/* Push the filter/LNA panel to the right edge of the row, whatever the
-   window width or wrap state leaves on the left of it. */
-.tune-row > .fpanel {
-    margin-left: auto;
-}
-.fpanel {
+ .fpanel {
     display: flex;
     flex-direction: column;
     gap: 0.3rem;
@@ -554,53 +905,10 @@ input[type=number]:disabled {
 .fstep-half-bottom:hover ~ .fstep-out {
     opacity: 1;
 }
-.vrx-panel .muted {
-    margin: 0 0 0.5rem;
-    font-size: 0.8rem;
-}
-.vrx-badge {
-    font-variant-numeric: tabular-nums;
-    font-weight: 600;
-    font-size: 0.85rem;
-    padding: 0.3rem 0.7rem;
-    border-radius: 6px;
-    border: 1px solid var(--border);
-    background: #11161f;
-}
-.vrx-badge.on {
-    color: var(--ok);
-    border-color: rgba(76, 175, 125, 0.55);
-    background: #17271f;
-}
-.vrx-badge.off {
-    color: var(--muted);
-}
-label.vol {
-    flex: 1 1 auto;
-    min-width: 16rem;
-}
-label.vol span {
-    width: 2rem;
-    text-align: right;
-    color: var(--muted);
-    font-size: 0.8rem;
-}
-label.vol .vol-val {
-    width: 2.6rem;
-    color: var(--fg);
-    font-variant-numeric: tabular-nums;
-    text-align: left;
-    margin-left: 0.2rem;
-    font-size: 0.8rem;
-}
-/* Match the numeric input sizing so the vol row stays aligned. */
-label.vol input[type=range] {
-    flex: 1 1 auto;
-    min-width: 6rem;
-    accent-color: var(--ok);
-}
 
-/* FT8 decode log — appears inside the vrx panel when the mode is FT8. */
+/* Decode log — appears in the bottom decode panel while any slot is
+   demodulating a digital mode (FT8 / FT4 / JS8). The table is the panel's
+   content; the panel hosts only this table. */
 .ft8-log {
     margin-top: 0.8rem;
     padding-top: 0.8rem;
@@ -609,10 +917,11 @@ label.vol input[type=range] {
     overflow-y: auto;
 }
 .ft8-log h4 {
-    margin: 0 0 0.5rem;
-    font-size: 0.85rem;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
+    margin: 0 0 0.6rem;
+    font-size: 0.8rem;
+    font-weight: 600;
+    text-transform: none;
+    letter-spacing: 0.02em;
     color: var(--muted);
 }
 .ft8-table {

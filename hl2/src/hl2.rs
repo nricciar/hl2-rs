@@ -1,7 +1,6 @@
 //! High-level Hermes-Lite 2 client.
 //!
-//! The design separates the roles that previously lived in one long-lived
-//! struct:
+//! Two roles are split across two types:
 //!
 //! * **`Hl2`** — an *owned, clonable* control handle for one device. It wraps
 //!   the single shared UDP socket via `Arc`, so many websocket clients can
@@ -499,6 +498,29 @@ impl Hl2 {
     /// set per frame.
     pub fn active_slots(&self) -> Vec<u8> {
         self.inner.fanout.slots()
+    }
+
+    /// Whether `slot` is currently *active* — i.e. registered in the fan-out
+    /// and owning a dedicated [`BasebandRing`]. Slot 1 is seeded active at
+    /// construction; a later `tune(slot, f≠0)` activates other slots;
+    /// `tune(slot, 0)` deactivates.
+    ///
+    /// Callers that consume a slot's baseband stream (`VirtualReceiver`
+    /// demods, spectrum taps, mode decoders) typically bind to the slot's
+    /// ring at spawn time; `baseband_ring(slot)` resolves to that dedicated
+    /// ring **only if the slot is active** (otherwise it falls back to the
+    /// position-0 ring, which is still the RX1 anchor). Comparing ring
+    /// handles to detect this is fragile — apps should ask the library
+    /// directly:
+    ///
+    /// ```text
+    /// let ring = hl2.baseband_ring(slot);
+    /// let active = hl2.is_slot_active(slot);
+    /// // ... if a running consumer must be re-bound when `active`
+    /// // transitions from `false` to `true`, the app knows to rebuild it.
+    /// ```
+    pub fn is_slot_active(&self, slot: u8) -> bool {
+        self.inner.fanout.ring_for_slot(slot).is_some()
     }
 
     /// The number of active receiver slots (the N that goes in C4[6:3] of the

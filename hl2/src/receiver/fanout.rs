@@ -7,7 +7,7 @@
 //! `N` per-receiver streams (`BasebandChunk::per_rx`), where `per_rx[p]` is the
 //! stream of the *p-th active slot in ascending order*.
 //!
-//! A single shared [`BasebandRing`] (the old RX1-only design) can only hold
+//! A single shared [`BasebandRing`] can only hold
 //! one of those streams. To demodulate several receivers at once we need one
 //! ring **per active slot**, keyed by the slot the user tuned to:
 //!
