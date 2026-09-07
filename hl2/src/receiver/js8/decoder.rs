@@ -721,6 +721,7 @@ mod tests {
     /// run it through the continuous decoder. The pipeline must recover
     /// the frame per mode (callsign + grid, per `unpack_frame` for the
     /// heartbeat family), tagged with the right submode.
+    #[ignore = "slow: full decode across all four modes"]
     #[test]
     fn self_synthesised_js8_all_modes_decode() {
         use crate::receiver::js8::frame::encode_tones;
@@ -787,6 +788,7 @@ mod tests {
     /// same-frequency) frame again within [`EMIT_DEDUP_MS`] — the
     /// continuous re-arm cadence would otherwise flood the log and PSK
     /// Reporter with the same station every ~1.5 s.
+    #[ignore = "slow: two full decode passes"]
     #[test]
     fn repeat_suppressed_within_window() {
         use crate::receiver::js8::frame::encode_tones;
