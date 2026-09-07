@@ -893,7 +893,6 @@ dependencies = [
  "num-complex",
  "rustfft",
  "tokio",
- "tokio-util",
 ]
 
 [[package]]

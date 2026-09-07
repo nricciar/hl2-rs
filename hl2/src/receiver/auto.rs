@@ -28,12 +28,15 @@
 pub enum AutoMode {
     /// FT8, the 15-second-slot WSJT-family mode
     /// ([`super::Ft8Message`] / [`super::Ft8Decoder`]).
+    #[cfg(feature = "ft8")]
     Ft8,
     /// JS8Call, the multi-speed continuous mode
     /// ([`super::Js8Message`] / [`super::js8::Js8Decoder`]).
+    #[cfg(feature = "js8")]
     Js8,
     /// FT4, the 7.5-second-slot WSJT-family mode
     /// ([`super::Ft4Message`] / [`super::ft4::Ft4Decoder`]).
+    #[cfg(feature = "ft4")]
     Ft4,
 }
 
@@ -42,8 +45,11 @@ impl AutoMode {
     /// rename — the UI renders it in the "Auto Decode" readout.
     pub const fn wire(&self) -> &'static str {
         match self {
+            #[cfg(feature = "ft8")]
             Self::Ft8 => "ft8",
+            #[cfg(feature = "js8")]
             Self::Js8 => "js8",
+            #[cfg(feature = "ft4")]
             Self::Ft4 => "ft4",
         }
     }
@@ -54,13 +60,24 @@ impl AutoMode {
     /// Adding a band is a one-line change in the decoder module's table.
     pub fn known_freqs(&self) -> &'static [u32] {
         match self {
+            #[cfg(feature = "ft8")]
             Self::Ft8 => super::ft8::KNOWN_FREQS,
+            #[cfg(feature = "js8")]
             Self::Js8 => super::js8::decoder::KNOWN_FREQS,
+            #[cfg(feature = "ft4")]
             Self::Ft4 => super::ft4::KNOWN_FREQS,
         }
     }
 }
 
 /// The full registry. Order is the UI render order and the order the API
-/// iterates when building a slot's auto-decoder set.
-pub const AUTO_MODES: &[AutoMode] = &[AutoMode::Ft8, AutoMode::Js8, AutoMode::Ft4];
+/// iterates when building a slot's auto-decoder set. Each entry is present
+/// only for an enabled digital mode.
+pub const AUTO_MODES: &[AutoMode] = &[
+    #[cfg(feature = "ft8")]
+    AutoMode::Ft8,
+    #[cfg(feature = "js8")]
+    AutoMode::Js8,
+    #[cfg(feature = "ft4")]
+    AutoMode::Ft4,
+];

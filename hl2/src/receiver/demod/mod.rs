@@ -33,6 +33,8 @@
 
 pub mod am;
 pub mod core;
+/// FT8/FT4/JS8 12 kHz USB core — present only when a digital mode is enabled.
+#[cfg(any(feature = "ft8", feature = "ft4", feature = "js8"))]
 pub mod digital;
 pub mod dsp;
 pub mod engine;
@@ -50,6 +52,8 @@ use super::sink::AudioSink;
 // Nco, …}` (and `super::demod::RawSampleTap` from ft8/ft4/js8) resolve.
 pub use am::AmCore;
 pub use core::{DemodCore, StandardDemod};
+/// The FT8/FT4/JS8 shared core — present only when a digital mode is enabled.
+#[cfg(any(feature = "ft8", feature = "ft4", feature = "js8"))]
 pub use digital::DigitalCore;
 pub use dsp::{F32Fir, F32FirState, KAISER_BETA, Nco, PolyphaseDecimator};
 pub use engine::AudioEngine;
@@ -60,6 +64,8 @@ pub use ssb::SsbCore;
 /// for each mode's core.
 pub type SsbDemodulator = StandardDemod<SsbCore>;
 pub type AmDemodulator = StandardDemod<AmCore>;
+/// Full-tail demodulator for the digital (FT8/FT4/JS8) core.
+#[cfg(any(feature = "ft8", feature = "ft4", feature = "js8"))]
 pub type DigitalDemodulator = StandardDemod<DigitalCore>;
 pub type FmDemodulator = StandardDemod<FmCore>;
 
@@ -142,10 +148,13 @@ pub fn make_demod_tap(
 ) -> Result<Box<dyn Demodulator>, DemodError> {
     ensure_decimable(source_rate_hz, audio)?;
     Ok(match mode {
+        #[cfg(feature = "ft8")]
         Mode::Ft8 => digital::DigitalCore::new(source_rate_hz, source_center_hz, audio, "ft8")
             .demodulator(audio, tap),
+        #[cfg(feature = "js8")]
         Mode::Js8 => digital::DigitalCore::new(source_rate_hz, source_center_hz, audio, "js8")
             .demodulator(audio, tap),
+        #[cfg(feature = "ft4")]
         Mode::Ft4 => digital::DigitalCore::new(source_rate_hz, source_center_hz, audio, "ft4")
             .demodulator(audio, tap),
         Mode::Am => am::AmCore::new(source_rate_hz, source_center_hz, bandwidth_hz, audio)

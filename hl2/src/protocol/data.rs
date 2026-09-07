@@ -1,4 +1,10 @@
 //! Parsing of 1032-byte HL2 data packets, IQ extraction, and block assembly.
+//!
+//! `no_std`-eligible: allocation comes from `alloc` (see the top-level
+//! `crate::extern crate alloc`), so the heap types here are `alloc::vec::Vec`
+//! (identical to `std`'s `Vec` when `std` is enabled).
+
+use alloc::vec::Vec;
 
 use num_complex::Complex;
 

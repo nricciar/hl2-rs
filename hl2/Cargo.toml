@@ -4,19 +4,88 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-tokio = { workspace = true }
-tokio-util = { version = "0.7", features = ["net", "codec"] }
+# Complex I/Q sample type. `no_std` + `alloc`, required by the protocol core.
 num-complex = "0.4"
-rustfft = "6"
-mfsk-core = "0.9.1"
-hl2-common = { workspace = true }
+
+# Async control client (`hl2` module: `Hl2`, `discover`, pump). Pulls `tokio`.
+[dependencies.tokio]
+workspace = true
+optional = true
+
+# Digital-mode decoders — opt-out by dropping the mode feature.
+[dependencies.mfsk-core]
+version = "0.9.1"
+optional = true
+
+# JS8's FFT backend.
+[dependencies.rustfft]
+version = "6"
+optional = true
+
+# Shared wire / spot / `DecodedMessage` types — only the digital decoders need
+# it, so it's optional (a no-digital build has zero `hl2-common` / serde).
+[dependencies.hl2-common]
+workspace = true
+optional = true
+
+# ALSA audio sink (`receiver::AlsaSink`), off by default.
 [dependencies.cpal]
 version = "0.15"
 optional = true
 
 [features]
-js8_trace = []
-default = []
+default = ["std", "client", "digital"]
+
+# `std` standard library (allocation, sync primitives). Off = the lean
+# `no_std` protocol core (protocol + the std-free slice of the receiver).
+std = []
+
+# The `tokio`-based control client: `Hl2`, `discover*`, `start`/`stop`/`tune`,
+# the receive pump, and the `hl2` bin + network-probe examples.
+client = ["std", "dep:tokio"]
+
+# WSJT-family slot decoders.
+ft8 = ["std", "dep:mfsk-core", "dep:hl2-common"]
+ft4 = ["std", "dep:mfsk-core", "dep:hl2-common"]
+# JS8Call decoder (larger: carries `rustfft`).
+js8 = ["std", "dep:rustfft", "dep:hl2-common"]
+
+# Sugar: every digital mode at once. Drop a single mode with
+# `default-features = false, features = ["std", "client", "ft8", "ft4"]`.
+digital = ["ft8", "ft4", "js8"]
+
 # ALSA sink via `cpal`.
 alsa = ["dep:cpal"]
-integration-tests = []
+
+# Integration tests (a live HL2 + the `client` API).
+integration-tests = ["client"]
+
+# JS8 decoder tracing (no-op without `js8`).
+js8_trace = ["js8"]
+
+[[bin]]
+name = "hl2"
+path = "src/bin/main.rs"
+required-features = ["client", "ft8"]
+
+# Network probes: use `hl2::protocol` + their own `tokio` (enabled by `client`).
+[[example]]
+name = "ep6probe"
+required-features = ["client"]
+
+[[example]]
+name = "rateprobe"
+required-features = ["client"]
+
+[[example]]
+name = "tune_sweep"
+required-features = ["client"]
+
+[[example]]
+name = "tune_validate"
+required-features = ["client"]
+
+# Demod benchmark: needs the `Mode::Ft8` digital path.
+[[example]]
+name = "bench_demod"
+required-features = ["ft8"]

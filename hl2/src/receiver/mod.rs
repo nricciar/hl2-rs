@@ -27,48 +27,73 @@
 //! without touching the byte layout. The only seam that meets the wire is
 //! the abstract (not socket-specific) `BasebandSource`.
 
+/// Peak normalisation for the digital-mode decode windows (FT8/FT4/JS8).
+#[cfg(any(feature = "ft8", feature = "ft4", feature = "js8"))]
 pub mod audio_scale;
+/// Auto-decode registry: which digital modes are present + their known freqs.
+#[cfg(any(feature = "ft8", feature = "ft4", feature = "js8"))]
 pub mod auto;
 pub mod baseband_ring;
 pub mod demod;
 pub mod fanout;
+/// FT4 slot decoder (`mfsk-core`). `ft4` feature.
+#[cfg(feature = "ft4")]
 pub mod ft4;
+/// FT8 slot decoder (`mfsk-core`). `ft8` feature.
+#[cfg(feature = "ft8")]
 pub mod ft8;
+/// JS8Call decoder (`rustfft`). `js8` feature.
+#[cfg(feature = "js8")]
 pub mod js8;
 pub mod sink;
 pub mod source;
+/// WSJT-family spot (PSK Reporter) extraction — the shared FT8/FT4 free-text
+/// grammar. (JS8 has its own varicode selector in `js8::decoder`.) Present
+/// iff a WSJT mode (FT8 or FT4) is enabled, since those need `hl2-common`.
+#[cfg(any(feature = "ft8", feature = "ft4"))]
 pub mod spot;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Auto-decode registry + per-mode known-frequency tables (whichever modes are
+/// enabled; the API iterates `AUTO_MODES` to build slot decoders).
+#[cfg(any(feature = "ft8", feature = "ft4", feature = "js8"))]
 pub use auto::{AUTO_MODES, AutoMode};
 pub use baseband_ring::{BASEBAND_RING_CAP, BasebandRing};
 pub use demod::AudioEngine;
 pub use demod::{
-    AmCore, AmDemodulator, DemodCore, Demodulator, DigitalCore, DigitalDemodulator, F32Fir,
-    F32FirState, IqBlock, Nco, PolyphaseDecimator, RawSampleTap, SsbCore, SsbDemodulator,
-    StandardDemod, make_demod, make_demod_tap,
+    AmCore, AmDemodulator, DemodCore, Demodulator, F32Fir, F32FirState, IqBlock, Nco,
+    PolyphaseDecimator, RawSampleTap, SsbCore, SsbDemodulator, StandardDemod, make_demod,
+    make_demod_tap,
 };
-pub use fanout::BasebandFanout;
+/// Digital-mode core (FT8/FT4/JS8 share one USB/12 kHz core), present only when
+/// at least one digital mode is enabled.
+#[cfg(any(feature = "ft8", feature = "ft4", feature = "js8"))]
+pub use demod::{DigitalCore, DigitalDemodulator};
+#[cfg(feature = "ft4")]
 pub use ft4::{
     FT4_SAMPLE_RATE_HZ, FT4_SLOT_MS, FT4_SLOT_WINDOW_SAMPLES, Ft4Decoder, Ft4Message, Ft4Tap,
     closed_slot_for as ft4_closed_slot_for, decode_closed_slot as ft4_decode_closed_slot,
     shared as ft4_shared,
 };
+#[cfg(feature = "ft8")]
 pub use ft8::{
     FT8_SAMPLE_RATE_HZ, FT8_SLOT_MS, FT8_SLOT_WINDOW_SAMPLES, Ft8Decoder, Ft8Message, Ft8Tap,
     SharedDecoder, closed_slot_for, decode_closed_slot, shared,
 };
+#[cfg(feature = "js8")]
 pub use js8::decoder::{
     JS8_BUFFER_CAP, JS8_SAMPLE_RATE_HZ, JS8_SAMPLES_PER_SEC, Js8Decoder, Js8Message, Js8Tap,
     js8_step, shared as js8_shared,
 };
-/// Shared JS8 decoder handle ([`Arc<Mutex<Js8Decoder>>`]), the type both the
-/// demod tap and the API's decode task hold (cf. [`SharedDecoder`] for FT8).
-pub type Js8SharedDecoder = js8::decoder::SharedDecoder;
-/// Shared FT4 decoder handle ([`Arc<Mutex<Ft4Decoder>>`]), the type both the
-/// demod tap and the API's decode task hold (cf. [`SharedDecoder`] for FT8).
+/// Shared FT4 decoder handle ([`Arc<Mutex<Ft4Decoder>>`]), held by both the
+/// demod tap and the API's decode task (cf. [`SharedDecoder`] for FT8).
+#[cfg(feature = "ft4")]
 pub type Ft4SharedDecoder = ft4::SharedDecoder;
+/// Shared JS8 decoder handle ([`Arc<Mutex<Js8Decoder>>`]), held by both the
+/// demod tap and the API's decode task (cf. [`SharedDecoder`] for FT8).
+#[cfg(feature = "js8")]
+pub type Js8SharedDecoder = js8::decoder::SharedDecoder;
 #[cfg(feature = "alsa")]
 pub use sink::AlsaSink;
 pub use sink::{
@@ -115,12 +140,16 @@ pub enum Mode {
     /// ([`hl2::receiver::Ft8Decoder`]) on a wall-clock-aligned 15 s slot.
     /// Mode is SSB/USB at a 12 kHz output rate; the flag tells the API layer
     /// what rate to drive and when to decode. Slot details in PROTOCOL.md.
+    /// Requires the `ft8` feature.
+    #[cfg(feature = "ft8")]
     Ft8,
     /// JS8Call (Mode A): same USB/12 kHz pipeline as [`Mode::Ft8`], decoded
-    /// in `hl2-api` ([`Js8Decoder`]) on a 15 s slot.
+    /// in `hl2-api` ([`Js8Decoder`]) on a 15 s slot. Requires the `js8` feature.
+    #[cfg(feature = "js8")]
     Js8,
     /// FT4: same USB/12 kHz pipeline as [`Mode::Ft8`], decoded in `hl2-api`
-    /// ([`Ft4Decoder`]) on a 7.5 s slot.
+    /// ([`Ft4Decoder`]) on a 7.5 s slot. Requires the `ft4` feature.
+    #[cfg(feature = "ft4")]
     Ft4,
 }
 
@@ -136,8 +165,11 @@ impl Mode {
             Mode::Fm => 15_000,
             Mode::FmNarrow => 5_000,
             Mode::Ssb(_) => 2_600,
+            #[cfg(feature = "ft8")]
             Mode::Ft8 => 2_600,
+            #[cfg(feature = "js8")]
             Mode::Js8 => 2_600,
+            #[cfg(feature = "ft4")]
             Mode::Ft4 => 2_600,
         }
     }
@@ -151,8 +183,11 @@ impl Mode {
             Mode::Fm => None,
             Mode::FmNarrow => None,
             Mode::Ssb(s) => Some(*s),
+            #[cfg(feature = "ft8")]
             Mode::Ft8 => Some(Sideband::Usb),
+            #[cfg(feature = "js8")]
             Mode::Js8 => Some(Sideband::Usb),
+            #[cfg(feature = "ft4")]
             Mode::Ft4 => Some(Sideband::Usb),
         }
     }
