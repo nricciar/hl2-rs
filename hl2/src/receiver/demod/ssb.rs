@@ -5,16 +5,14 @@
 //! that per-sample DSP as a [`DemodCore`]. The audio tail (DC-block +
 //! RMS-target AGC + pre-AGC [`RawSampleTap`] + `i16` sink write) is
 //! shared with every mode by the [`AudioEngine`], which [`StandardDemod`]
-//! attaches here via [`DemodCore::demodulator`]. The API's S-meter hangs off
-//! that same [`RawSampleTap`] (see `api/src/meter.rs`).
+//! attaches here via [`DemodCore::demodulator`].
 //!
 //! The USB/LSB distinction is carried by which post-NCO arm is kept: a
 //! positive-frequency NCO moves the upper sideband to baseband on the
-//! in-phase arm and a negative one moves the lower sideband to baseband — the
-//! same trick the reference uses (keep the in-phase arm for USB; conjugate it
-//! to reach LSB). For LSB we synthesize that quadrature arm with a 90°
-//! (Hilbert) phase-shifter on the in-phase arm, which is valid for both real
-//! and complex baseband.
+//! in-phase arm and a negative one moves the lower sideband to baseband.
+//! For LSB we synthesize that quadrature arm with a 90° (Hilbert)
+//! phase-shifter on the in-phase arm, which is valid for both real and
+//! complex baseband.
 //!
 //! The channel-select FIR is the anti-alias filter of a [`PolyphaseDecimator`],
 //! so only ≈ 1/M of its taps touch each sample (~M× fewer MACs, M = the
@@ -74,9 +72,9 @@ impl SsbCore {
         let taps = if bandwidth_hz <= 4_000 { 257 } else { 129 };
         let h = F32Fir::lowpass(taps, bw_ratio, KAISER_BETA).taps().to_vec();
         let lp = PolyphaseDecimator::new(&h, m);
-        // Quadrature (Hilbert) 90° phase shifter. 257 taps is well within the
-        // voice band (this is only exercised for LSB, where its output is used);
-        // the old 2× (514) was pure overhead.
+        // Quadrature (Hilbert) 90° phase shifter. 257 taps is well within
+        // the voice band (this is only exercised for LSB, where its
+        // output is used); a wider window is pure overhead.
         let hilb_taps = taps.max(257);
         let hilb = F32FirState::new(&F32Fir::hilbert(hilb_taps, KAISER_BETA));
         let nco = Nco::new(2.0 * std::f64::consts::PI * source_center_hz / source_rate_hz as f64);

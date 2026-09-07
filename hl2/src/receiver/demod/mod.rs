@@ -45,10 +45,9 @@ use num_complex::Complex;
 
 use super::sink::AudioSink;
 
-// Re-export the mode cores + shared DSP + the shared types so the module-root
-// paths (`hl2::receiver::demod::{SsbCore, AmCore, DigitalCore, F32Fir,
-// Nco, …}` and `super::demod::RawSampleTap` from ft8/ft4/js8) keep resolving
-// from the new organisation.
+// Re-export the mode cores + shared DSP + the shared types so module-root
+// paths like `hl2::receiver::demod::{SsbCore, AmCore, DigitalCore, F32Fir,
+// Nco, …}` (and `super::demod::RawSampleTap` from ft8/ft4/js8) resolve.
 pub use am::AmCore;
 pub use core::{DemodCore, StandardDemod};
 pub use digital::DigitalCore;
@@ -57,11 +56,8 @@ pub use engine::AudioEngine;
 pub use fm::FmCore;
 pub use ssb::SsbCore;
 
-/// Legacy names for the three built-in demodulators, now expressed as the
-/// generic [`StandardDemod`] over each mode's [`DemodCore`]. Kept so existing
-/// docs/references that name `SsbDemodulator` / `AmDemodulator` /
-/// `DigitalDemodulator` keep resolving to the real (full-tail) demod type
-/// instead of the bare core.
+/// Per-mode aliases for [`StandardDemod`]: the full-tail demodulator type
+/// for each mode's core.
 pub type SsbDemodulator = StandardDemod<SsbCore>;
 pub type AmDemodulator = StandardDemod<AmCore>;
 pub type DigitalDemodulator = StandardDemod<DigitalCore>;
@@ -87,10 +83,7 @@ impl std::error::Error for RateTooClose {}
 /// Demodulator error.
 pub type DemodError = Box<dyn std::error::Error + Send + Sync>;
 
-/// A block of complex I/Q baseband samples: `Complex<f32>` pairs.
-///
-/// The name is unchanged and the layout is the wire-side `Vec<Complex<f32>>`;
-/// a new-mode `DemodCore` impl consumes this as-is.
+/// A block of complex I/Q baseband samples: `Vec<Complex<f32>>`.
 pub type IqBlock = Vec<Complex<f32>>;
 
 use crate::receiver::{AudioConfig, Mode, Sideband};
@@ -135,12 +128,10 @@ pub fn make_demod(
     )
 }
 
-/// [`make_demod`] plus an optional pre-AGC [`RawSampleTap`] (`tap`). This is
-/// the seam the FT8/JS8/FT4 slot decoders hang off: the demod still emits
-/// AGC'd `i16` to the `CH_AUDIO` sink (the operator hears the same audio
-/// being decoded), while `tap` copies the untouched pre-AGC `f32` stream to
-/// the decoder. The API's per-receiver signal-level S-meter also hangs off
-/// `tap` (see `api/src/meter.rs`) — the engine needs no meter of its own.
+/// [`make_demod`] plus an optional pre-AGC [`RawSampleTap`] (`tap`). The
+/// tap is the seam the FT8/JS8/FT4 slot decoders attach to: the demod still
+/// emits AGC'd `i16` to the `CH_AUDIO` sink, while `tap` copies the
+/// untouched pre-AGC `f32` stream to the decoder.
 pub fn make_demod_tap(
     mode: Mode,
     source_rate_hz: u32,
@@ -187,15 +178,9 @@ pub fn make_demod_tap(
 }
 
 /// A demodulator: complex I/Q in, `i16` mono audio out, to a given sink.
-///
-/// This trait is **stable** — `VirtualReceiver` holds a
-/// `Box<dyn Demodulator>` and feeds it one block at a time — and the only
-/// thing a new mode does not get for free is a single `DemodCore::demodulator`
-/// call (which [`make_demod_tap`] invokes for it).
-///
-/// `Send` so a [`crate::receiver::VirtualReceiver`] (which owns a
-/// `Box<dyn Demodulator>`) can be handed to a dedicated demod thread — the
-/// pump and the demod are decoupled via the
+/// Held as `Box<dyn Demodulator>` by [`crate::receiver::VirtualReceiver`],
+/// fed one block at a time. `Send` so a receiver can be handed to a demod
+/// thread — the pump and the demod are decoupled via the
 /// [`crate::receiver::BasebandRing`].
 pub trait Demodulator: Send {
     /// Demodulate one complex I/Q block into `sink`; returns audio frames

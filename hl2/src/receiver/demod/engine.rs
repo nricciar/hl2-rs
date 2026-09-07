@@ -1,24 +1,15 @@
-//! The shared **audio tail**: everything that a demodulated sample runs through
+//! The shared **audio tail**: everything a demodulated sample runs through
 //! after the mode-specific DSP — the pre-AGC [`RawSampleTap`] seam, the
-//! AC/DC-block + RMS-targeted AGC normalisation, and the `i16` sink write.
+//! DC-block + RMS-targeted AGC normalisation, and the `i16` sink write.
 //!
-//! Before this module this logic was copy-pasted into `ssb.rs`, `am.rs` and
-//! `digital.rs` (identical `emit` / `flush_full_blocks` / `flush_audio` bodies,
-//! identical `agc_gain` / `audio_buf` / `tap` fields). It is identical for every
-//! mode — the only per-mode difference in the whole pipeline is the single
-//! sample the core produces per complex input, and that now flows in through
-//! [`AudioEngine::push`].
-//!
-//! A [`DemodCore`](super::core::DemodCore) decides *what* the decimated real
-//! sample is (USB arm / LSB Hilbert / envelope / phase rate / …); the
-//! [`AudioEngine`] decides how it is normalised and delivered. [`StandardDemod`]
-//! ([`super::core`]) composes the two into a full [`Demodulator`].
+//! A [`DemodCore`](super::core::DemodCore) decides *what* the decimated
+//! sample is (USB arm / LSB Hilbert / envelope / phase rate / …); this
+//! [`AudioEngine`] decides how it is normalised and delivered.
+//! [`StandardDemod`](super::core::StandardDemod) composes the two into a
+//! full [`Demodulator`](super::Demodulator).
 //!
 //! The normalisation itself — DC block, slow RMS-targeted AGC, gain — is in
-//! [`normalize_to_i16_with_agc`], unchanged from the old per-mode copies (see
-//! PROTOCOL.md §16.3). The signal-level S-meter is **not** part of this tail:
-//! it hangs off the pre-AGC [`RawSampleTap`] seam from the API layer (see
-//! `api/src/meter.rs`), so the `hl2` crate keeps no level bookkeeping.
+//! [`normalize_to_i16_with_agc`].
 
 use std::sync::atomic::AtomicUsize;
 
@@ -27,12 +18,10 @@ use crate::receiver::AudioConfig;
 use crate::receiver::sink::AudioSink;
 
 /// Minimum decimated samples to accumulate before a block is normalised and
-/// emitted. A single wire chunk (63 complex samples at a 192 kHz → 4.8 kHz
+/// emitted. A single wire chunk (63 complex samples at 192 kHz → 4.8 kHz
 /// decimation) yields only ≈ 2 samples, far too few for a meaningful
-/// DC-block / AGC target (a 1-sample mean subtracts `x` from itself → the
-/// output is always 0, which is what made SSB "silence"). ~50 ms of 4.8 kHz
-/// audio (240 samples) is the smallest block that gives stable statistics
-/// without noticeable latency.
+/// DC-block / AGC target (a 1-sample mean cancels itself). ~50 ms of 4.8 kHz
+/// audio (240 samples) gives stable statistics without noticeable latency.
 const AUDIO_EMIN: usize = 240;
 
 /// Gated (HL2_DEBUG) instrument counter so we don't flood on every emit.
@@ -49,19 +38,16 @@ pub struct AudioEngine {
     /// it reaches `AUDIO_EMIN`.
     audio_buf: Vec<f32>,
     /// Optional pre-AGC raw-sample tap (e.g. FT8 decode). `Arc` so the API
-    /// layer can keep one handle for the demod and hand a clone to the decode
-    /// task. The API's signal-level meter hangs off this same seam too — as
-    /// another `RawSampleTap` (see `api/src/meter.rs`) — so the tail needs no
-    /// meter of its own.
+    /// layer keeps one handle for the demod and hands a clone to the decode
+    /// task.
     tap: Option<std::sync::Arc<dyn RawSampleTap>>,
     /// A short label for the HL2_DEBUG gated emit trace (`"ssb"` / `"am"` / …).
     mode_label: &'static str,
 }
 
 impl AudioEngine {
-    /// Build an empty tail at `rate_hz` / `gain_db`. The default AGC seed
-    /// (1000.0) reproduces the old per-mode initial gain so the first few emits
-    /// settle identically to before.
+    /// Build an empty tail at `rate_hz` / `gain_db`, AGC gain seeded at
+    /// 1000.0 (updated on the first emit).
     pub fn new(rate_hz: u32, gain_db: f32, mode_label: &'static str) -> Self {
         Self {
             audio_cfg: AudioConfig { rate_hz, gain_db },
@@ -128,8 +114,8 @@ impl AudioEngine {
         slice: &[f32],
         sink: &mut dyn AudioSink,
     ) -> Result<usize, super::DemodError> {
-        // Pre-AGC raw-sample tap (FT8/JS8/FT4 decode, and the API's S-meter):
-        // the untouched decimated `f32` stream, in arrival order.
+        // Pre-AGC raw-sample tap (FT8/JS8/FT4 decode): the untouched
+        // decimated `f32` stream, in arrival order.
         if let Some(tap) = self.tap.as_ref() {
             tap.append(slice);
         }
@@ -158,18 +144,13 @@ impl AudioEngine {
 /// units (the channel-filter output — typically `[-1, +1]` for a unit
 /// amplitude input). This function applies:
 ///
-///   1. **DC blocking** — subtract the block mean so the ADI chain's constant
-///      I/Q offset (often ~0.3 on the in-phase arm) doesn't dominate the
-///      output level for USB (which passes the in-phase arm).
-///   2. **Slow RMS-targeted AGC** (replaces the old per-block peak normaliser).
-///      The AGC gain is a **natural→i16 scale factor**: it maps the block's
-///      RMS to the target output RMS. The target is
-///      `TARGET_RMS_I16 = 0.1 × 32767` (≈ −20 dBFS). The AGC gain is
-///      smoothed with a one-pole filter: fast attack (alpha=0.4) when the
-///      gain needs to increase, slow release (alpha=0.08) when it decreases
-///      — classic SSB AGC asymmetry that minimises "pumping" on voice gaps.
-///      The gain is clamped to `[1.0, 1e7]` so a silent input doesn't
-///      drive the gain to 1e9 and a saturated one doesn't crush to 0.
+///   1. **DC blocking** — subtract the block mean so a constant I/Q offset
+///      doesn't dominate the output level.
+///   2. **Slow RMS-targeted AGC**. The AGC gain is a **natural→i16 scale
+///      factor** mapping the block's RMS to the target
+///      `TARGET_RMS_I16 = 0.1 × 32767` (≈ −20 dBFS). It is smoothed with a
+///      one-pole filter — fast attack (alpha=0.4), slow release (alpha=0.08) —
+///      to minimise "pumping" on voice gaps, and clamped to `[1.0, 1e7]`.
 ///   3. the user's `gain_db` (applied on top of the AGC) — a knob to add
 ///      headroom or trim overall level.
 ///
@@ -198,14 +179,10 @@ fn normalize_to_i16_with_agc(
     let rms = (rms_sq / n as f32).sqrt();
     // 2. AGC. Target output RMS in i16 units.
     //
-    // The HL2 EP6 baseband is a full-Nyquist complex stream in which SSB voice
-    // occupies only ~3 kHz of 96 kHz — so the in-band voice RMS relative to
-    // full-scale is typically ~1e-5–1e-4 (≈ −100…−80 dBFS). Reaching the
-    // −20 dBFS target therefore requires ~1e6–1e8× of gain, well beyond a
-    // "reasonable" ceiling. The reference gets this gain from the
-    // *hardware* RXA AGC before digitisation (~80 dB); we do it
-    // digitally, so the ceiling must cover it. 1e7 (140 dB) lands the
-    // measured in-band signal right at target.
+    // The HL2 EP6 baseband is full-Nyquist, with in-band voice RMS typically
+    // ~1e-5–1e-4 (≈ −100…−80 dBFS). Reaching the −20 dBFS target needs
+    // ~1e6–1e8× of gain, so the clamp ceiling (1e7 ≈ 140 dB) must cover
+    // that.
     const TARGET_RMS_I16: f32 = 0.1 * 32_767.0;
     let target_scale = (TARGET_RMS_I16 / rms.max(1e-6)).clamp(1.0, 10_000_000.0);
     let alpha = if target_scale > *agc_gain { 0.4 } else { 0.08 };

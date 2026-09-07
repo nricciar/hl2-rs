@@ -62,16 +62,13 @@ impl DigitalCore {
     ) -> Self {
         let m = source_rate_hz as usize / audio.rate_hz as usize;
         let bw_ratio = (2_600.0f64 / source_rate_hz as f64).clamp(1e-3, 0.4);
-        // 511 taps (→ 513 odd) on the 12 kHz digital path: with Kaiser β = 12
-        // this puts the out-of-band rejection floor at ~107 dB across the
-        // 3.8 – 6.0 kHz band — well past the 80 dB floor the
-        // `ft8_js8_path_rejects_out_of_passband_signal_by_at_least_80_db`
-        // regression guards, and gives operator-visible headroom for a
-        // stronger adjacent-channel signal. 257 taps was borderline (worst
-        // case ~82 dB) because a 4 kHz offset lands right in the *transition
-        // band* of a 257-tap / 2.6 kHz / 192 kHz filter, where sidelobe peak
-        // height is β- and tap-count-sensitive. Cost is modest: 513 taps ÷ 16
-        // polyphase ≈ 32 MACs per input sample.
+        // 511 taps on the 12 kHz digital path: with Kaiser β = 12 this gives
+        // ~107 dB out-of-band rejection across the 3.8–6.0 kHz band — past
+        // the 80 dB floor the rejection test guards and clear headroom for a
+        // strong adjacent-channel signal. (A 4 kHz offset lands in the
+        // transition band of a 257-tap filter, where rejection is only
+        // ~82 dB.) Cost is modest: 513 taps ÷ 16 polyphase ≈ 32 MACs per
+        // input sample.
         let h = F32Fir::lowpass(511, bw_ratio, KAISER_BETA).taps().to_vec();
         let lp = PolyphaseDecimator::new(&h, m);
         let nco = Nco::new(2.0 * std::f64::consts::PI * source_center_hz / source_rate_hz as f64);

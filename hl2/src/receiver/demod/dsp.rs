@@ -1,34 +1,21 @@
-//! Hand-rolled DSP primitives shared by every virtual-receiver mode.
-//!
-//! A complex phase-recurrence [`Nco`], a Kaiser-windowed windowed-sinc
+//! Hand-rolled DSP primitives shared by every virtual-receiver mode: a
+//! complex phase-recurrence [`Nco`], a Kaiser-windowed windowed-sinc
 //! low-pass / Hilbert FIR ([`F32Fir`] + its streaming [`F32FirState`]), and
-//! the [`PolyphaseDecimator`] that turns the full-rate anti-alias FIR into an
-//! ≈`1/M`-taps-per-sample decimator. All three are consumed by both the SSB
+//! the [`PolyphaseDecimator`] that turns the full-rate anti-alias FIR into
+//! an ≈`1/M`-taps-per-sample decimator. All three are consumed by the SSB
 //! voice path ([`super::ssb`]) and the 12 kHz digital path
-//! ([`super::digital`]) — the SSB/FT8/JS8/FT4 distinction is carried by how
-//! they are composed, not by the DSP itself.
-//!
-//! No external DSP crate: `KAISER_BETA` and the windowed-sinc design below are
-//! the channel-select / anti-alias filter.
-//!
-//! DSP is hand-rolled (windowed-sinc FIR, Hilbert, polyphase decimator); no
-//! external DSP crate.
+//! ([`super::digital`]) — no external DSP crate.
 
 use num_complex::Complex;
 
-/// Kaiser-window shape parameter β used by the SSB/digital channel-select
-/// and Hilbert windows.
+/// Kaiser-window shape parameter β for the channel-select and Hilbert
+/// windows.
 ///
-/// The Kaiser window is the standard choice for windowed-sinc decimation
-/// filters in SDR stack clients: unlike Hann/Blackman
-/// its stopband attenuation is an *explicit design parameter* — β directly
-/// trades off sidelobe decay against transition width. β = 12 gives ≈ 100-110
-/// dB stopband (the rule of thumb `A ≈ 10·β − 18` for β > 5), which at our
-/// 511-tap / 2.6 kHz @ 192 kHz digital-path design rejects a 4-6 kHz
-/// offset by ≥ 107 dB (a Hann window — first sidelobe fixed at ≈ −31 dB
-/// with only 18 dB/octave sidelobe decay — reaches only ~55-60 dB at that
-/// offset, leaving off-center digital signals, e.g. adjacent-channel FT8
-/// on a USB center, clearly audible).
+/// Unlike Hann/Blackman, the Kaiser window's stopband attenuation is an
+/// explicit design parameter — β trades sidelobe decay against transition
+/// width. β = 12 gives ≈ 100–110 dB stopband (rule of thumb `A ≈ 10·β − 18`
+/// for β > 5), which at our 511-tap / 2.6 kHz @ 192 kHz digital design
+/// rejects a 4–6 kHz offset by ≥ 107 dB.
 pub const KAISER_BETA: f64 = 12.0;
 
 /// Kaiser window (`w[i] = I₀(β·√(1−x²))/I₀(β)`, `x = (i−c)/c ∈ [−1,1]`,
@@ -59,11 +46,9 @@ fn bessel_i0(x: f64) -> f64 {
     sum
 }
 
-/// A complex oscillator (`× e^(−j·φ)`) advanced by phase recurrence.
-///
-/// The old implementation recomputed `cos(phase)` / `sin(phase)` (two
-/// transcendentals) for every 96 kHz sample. Instead the state `(c, s)`
-/// holds `(cos φ, sin φ)` in `f64` and each step is the 2-D rotation
+/// A complex oscillator (`× e^(−j·φ)`) advanced by phase recurrence — no
+/// `cos`/`sin` in the loop. The state `(c, s)` holds `(cos φ, sin φ)` in
+/// `f64` and each step is the 2-D rotation
 ///
 /// ```text
 /// z' = z · e^(−j·φ)      (re·c + im·s,  im·c − re·s)
@@ -71,12 +56,10 @@ fn bessel_i0(x: f64) -> f64 {
 /// s' =  s·cos_step + c·sin_step
 /// ```
 ///
-/// (two FMA-pairs, no trig in the loop). This matches the old per-sample
-/// `(−nco_phase)` convention exactly: sample `n` is mixed at
-/// `φ = n·step` (`z·e^(−j·n·step)`), then the state advances. Over a block
-/// of up to a few thousand samples the drift of `c² + s²` from 1 is a
-/// 2nd-order O(n·ε) effect (~1e-13 per 10⁴ samples in f64) — far below
-/// `f32` sample precision, so no periodic renormalisation is needed.
+/// Sample `n` is mixed at `φ = n·step`, then the state advances. Over the
+/// few-thousand samples of a block the drift of `c² + s²` from 1 is ~1e-13
+/// in f64 — far below `f32` sample precision, so no renormalisation is
+/// needed.
 ///
 /// `step == 0.0` (a baseband source) short-circuits to the identity.
 #[derive(Debug, Clone)]
@@ -121,11 +104,9 @@ impl Nco {
 /// linear phase (group delay `(n−1)/2` samples) and the response
 /// `H(0) = 1`, `H(Nyquist) ≈ 0`. Applied as `y[k] = Σ_j h[j]·x[k − j]`.
 ///
-/// After the NCO down-conversion, this is the channel-select filter
-/// for SSB: it passes the voice band `[−BW, +BW]` around DC and rejects
-/// out-of-band signals and the image. The USB/LSB distinction itself is
-/// carried by the NCO direction (the reference does the same: it conjugates
-/// the in-phase arm for LSB). The windowing is Kaiser (see
+/// After the NCO down-conversion this is the SSB channel-select filter:
+/// it passes the voice band `[−BW, +BW]` around DC and rejects out-of-band
+/// signals and the image. Windowed with the Kaiser window (see
 /// [`KAISER_BETA`]).
 #[derive(Debug, Clone)]
 pub struct F32Fir {
@@ -238,14 +219,11 @@ impl F32Fir {
 /// A FIR filter with a **fixed-length, pre-allocated** history ring, tuned
 /// for streaming single-sample convolution (the SSB hot loop).
 ///
-/// The history ring holds the last `T` input samples, newest at
-/// `hist[(pos − 1) % T]`. `convolve()` computes
+/// The history ring holds the last `T` input samples. `convolve()` computes
 /// `Σ_j taps[j]·x[n−j]` (terms with `n−j < 0` zero-padded, identical to
 /// [`F32Fir::apply`] with the full history) in a single contiguous
-/// backwards pass over the ring + the just-pushed sample, in O(T) with no
-/// per-tap `Vec` reallocation, `drain`, or modulo (only one per ring step).
-/// Compared with the old `Vec::push` + `Vec::drain` + `apply` path this
-/// avoids two heap operations and one amortised `memmove` per sample.
+/// backwards pass over the ring + the just-pushed sample — O(T), no
+/// per-tap reallocation or `vec` drain.
 #[derive(Debug, Clone)]
 pub struct F32FirState {
     taps: Vec<f32>,
@@ -295,7 +273,7 @@ impl F32FirState {
     /// `x` is appended to the history (oldest dropped on overflow). The
     /// result is the causal convolution `Σ_j taps[j]·x[n − j]`, where `n` is
     /// the total number of samples pushed and terms with `n − j < 0` are
-    /// dropped — byte-identical to the old `apply(history, len−1)` path.
+    /// dropped — byte-identical to the `apply(history, len−1)` path.
     #[inline]
     pub fn convolve(&mut self, x: f32) -> f32 {
         let t = self.taps.len();
@@ -335,8 +313,7 @@ impl F32FirState {
 /// **Polyphase** low-pass + decimator: the anti-alias / decimate stage.
 ///
 /// Produces exactly the same samples as "full-rate low-pass FIR followed by
-/// a sub-sampler" (the old `F32FirState` + `Decimator` pair, without the
-/// single-pole smoothing), at ≈ `1/M ×` the tap-multiplies.
+/// a sub-sampler", at ≈ `1/M ×` the tap-multiplies.
 ///
 /// Output alignment: the `e`-th emitted sample (0-indexed) equals the
 /// full-rate convolution's output at input index `e·M + (M−1)` — i.e. the
@@ -360,17 +337,16 @@ impl F32FirState {
 ///   `H_p[j] = h[p + j·M]`,  `j = 0, 1, …`
 ///
 /// in newest-first order (`H_p[0] = h[p]` multiplies the newest substream
-/// sample). The `M` branches are exactly the `M` phase components of the
-/// decimated convolution; summing their step-`k` outputs recovers `y[k]`.
-/// Verified to ~10⁻¹⁶ against a naive full-rate reference by
+/// sample). The `M` branches are the `M` phase components of the decimated
+/// convolution; summing their step-`k` outputs recovers `y[k]`.
+/// Checked against a naive full-rate reference by
 /// `polyphase_matches_fullfir_decimate` below, for arbitrary (random) `h`.
 ///
 /// ## Cost
 ///
-/// Per input sample: one branch convolve of `⌈(N)/M⌉ ≈ N/M` taps (vs `N`
-/// for the full-rate path) — ~`M×` fewer MACs — and at each group boundary:
-/// `M−1` additions. The windowed-sinc `h` *is* the anti-alias design; the
-/// old single-pole smoothing stage is unnecessary.
+/// Per input sample: one branch convolve of `⌈N/M⌉` taps (vs `N` for the
+/// full-rate path) — ~`M×` fewer MACs — and at each group boundary `M−1`
+/// additions. The windowed-sinc `h` *is* the anti-alias filter.
 #[derive(Debug, Clone)]
 pub struct PolyphaseDecimator {
     /// Branch `p` (index `p` in `0..M`): taps `h[p], h[p+M], …`.
@@ -514,11 +490,10 @@ mod tests {
         }
     }
 
-    /// `F32FirState::convolve` (the new fixed-ring streaming path) must match
-    /// `F32Fir::apply` over a growing full-history vector (the old path), both
-    /// during the zero-pad onset and in steady state. Catches any ring-index
-    /// or onset regression that the tone tests (which only check peak level)
-    /// would miss.
+    /// `F32FirState::convolve` must match `F32Fir::apply` over a full
+    /// history vector, both during the zero-pad onset and in steady state.
+    /// Catches any ring-index or onset regression that the tone tests (which
+    /// only check peak level) would miss.
     #[test]
     fn firstate_matches_reference_apply() {
         let fir = F32Fir::lowpass(31, 0.03, KAISER_BETA);

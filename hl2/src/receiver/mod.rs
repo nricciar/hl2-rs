@@ -1,8 +1,7 @@
 //! # Virtual receiver (audio channel demod)
 //!
-//! This module is the software audio receiver for the HL2: it takes the
-//! radio's per-slot **complex I/Q baseband** and demodulates it to **audio**
-//! (`i16` mono), for SSB (USB/LSB) today and (AM, FM, FT8, CW…) later.
+//! The software audio receiver for the HL2: takes the radio's per-slot
+//! **complex I/Q baseband** and demodulates it to **audio** (`i16` mono).
 //!
 //! ## Pipeline
 //!
@@ -14,11 +13,9 @@
 //!
 //! The three ends are separate traits so each can be swapped independently:
 //!
-//! * `BasebandSource` — where the I/Q comes from (socket, file, synth). The
-//!   production socket-backed source is a follow-up (PROTOCOL.md §16).
-//! * `Demodulator` — the mode DSP. `SsbDemodulator` is built-in; new modes
-//!   are added by implementing this trait and extending [`Mode`] /
-//!   [`make_demod`].
+//! * `BasebandSource` — where the I/Q comes from (socket, file, synth).
+//! * `Demodulator` — the mode DSP. New modes implement [`DemodCore`] and are
+//!   added by extending [`Mode`] / [`make_demod`].
 //! * `AudioSink` — where the audio goes. `VecSink` (capture) and
 //!   `AlsaSink` (playback, `alsa` feature) are built-in.
 //!
@@ -26,11 +23,9 @@
 //!
 //! ## Layering note
 //!
-//! This is DSP, not wire protocol, so unlike the `protocol` module it may be
-//! used from `hl2-api` / `hl2-ui` without touching the byte layout. The
-//! layering rule still applies: nothing here writes or reads protocol bytes
-//! — the incoming `BasebandSource` is the only seam that meets the wire
-//! (and it is abstract, not socket-specific).
+//! This is DSP, not wire protocol: it may be used from `hl2-api` / `hl2-ui`
+//! without touching the byte layout. The only seam that meets the wire is
+//! the abstract (not socket-specific) `BasebandSource`.
 
 pub mod audio_scale;
 pub mod auto;
@@ -95,9 +90,9 @@ pub enum Sideband {
 
 /// The modulation / decode mode of a virtual receiver.
 ///
-/// Adding a mode is: extend this enum, add a `Demodulator`, and a branch in
-/// [`make_demod`]. `SsbWide` is a placeholder for "pass the wideband complex
-/// through unfiltered" (FT8/other digital work sits here — see the
+/// Adding a mode: extend this enum, add a [`Demodulator`] impl, and a branch
+/// in [`make_demod`]. `SsbWide` is a placeholder for "pass the wideband
+/// complex through unfiltered" (digital work sits here — see the
 /// `BasebandTap` idea in PROTOCOL.md §16.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -117,31 +112,16 @@ pub enum Mode {
     Ssb(Sideband),
     /// Wideband complex pass-through (digital-mode placeholder).
     SsbWide,
-    /// FT8: USB SSB audio at 12 kHz, plus an external FT8 decode pass (in
-    /// `hl2-api`, via [`hl2::receiver::Ft8Decoder`]). The demodulator itself
-    /// is the SSB/USB pipeline at a 12 kHz output rate; `Ft8` is a *mode
-    /// flag* that tells the API layer (a) to drive the demod at 12 kHz, and
-    /// (b) to spin up a wall-clock-aligned 15-second slot decode task.
-    ///
-    /// See the FT8 section in PROTOCOL.md for the slot / wall-clock
-    /// alignment details, and [`hl2::receiver::Ft8Decoder`] for the
-    /// decoder itself.
+    /// FT8: USB SSB audio at 12 kHz, decoded externally in `hl2-api`
+    /// ([`hl2::receiver::Ft8Decoder`]) on a wall-clock-aligned 15 s slot.
+    /// Mode is SSB/USB at a 12 kHz output rate; the flag tells the API layer
+    /// what rate to drive and when to decode. Slot details in PROTOCOL.md.
     Ft8,
-    /// JS8Call (Mode A): USB SSB audio at 12 kHz, plus an external
-    /// JS8 decode pass (in `hl2-api`, via
-    /// [`Js8Decoder`]). The demodulator is the same USB/12 kHz pipeline as
-    /// [`Mode::Ft8`]; `Js8` is a *mode flag* that tells the API layer to
-    /// spawn a wall-clock-aligned 15-second slot decode task. See the
-    /// JS8Call section in PROTOCOL.md and [`Js8Decoder`] for details.
+    /// JS8Call (Mode A): same USB/12 kHz pipeline as [`Mode::Ft8`], decoded
+    /// in `hl2-api` ([`Js8Decoder`]) on a 15 s slot.
     Js8,
-    /// FT4: USB SSB audio at 12 kHz, plus an external FT4 decode pass (in
-    /// `hl2-api`, via [`Ft4Decoder`]). The demodulator is the same USB/12 kHz
-    /// pipeline as [`Mode::Ft8`]; `Ft4` is a *mode flag* that tells the API
-    /// layer (a) to drive the demod at 12 kHz, and (b) to spin up a
-    /// wall-clock-aligned 7.5-second slot decode task.
-    ///
-    /// See the FT4 section in PROTOCOL.md for the slot / wall-clock
-    /// alignment details, and [`Ft4Decoder`] for the decoder itself.
+    /// FT4: same USB/12 kHz pipeline as [`Mode::Ft8`], decoded in `hl2-api`
+    /// ([`Ft4Decoder`]) on a 7.5 s slot.
     Ft4,
 }
 
@@ -215,12 +195,8 @@ pub struct ReceiverConfig {
     pub bandwidth_hz: Option<u32>,
     /// Audio output config.
     pub audio: AudioConfig,
-    /// Optional pre-AGC raw-sample tap (FT8/JS8/FT4 decode — see
-    /// [`RawSampleTap`]). `None` for plain SSB / AM / FM. The S-meter is
-    /// *not* part of this seam — it is computed in the API layer from the
-    /// displayed slot's band spectrum (see `api/src/meter.rs` and
-    /// PROTOCOL.md §16.3e), so this crate carries no level bookkeeping of
-    /// its own.
+    /// Optional pre-AGC raw-sample tap for FT8/JS8/FT4 decode (see
+    /// [`RawSampleTap`]). `None` for plain SSB / AM / FM.
     pub tap: Option<std::sync::Arc<dyn RawSampleTap>>,
 }
 

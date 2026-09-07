@@ -1,7 +1,6 @@
 //! High-level Hermes-Lite 2 client.
 //!
-//! The design separates the roles that previously lived in one long-lived
-//! struct:
+//! Two roles are split across two types:
 //!
 //! * **`Hl2`** — an *owned, clonable* control handle for one device. It wraps
 //!   the single shared UDP socket via `Arc`, so many websocket clients can

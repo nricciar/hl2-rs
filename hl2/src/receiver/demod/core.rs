@@ -3,29 +3,22 @@
 //!
 //! A core owns only the mode-specific per-sample DSP — NCO multiplication,
 //! sideband/envelope/phase discrimination, the polyphase anti-alias/decimate
-//! stage. It yields **zero, one, or many** decimated `f32` samples per
-//! complex input and must remember at most one pending sample between calls
-//! (drained by [`flush`](Self::flush)). It owns **none** of the audio tail:
-//! the DC-block + RMS-targeted AGC + pre-AGC [`RawSampleTap`] +
-//! `i16` sink write — that lives in [`AudioEngine`](super::engine::AudioEngine)
-//! and is shared with every mode by [`StandardDemod`] (this module).
+//! stage. It yields zero, one, or many decimated `f32` samples per complex
+//! input and must remember at most one pending sample between calls (drained
+//! by [`flush`](Self::flush)). It owns **none** of the audio tail: the
+//! DC-block + RMS-targeted AGC + pre-AGC [`RawSampleTap`] + `i16` sink write
+//! — that lives in [`AudioEngine`](super::engine::AudioEngine) and is shared
+//! by [`StandardDemod`] (this module).
 //!
 //! ```text
 //! complex I/Q ──► DemodCore::process ──► 0..=N f32s per block ──► AudioEngine ──► i16 → sink
 //!                     (mode DSP)                                    (AGC, tap)
 //! ```
 //!
-//! This is the extension point. To add FM/NFM/CW: implement `DemodCore`
-//! (≤ 30 lines — reuse [`Nco`](super::dsp::Nco) +
-//! [`PolyphaseDecimator`](super::dsp::PolyphaseDecimator) + a mode-specific
-//! discriminator), then add the `Mode` enum variant + a registry row
-//! (`demod/mod.rs`). Nothing else changes.
-//!
-//! The default [`demodulator`](Self::demodulator) builds the audio tail (with
-//! the engine's default AGC seed of 1000.0, matching the old per-mode initial
-//! gains) and returns a `Box<dyn Demodulator>` — so `VirtualReceiver`,
-//! `hl2-api`, the CLI and the existing unit tests continue to consume the
-//! modes through the stable `Box<dyn Demodulator>` API.
+//! To add a mode: implement `DemodCore` (≤ 30 lines — reuse
+//! [`Nco`](super::dsp::Nco) + [`PolyphaseDecimator`](super::dsp::PolyphaseDecimator)
+//! + a mode-specific discriminator), add the `Mode` enum variant and a
+//! dispatch arm in `demod/mod.rs`, and that's the whole change.
 
 use num_complex::Complex;
 
@@ -68,9 +61,9 @@ pub trait DemodCore: Send + 'static {
 
     /// Compose this core with the shared audio tail into a full [`Demodulator`].
     ///
-    /// `audio` carries the decimated output rate + playback gain; `tap` is the
-    /// optional pre-AGC raw-sample seam (the API's FT8/JS8/FT4 decoders *and*
-    /// its S-meter both hang off it). This is the **one call site** that turns
+    /// `audio` carries the decimated output rate + playback gain; `tap` is
+    /// the optional pre-AGC raw-sample seam (the FT8/JS8/FT4 decoders hang
+    /// off it in the same frame). This is the **one call site** that turns
     /// a mode's core into a ready-to-use demodulator; new modes do not need a
     /// separate `Demodulator` impl.
     fn demodulator(
@@ -89,11 +82,9 @@ pub trait DemodCore: Send + 'static {
     }
 }
 
-/// The generic "core + engine → full [`Demodulator`]" wrapper. This is the
-/// *only* `Demodulator` impl in the crate (the three concrete per-mode impls
-/// — in `ssb.rs` / `am.rs` / `digital.rs` — are gone after the refactor).
-/// New modes do not need a new `Demodulator` impl — they need a new
-/// `DemodCore` impl and a single line in the dispatch.
+/// The "core + shared audio tail → full [`Demodulator`]" wrapper. This is
+/// the only `Demodulator` impl in the crate — new modes add a `DemodCore`
+/// impl and a single dispatch arm, not a new `Demodulator` impl.
 pub struct StandardDemod<C: DemodCore> {
     /// The mode-specific DSP.
     core: C,
@@ -121,9 +112,9 @@ impl<C: DemodCore> Demodulator for StandardDemod<C> {
     fn flush_audio(&mut self, sink: &mut dyn AudioSink) -> Result<usize, DemodError> {
         // Two steps: drain any pending sample the core still has (the AM
         // envelope path may have one), then drain the audio tail's residual
-        // partial block. Order matters: `flush()`'s pending sample belongs to
-        // the current block, so it is normalised in the same `emit` window as
-        // the tail's residue (matching the old `flush_residue` semantics).
+        // partial block. Order matters: the core's pending sample belongs to
+        // the current block, so it is normalised in the same `emit` window
+        // as the tail's residue.
         let mut written = 0usize;
         if let Some(out) = self.core.flush() {
             self.engine.push(out);

@@ -12,36 +12,21 @@
 //!
 //! The audio tail (AGC DC-block + RMS target, pre-AGC [`RawSampleTap`],
 //! `i16` sink write) is shared with every mode via the [`AudioEngine`];
-//! this module implements only the envelope-detection core. The API's
-//! S-meter hangs off that same [`RawSampleTap`] (see `api/src/meter.rs`).
+//! this module implements only the envelope-detection core.
 //!
 //! ## Why envelope detection (not "keep the in-phase arm")
 //!
-//! A naive AM demod keeps only the real arm (`post.re`) — the same as the
-//! SSB-USB branch. That works on paper for a *perfect* NCO, but it has two
-//! practical defects that make AM sound worse than LSB, which the operator
-//! can use as a reference:
+//! Keeping only the real arm (`post.re`) — as SSB-USB does — works for a
+//! perfect NCO, but the residual carrier offset `Δf` rotates the baseband
+//! phasor and multiplies the audio by `cos(2π·Δf·t)` — a low-frequency
+//! warble that stutters the AGC ("popping"). Envelope detection
+//! `√(I²+Q²) = (A/2)·[1+m(t)]` is invariant to that rotation, so the offset
+//! drops out.
 //!
-//! 1. **Carrier-offset flutter.** The NCO's actual frequency is never
-//!    exactly the carrier's. Let the residual offset be `Δf` Hz. After the
-//!    NCO the baseband is `(A/2)·[1+m(t)]·e^(−j·2π·Δf·t)` — a slowly
-//!    rotating phasor. Keeping only `post.re` multiplies the audio by
-//!    `cos(2π·Δf·t)`, a low-frequency warble that throttens and steps the
-//!    AGC (the "popping / feedback" symptom). Envelope detection
-//!    `√(I²+Q²) = (A/2)·[1+m(t)]` is **invariant to that rotation**, so
-//!    the offset drops out.
-//! 2. **Carrier DC + modulation envelope.** The full-carrier term `A/2`
-//!    plus the LNA-AGC / antenna-fade envelope ride at baseband DC. The
-//!    AGC's 50 ms block-mean DC-block has to chase a *moving* target
-//!    (real AM's carrier moves with the speech envelope), and each
-//!    block-boundary correction is a step = a pop. The envelope detector
-//!    leaves clean DC (the carrier) plus the AC modulation — the AGC's
-//!    DC-block handles that well because it no longer fights flutter.
-//!
-//! The LSB SSB path "works" by accident: the Hilbert phase-shifter has a
-//! **zero at DC**, so it removes the carrier before the AGC sees it. USB
-//! and AM, both of which keep `post.re`, don't have that null. Envelope
-//! detection gives AM and USB the same carrier rejection.
+//! The full-carrier term `A/2` plus the antenna-fade envelope ride at
+//! baseband DC; the AGC's DC-block then chases a *moving* target on the
+//! raw arm. The envelope detector leaves clean DC (the carrier) plus the AC
+//! modulation, so the DC-block no longer fights flutter.
 //!
 //! `lp_i` and `lp_q` are identical taps at the same decimation factor, so
 //! they emit `Some(·)` on the same input instants. The envelope

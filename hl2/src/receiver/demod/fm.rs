@@ -9,13 +9,9 @@
 //!
 //! ## FM demodulation
 //!
-//! The HL2 EP6 wire delivers **genuine complex I/Q** — the decoder in
-//! [`crate::protocol::data`](hl2/src/protocol/data.rs:185) writes
-//! `Complex::new(i_re, q_im)` from two independent 24-bit big-endian
-//! words, so both arms carry real signal energy in every configuration.
-//! There is no "real (Q≈0)" mode to special-case: a Hilbert 90° phase-
-//! shifter (like the SSB core uses for legacy real-SDR input) is pure
-//! overhead here and is deliberately not used.
+//! The HL2 EP6 wire delivers **genuine complex I/Q**, so both arms carry
+//! signal energy in every configuration — a Hilbert phase-shifter (as the
+//! SSB core uses for real-SDR input) would be pure overhead here.
 //!
 //! After the NCO brings the FM carrier to baseband the sample is
 //! `A·e^{j·φ(t)}`, where the *phase* `φ(t)` carries the audio (the FM
@@ -44,24 +40,19 @@
 //! pair at each group boundary is a true complex sample.
 //!
 //! The **phase-derivative** read — `atan2` → difference → principal-value
-//! wrap — is **naturally amplitude-invariant**: `atan2` returns a phase,
-//! not a magnitude, so a weak carrier and a strong one produce the same
-//! `delta` for the same deviation. No `/|z|` division is required, and
-//! there is no `A²` scaling (the cross-product / quad-mod numerator
-//! `|z|·|z′|·sin Δφ` does carry the carrier amplitude twice, which is
-//! why a previous "cross-product + divide-by-magnitude" version of this
-//! core was too low on the HL2's weak DDC output to reach the AGC target
-//! — `atan2` sidesteps that scaling problem entirely).
+//! wrap — is **naturally amplitude-invariant**: `atan2` returns a phase, not
+//! a magnitude, so a weak carrier and a strong one produce the same `delta`
+//! for the same deviation. No `A²` scaling enters, which matters because the
+//! HL2 DDC output is weak and a cross-product demod would be too low to
+//! reach the AGC target.
 //!
-//! The deviation `[−f_dev, +f_dev]` is symmetric about DC, so the audio
-//! is zero-mean for symmetric deviation and the shared AGC's DC-block has
-//! no work left to do beyond removing any small residual offset.
+//! The deviation `[−f_dev, +f_dev]` is symmetric about DC, so the audio is
+//! zero-mean for symmetric deviation and the shared AGC's DC-block has no
+//! work beyond removing any small residual offset.
 //!
 //! The audio tail (DC-block + RMS-target AGC + pre-AGC
-//! [`RawSampleTap`](super::RawSampleTap) + `i16` sink write) is
-//! shared with every mode by the
-//! [`AudioEngine`](super::AudioEngine), attached via
-//! [`DemodCore::demodulator`](super::DemodCore::demodulator).
+//! [`RawSampleTap`](super::RawSampleTap) + `i16` sink write) is shared with
+//! every mode by the [`AudioEngine`](super::AudioEngine).
 
 use num_complex::Complex;
 
