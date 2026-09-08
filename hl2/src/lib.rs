@@ -5,13 +5,21 @@
 //!
 //! ## Features
 //!
-//! * `std` (default) — the full library. Off = the lean `no_std` protocol
-//!   core: [`protocol`] plus the std-free slice of [`receiver`].
+//! * `dsp` (default) — the DSP core: SSB/AM/FM mode cores, `Nco`, `F32Fir`,
+//!   `PolyphaseDecimator`, `AudioEngine`, `VecSink`/`DropSink`,
+//!   `VirtualReceiver`, `IqBlock`, `make_demod`. Requires only `alloc` +
+//!   `num-complex`. This is the **`no_std`-usable** demod path — a
+//!   single-threaded consumer can drive [`receiver::VirtualReceiver::process`]
+//!   over whatever I/Q source is wired (socket, file, a SPSC ring, or a live
+//!   EP6 stream).
+//! * `std` (default) — heap + sync + trait-object `std::error::Error`.
+//!   Required for the multi-threaded `client` (the `Arc<Mutex<...>>` shared
+//!   rings / decoders). Off = pure `no_std`.
 //! * `client` (default) — the `tokio` control client ([`hl2`]: `Hl2`,
-//!   `discover`, `start`/`stop`/`tune`, the receive pump).
+//!   `discover`, `start`/`stop`/`tune`, the receive pump + per-slot
+//!   `BasebandFanout`).
 //! * `ft8` / `ft4` / `js8` (default, via `digital`) — the WSJT / JS8 slot
-//!   decoders. Drop any to slim a build (e.g. `default-features = false,
-//!   features = ["std", "client", "ft8", "ft4"]` drops JS8).
+//!   decoders. Drop any to slim a build.
 //! * `alsa` — ALSA playback sink via `cpal`.
 
 #![cfg_attr(not(feature = "std"), no_std)]
@@ -27,8 +35,9 @@ pub mod hl2;
 /// the `no_std` core of the crate (only `num-complex` + `alloc`).
 pub mod protocol;
 /// Software audio receiver: baseband demod (SSB/AM/FM + digital 12 kHz) and
-/// the FT8/FT4/JS8 slot decoders. `std` (allocation + sync).
-#[cfg(feature = "std")]
+/// the FT8/FT4/JS8 slot decoders. `dsp` (allocation only) for the demod core;
+/// `std` adds the thread-safe `BufSink` / `BasebandFanout` / digital decoders.
+#[cfg(feature = "dsp")]
 pub mod receiver;
 
 #[cfg(feature = "client")]

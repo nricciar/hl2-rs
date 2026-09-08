@@ -41,7 +41,10 @@ pub mod engine;
 pub mod fm;
 pub mod ssb;
 
-use std::fmt;
+use ::core::fmt;
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use num_complex::Complex;
 
@@ -84,10 +87,18 @@ impl fmt::Display for RateTooClose {
         )
     }
 }
+#[cfg(feature = "std")]
 impl std::error::Error for RateTooClose {}
 
-/// Demodulator error.
+/// Demodulator error. Carries `Display + Debug` in `std` builds (via the
+/// `std::error::Error` supertrait, so callers can print `{e}`) and `Debug`
+/// in `no_std` builds where `std::error::Error` isn't available. Two
+/// non-auto traits can't be combined in one `dyn` object, so each world gets
+/// a single-trait box.
+#[cfg(feature = "std")]
 pub type DemodError = Box<dyn std::error::Error + Send + Sync>;
+#[cfg(not(feature = "std"))]
+pub type DemodError = Box<dyn fmt::Debug + Send + Sync>;
 
 /// A block of complex I/Q baseband samples: `Vec<Complex<f32>>`.
 pub type IqBlock = Vec<Complex<f32>>;
@@ -144,7 +155,7 @@ pub fn make_demod_tap(
     source_center_hz: f64,
     bandwidth_hz: u32,
     audio: AudioConfig,
-    tap: Option<std::sync::Arc<dyn RawSampleTap>>,
+    tap: Option<Arc<dyn RawSampleTap>>,
 ) -> Result<Box<dyn Demodulator>, DemodError> {
     ensure_decimable(source_rate_hz, audio)?;
     Ok(match mode {
@@ -229,7 +240,7 @@ pub trait Demodulator: Send {
 /// The tap is consumed by the **engine** ([`AudioEngine`]), not by the
 /// core — so a new-mode impl does not have to thread the tap through
 /// `DemodCore`.
-pub trait RawSampleTap: std::fmt::Debug + Send + Sync {
+pub trait RawSampleTap: fmt::Debug + Send + Sync {
     /// Append `samples` to the tap. May be called concurrently from the
     /// demod thread; implementers should be `Send + Sync` and keep calls
     /// short (no allocation, no blocking).

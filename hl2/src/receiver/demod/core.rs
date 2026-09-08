@@ -20,6 +20,8 @@
 //! + a mode-specific discriminator), add the `Mode` enum variant and a
 //! dispatch arm in `demod/mod.rs`, and that's the whole change.
 
+use alloc::boxed::Box;
+use alloc::sync::Arc;
 use num_complex::Complex;
 
 use super::engine::AudioEngine;
@@ -53,10 +55,21 @@ pub trait DemodCore: Send + 'static {
     /// type name (e.g. `SsbCore` → `"SsbCore"`); override per-mode when you
     /// want `"ssb-usb"` etc.
     fn kind(&self) -> &'static str {
-        std::any::type_name::<Self>()
-            .rsplit("::")
-            .next()
-            .unwrap_or("DemodCore")
+        // `core::any::type_name` is not (yet) stabilised for `no_std`; the
+        // `std`-gated fallback below keeps the nice type-name in `std` builds
+        // while `no_std` consumers get a stable `"DemodCore"` label (per-mode
+        // cores override it with a fixed string anyway).
+        #[cfg(feature = "std")]
+        {
+            std::any::type_name::<Self>()
+                .rsplit("::")
+                .next()
+                .unwrap_or("DemodCore")
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            "DemodCore"
+        }
     }
 
     /// Compose this core with the shared audio tail into a full [`Demodulator`].
@@ -69,7 +82,7 @@ pub trait DemodCore: Send + 'static {
     fn demodulator(
         self,
         audio: AudioConfig,
-        tap: Option<std::sync::Arc<dyn RawSampleTap>>,
+        tap: Option<Arc<dyn RawSampleTap>>,
     ) -> Box<dyn Demodulator>
     where
         Self: Sized,

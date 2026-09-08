@@ -33,8 +33,13 @@ pub mod audio_scale;
 /// Auto-decode registry: which digital modes are present + their known freqs.
 #[cfg(any(feature = "ft8", feature = "ft4", feature = "js8"))]
 pub mod auto;
+/// Bounded, drop-oldest complex I/Q ring the EP6 pump writes into (pump
+/// plumbing — needs `std` for the `Arc<Mutex<..>>` the fan-out hands out).
+#[cfg(feature = "std")]
 pub mod baseband_ring;
 pub mod demod;
+/// Per-slot EP6 baseband fan-out (pump plumbing — `std`-only).
+#[cfg(feature = "std")]
 pub mod fanout;
 /// FT4 slot decoder (`mfsk-core`). `ft4` feature.
 #[cfg(feature = "ft4")]
@@ -53,12 +58,16 @@ pub mod source;
 #[cfg(any(feature = "ft8", feature = "ft4"))]
 pub mod spot;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Auto-decode registry + per-mode known-frequency tables (whichever modes are
 /// enabled; the API iterates `AUTO_MODES` to build slot decoders).
 #[cfg(any(feature = "ft8", feature = "ft4", feature = "js8"))]
 pub use auto::{AUTO_MODES, AutoMode};
+#[cfg(feature = "std")]
 pub use baseband_ring::{BASEBAND_RING_CAP, BasebandRing};
 pub use demod::AudioEngine;
 pub use demod::{
@@ -96,13 +105,21 @@ pub type Ft4SharedDecoder = ft4::SharedDecoder;
 pub type Js8SharedDecoder = js8::decoder::SharedDecoder;
 #[cfg(feature = "alsa")]
 pub use sink::AlsaSink;
-pub use sink::{
-    AudioSink, BUF_SINK_DEFAULT_CAP, BufSink, BufSinkHandle, DropSink, SinkError, VecSink,
-};
+pub use sink::{AudioSink, DropSink, SinkError, VecSink};
+/// Thread-safe `BufSink` / `BufSinkHandle` (the shared buffer the pump +
+/// demod + API share) live in the `std` world.
+#[cfg(feature = "std")]
+pub use sink::{BUF_SINK_DEFAULT_CAP, BufSink, BufSinkHandle};
 pub use source::{BasebandSource, VecSource};
 
 /// A receiver-mode-specific error.
+/// A receiver-mode-specific error. Same shape as
+/// [`crate::receiver::demod::DemodError`]: `std::error::Error` in `std`
+/// builds (so callers can print `{e}`) and `Debug` in `no_std` builds.
+#[cfg(feature = "std")]
 pub type ReceiverError = Box<dyn std::error::Error + Send + Sync>;
+#[cfg(not(feature = "std"))]
+pub type ReceiverError = Box<dyn core::fmt::Debug + Send + Sync>;
 
 /// SSB sideband.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,7 +246,7 @@ pub struct ReceiverConfig {
     pub audio: AudioConfig,
     /// Optional pre-AGC raw-sample tap for FT8/JS8/FT4 decode (see
     /// [`RawSampleTap`]). `None` for plain SSB / AM / FM.
-    pub tap: Option<std::sync::Arc<dyn RawSampleTap>>,
+    pub tap: Option<Arc<dyn RawSampleTap>>,
 }
 
 impl Default for ReceiverConfig {
@@ -313,7 +330,9 @@ impl VirtualReceiver {
     /// (its AGC/DC-block accumulator) and then the sink itself.
     pub fn flush(&mut self) -> Result<(), ReceiverError> {
         self.demod.flush(&mut *self.sink)?;
-        self.sink.flush()
+        self.sink
+            .flush()
+            .map_err(|e| -> ReceiverError { Box::new(e) })
     }
 
     /// Stream an entire [`BasebandSource`] through the demodulator to the

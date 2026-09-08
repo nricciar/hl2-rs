@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 use num_complex::Complex;
 
 /// A continuous stream of complex I/Q baseband samples, per radio slot.
