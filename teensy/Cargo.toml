@@ -4,23 +4,20 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+hl2 = { path = "../hl2", default-features = false, features = ["dsp"] }
 rtic = { version = "2", features = ["thumbv7-backend"] }
 rtic-monotonics = { version = "1", default-features = false, features = ["cortex-m-systick"] }
 ili9341 = "0.6.0"
 display-interface-spi = "0.5.0"
 embedded-hal = { version = "1.0.0", default-features = false }
 cortex-m = { version = "0.7", default-features = false }
-
-# Remove these if you don't want logging.
 imxrt-log = { version = "0.2", default-features = false, features = ["log", "usbd"] }
 log = { version = "0.4", features = ["max_level_debug", "release_max_level_info"] }
-
 teensy4-panic = { version = "0.3", features = ["log"] }
 
 [dependencies.teensy4-bsp]
 version = "0.6"
 features = [
-    # Use the BSP's runtime.
     "rt",
 ]
 
