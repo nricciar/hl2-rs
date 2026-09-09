@@ -39,9 +39,66 @@ mod app {
 
     use smoltcp::{
         iface::{Config, Interface, SocketSet, SocketStorage},
-        socket::dhcpv4,
+        socket::{dhcpv4, udp},
         wire::EthernetAddress,
     };
+
+    // Discovery lifecycle shared between the `ethernet` task (producer) and
+    // the `hello_world` task (painter). `AtomicU8` is enough: one writer,
+    // one reader, single-core, no ordering needed between the state byte and
+    // the `HL2_FOUND` pointer (the pointer is either null or final by the
+    // time the state flips to `Found`).
+    const STATE_WAITING: u8 = 0;
+    const STATE_SEARCHING: u8 = 1;
+    const STATE_FOUND: u8 = 2;
+    const STATE_NOT_FOUND: u8 = 3;
+    static DISCOVERY_STATE: core::sync::atomic::AtomicU8 =
+        core::sync::atomic::AtomicU8::new(STATE_WAITING);
+
+    // UDP datagram storage for HL2 discovery. The HL2 reply is a fixed 60
+    // bytes (hl2/src/protocol/discovery.rs:39); 8 slots / 512 B payload hold
+    // replies with ample headroom while this socket coexists with DHCP.
+    static UDP_RX_META: [udp::PacketMetadata; 8] = [udp::PacketMetadata::EMPTY; 8];
+    static UDP_RX_BUF: [u8; 4096] = [0u8; 4096];
+    static UDP_TX_META: [udp::PacketMetadata; 8] = [udp::PacketMetadata::EMPTY; 8];
+    static UDP_TX_BUF: [u8; 512] = [0u8; 512];
+
+    fn make_udp_socket() -> udp::Socket<'static> {
+        // Safety: these statics are declared once, used exactly once, and are
+        // not otherwise accessed before the socket owns them.
+        unsafe {
+            let rx_meta = core::slice::from_raw_parts_mut(
+                UDP_RX_META.as_ptr() as *mut udp::PacketMetadata,
+                UDP_RX_META.len(),
+            );
+            let rx_payload =
+                core::slice::from_raw_parts_mut(UDP_RX_BUF.as_ptr() as *mut u8, UDP_RX_BUF.len());
+            let tx_meta = core::slice::from_raw_parts_mut(
+                UDP_TX_META.as_ptr() as *mut udp::PacketMetadata,
+                UDP_TX_META.len(),
+            );
+            let tx_payload =
+                core::slice::from_raw_parts_mut(UDP_TX_BUF.as_ptr() as *mut u8, UDP_TX_BUF.len());
+            let rx = udp::PacketBuffer::new(&mut rx_meta[..], &mut rx_payload[..]);
+            let tx = udp::PacketBuffer::new(&mut tx_meta[..], &mut tx_payload[..]);
+            udp::Socket::new(rx, tx)
+        }
+    }
+
+    // The first parsed HL2 discovery reply, stored once so `hello_world` can
+    // re-render the display without re-parsing.
+    static HL2_FOUND: static_cell::StaticCell<hl2::protocol::discovery::DiscoveryInfo> =
+        static_cell::StaticCell::new();
+
+    // `NonNull` pointer to the stored reply, so we can read it back after
+    // `try_init_with` consumes the `StaticCell`'s single use.
+    static FOUND_PTR: core::sync::atomic::AtomicPtr<hl2::protocol::discovery::DiscoveryInfo> =
+        core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+    fn hl2_found_ref() -> Option<&'static hl2::protocol::discovery::DiscoveryInfo> {
+        let p = FOUND_PTR.load(core::sync::atomic::Ordering::Acquire);
+        (p != core::ptr::null_mut()).then_some(unsafe { &*p })
+    }
 
     // Locally administered test MAC. Change this for each board on the same LAN.
     const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
@@ -271,7 +328,7 @@ mod app {
         }
         log::info!("Banner painted");
 
-        hello_world::spawn().unwrap();
+        let _ = hello_world::spawn(display);
         assert!(ethernet::spawn(ccm, ccm_analog, iomuxc_gpr).is_ok());
         (Shared {}, Local { poller })
     }
@@ -302,10 +359,20 @@ mod app {
         let now = || smoltcp::time::Instant::from_millis(Systick::now().ticks() as i64);
         let mut iface =
             Interface::new(Config::new(EthernetAddress(MAC).into()), &mut device, now());
-        let mut storage = [SocketStorage::EMPTY];
+        let mut storage = [SocketStorage::EMPTY; 2];
         let mut sockets = SocketSet::new(&mut storage[..]);
         let dhcp = sockets.add(dhcpv4::Socket::new());
+        // Discovery socket. Bind to HL2_PORT (1024) so we receive the reply.
+        let mut hl2_sock = make_udp_socket();
+        hl2_sock
+            .bind(hl2::protocol::HL2_PORT)
+            .expect("bind discovery socket to HL2_PORT");
+        let hl2 = sockets.add(hl2_sock);
+
         let mut link_up = false;
+        let mut discovered = false;
+        let mut search_attempts = 0u32;
+        let mut next_search = Systick::now();
         let mut next_status = Systick::now();
         let mut next_report = Systick::now();
         loop {
@@ -339,6 +406,9 @@ mod app {
                     iface.poll_ingress_single(now(), &mut device, &mut sockets);
                 }
                 iface.poll_egress(now(), &mut device, &mut sockets);
+
+                let ip_configured = !iface.ip_addrs().is_empty();
+
                 match sockets.get_mut::<dhcpv4::Socket>(dhcp).poll() {
                     Some(dhcpv4::Event::Configured(config)) => {
                         iface.update_ip_addrs(|addrs| {
@@ -350,13 +420,100 @@ mod app {
                             iface.routes_mut().add_default_ipv4_route(router).unwrap();
                         }
                         log::info!("DHCP address: {}; try pinging this address", config.address);
+                        // We have an IP — start searching.
+                        if ip_configured {
+                            DISCOVERY_STATE
+                                .store(STATE_SEARCHING, core::sync::atomic::Ordering::Release);
+                            search_attempts = 0;
+                            next_search = Systick::now(); // send immediately
+                        }
                     }
                     Some(dhcpv4::Event::Deconfigured) => {
                         iface.update_ip_addrs(|addrs| addrs.clear());
                         iface.routes_mut().remove_default_ipv4_route();
                         log::info!("DHCP: waiting for a lease");
+                        DISCOVERY_STATE.store(STATE_WAITING, core::sync::atomic::Ordering::Release);
                     }
                     None => {}
+                }
+
+                if !ip_configured && !discovered {
+                    // No IP: nothing to broadcast.
+                    DISCOVERY_STATE.store(STATE_WAITING, core::sync::atomic::Ordering::Release);
+                }
+
+                // Broadcast the 63-byte discovery request every 2 s while we
+                // have an IP and have not yet found the HL2.
+                if ip_configured && !discovered && Systick::now() >= next_search {
+                    next_search = Systick::now() + 2_000.millis();
+                    search_attempts = search_attempts.wrapping_add(1);
+                    let req = hl2::protocol::discovery::discovery_request();
+                    let dst = smoltcp::wire::IpEndpoint {
+                        addr: smoltcp::wire::IpAddress::v4(255, 255, 255, 255),
+                        port: hl2::protocol::HL2_PORT,
+                    };
+                    match sockets.get_mut::<udp::Socket>(hl2).send_slice(&req, dst) {
+                        Ok(_) => {}
+                        Err(e) => log::error!("HL2 discovery: send failed: {e}"),
+                    }
+                }
+
+                // Drain the UDP socket until empty; a reply is exactly 60 bytes
+                // and must parse as a valid discovery response.
+                if !discovered {
+                    let s = sockets.get_mut::<udp::Socket>(hl2);
+                    while s.can_recv() {
+                        let mut buf = [0u8; 512];
+                        match s.recv_slice(&mut buf) {
+                            Ok((len, from)) => {
+                                if len >= hl2::protocol::DISCOVERY_RESPONSE_SIZE {
+                                    match hl2::protocol::discovery::parse_discovery_response(
+                                        buf.get(..hl2::protocol::DISCOVERY_RESPONSE_SIZE)
+                                            .unwrap()
+                                            .try_into()
+                                            .unwrap(),
+                                    ) {
+                                        Some(info) => {
+                                            let mac = info.mac;
+                                            log::info!(
+                                                "HL2 FOUND ip={}.{}.{}.{} mac={:02x?} gw={} rx={} {}bit sending={}",
+                                                info.ip[0],
+                                                info.ip[1],
+                                                info.ip[2],
+                                                info.ip[3],
+                                                mac,
+                                                info.gateware_major * 10 + info.gateware_minor,
+                                                info.rx_count,
+                                                if info.sample_16bit { 16 } else { 12 },
+                                                info.is_sending,
+                                            );
+                                            if let Some(found) = HL2_FOUND.try_init_with(|| info) {
+                                                FOUND_PTR.store(
+                                                    found as *mut _,
+                                                    core::sync::atomic::Ordering::Release,
+                                                );
+                                                DISCOVERY_STATE.store(
+                                                    STATE_FOUND,
+                                                    core::sync::atomic::Ordering::Release,
+                                                );
+                                                discovered = true;
+                                            }
+                                        }
+                                        None => {
+                                            log::info!(
+                                                "HL2 discovery: {len} B from {from}; malformed, ignoring"
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    log::info!(
+                                        "HL2 discovery: {len} B from {from}; short, ignoring"
+                                    );
+                                }
+                            }
+                            Err(e) => log::error!("HL2 discovery: recv failed: {e}"),
+                        }
+                    }
                 }
             }
             if Systick::now() >= next_report {
@@ -372,28 +529,116 @@ mod app {
     }
 
     /// A 5x7 bitmap for one glyph (7 rows, 5 cols, MSB = leftmost bit).
+    /// Covers the letters, digits and punctuation used by the discovery UI.
     fn glyph(ch: char) -> [u8; 7] {
         match ch {
+            'A' => [
+                0b00110, 0b01010, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+            ],
+            'B' => [
+                0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110,
+            ],
+            'C' => [
+                0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110,
+            ],
+            'D' => [
+                0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
+            ],
+            'E' => [
+                0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
+            ],
+            'F' => [
+                0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000,
+            ],
+            'G' => [
+                0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110,
+            ],
             'H' => [
                 0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
             ],
-            'E' => [
-                0b11111, 0b10000, 0b10000, 0b11111, 0b10000, 0b10000, 0b11111,
+            'I' => [
+                0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+            ],
+            'K' => [
+                0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001,
             ],
             'L' => [
                 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
             ],
+            'M' => [
+                0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001,
+            ],
+            'N' => [
+                0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001,
+            ],
             'O' => [
                 0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
             ],
-            'W' => [
-                0b10001, 0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011,
+            'P' => [
+                0b01110, 0b10001, 0b10001, 0b01110, 0b10000, 0b10000, 0b10000,
             ],
             'R' => [
                 0b11100, 0b10010, 0b10010, 0b11100, 0b10100, 0b10010, 0b10001,
             ],
-            'D' => [
-                0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
+            'S' => [
+                0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110,
+            ],
+            'T' => [
+                0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+            ],
+            'U' => [
+                0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+            ],
+            'V' => [
+                0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
+            ],
+            'W' => [
+                0b10001, 0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011,
+            ],
+            'X' => [
+                0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001,
+            ],
+            '0' => [
+                0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
+            ],
+            '1' => [
+                0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+            ],
+            '2' => [
+                0b01110, 0b10001, 0b00001, 0b00110, 0b01000, 0b10000, 0b11111,
+            ],
+            '3' => [
+                0b01110, 0b10001, 0b00001, 0b00110, 0b00001, 0b10001, 0b01110,
+            ],
+            '4' => [
+                0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+            ],
+            '5' => [
+                0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110,
+            ],
+            '6' => [
+                0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
+            ],
+            '7' => [
+                0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
+            ],
+            '8' => [
+                0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+            ],
+            '9' => [
+                0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b00110,
+            ],
+            '.' => [
+                0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100,
+            ],
+            '-' => [
+                0b00000, 0b00000, 0b00000, 0b01110, 0b00000, 0b00000, 0b00000,
+            ],
+            ':' => [
+                0b00000, 0b00100, 0b00000, 0b00000, 0b00100, 0b00000, 0b00000,
+            ],
+            '/' => [
+                0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b00000, 0b00000,
             ],
             _ => [0u8; 7],
         }
@@ -445,6 +690,122 @@ mod app {
         }
     }
 
+    /// Paint one of the four discovery states on the LCD. Full-screen paint
+    /// so the user sees progress without a USB console.
+    ///
+    ///   WaitingIp  -> "WAITING FOR IP" / "DHCP IN PROGRESS"
+    ///   Searching  -> "SEARCHING HL2" / "BROADCASTING"
+    ///   NotFound   -> "HL2 NOT FOUND" / "CHECK CABLE + LAN"
+    ///   Found      -> "HL2 FOUND" / <IP> / <MAC> / "GW a.b [16|12] BIT RX n"
+    fn paint_discovery(
+        display: &mut Display,
+        info: Option<&hl2::protocol::discovery::DiscoveryInfo>,
+    ) {
+        let bg: u16 = 0x001E;
+        let fg: u16 = 0xFFFF;
+        fill_rect(display, 0, 0, WIDTH, HEIGHT, bg);
+
+        let state = DISCOVERY_STATE.load(core::sync::atomic::Ordering::Acquire);
+        let (t1, t2): (&str, &str) = match (state, info) {
+            (STATE_WAITING, _) => ("WAITING FOR IP", "DHCP IN PROGRESS"),
+            (STATE_SEARCHING, _) => ("SEARCHING HL2", "BROADCASTING"),
+            (STATE_NOT_FOUND, _) => ("HL2 NOT FOUND", "CHECK CABLE + LAN"),
+            (STATE_FOUND, Some(_)) => ("HL2 FOUND", "RX"),
+            (STATE_FOUND, None) => ("HL2 FOUND", ""),
+            _ => ("?", "?"),
+        };
+
+        // Title (scale 4).
+        draw_text(display, 10, 12, 4, t1, fg, bg);
+        // Body (scale 3).
+        if !t2.is_empty() {
+            draw_text(display, 10, 72, 3, t2, fg, bg);
+        }
+
+        if let Some(i) = info {
+            // IP line: "a.b.c.d"
+            let mut s = [0u8; 16];
+            let mut p = 0usize;
+            for octet in i.ip.iter() {
+                if p > 0 {
+                    s[p] = b'.';
+                    p += 1;
+                }
+                s[p] = b'0' + octet / 10;
+                p += 1;
+                s[p] = b'0' + octet % 10;
+                p += 1;
+            }
+            let ip_str = core::str::from_utf8(&s[..p]).unwrap();
+            draw_text(display, 10, 112, 3, ip_str, fg, bg);
+
+            // MAC line: "aa:bb:cc:dd:ee:ff"
+            let mut s = [0u8; 20];
+            let mut p = 0usize;
+            for (n, m) in i.mac.iter().enumerate() {
+                if n > 0 {
+                    s[p] = b':';
+                    p += 1;
+                }
+                for shift in [4usize, 0usize] {
+                    let nib = (*m >> shift) & 0x0F;
+                    s[p] = match nib {
+                        0..=9 => b'0' + nib,
+                        10..=15 => b'A' + nib - 10,
+                        _ => 0,
+                    };
+                    p += 1;
+                }
+            }
+            let mac_str = core::str::from_utf8(&s[..p]).unwrap();
+            draw_text(display, 10, 152, 3, mac_str, fg, bg);
+
+            // Gateware: "GW a.b 1[6|2]-BIT RX n"
+            let mut s = [0u8; 28];
+            let mut p = 0usize;
+            s[p] = b'G';
+            p += 1;
+            s[p] = b'W';
+            p += 1;
+            s[p] = b' ';
+            p += 1;
+            s[p] = b'0' + i.gateware_major % 10;
+            p += 1;
+            s[p] = b'.';
+            p += 1;
+            s[p] = b'0' + i.gateware_minor % 10;
+            p += 1;
+            s[p] = b' ';
+            p += 1;
+            s[p] = b'1';
+            p += 1;
+            s[p] = if i.sample_16bit { b'6' } else { b'2' };
+            p += 1;
+            s[p] = b'-';
+            p += 1;
+            s[p] = b'B';
+            p += 1;
+            s[p] = b'I';
+            p += 1;
+            s[p] = b'T';
+            p += 1;
+            s[p] = b' ';
+            p += 1;
+            s[p] = b'R';
+            p += 1;
+            s[p] = b'X';
+            p += 1;
+            s[p] = b' ';
+            p += 1;
+            s[p] = b'0' + i.rx_count / 10;
+            p += 1;
+            s[p] = b'0' + i.rx_count % 10;
+            p += 1;
+            let gw_str = core::str::from_utf8(&s[..p]).unwrap();
+            draw_text(display, 10, 192, 3, gw_str, fg, bg);
+        }
+    }
+
     /// Paint the welcome banner: a dark background, colored side bands, and the
     /// "HELLO WORLD" text.
     fn paint_banner(display: &mut Display) {
@@ -469,15 +830,16 @@ mod app {
         draw_text(display, x0, 140, scale, "WORLD", 0xFFFF, 0x001E);
     }
 
-    /// Periodically log over USB so we can see the radio's "companion" device
-    /// is alive. This is the actual "hello world" heartbeat.
+    /// Paint the current discovery state on the display. Each pass re-renders
+    /// based on `DISCOVERY_STATE` / `HL2_FOUND`. The display is passed in via
+    /// `spawn(display)` as a free (task-local) resource, following the same
+    /// convention as `ethernet(ccm, ccm_analog, iomuxc_gpr)` in the baseline.
+    /// `hello_world` is the sole owner, so no sync is required.
     #[task]
-    async fn hello_world(_cx: hello_world::Context) {
-        let mut n = 0u32;
+    async fn hello_world(_cx: hello_world::Context, mut display: Display) {
         loop {
-            log::info!("Hello from your Teensy 4.1 — the ILI9341 is up and running! ({n})");
-            n = n.wrapping_add(1);
-            Systick::delay(1_000.millis()).await;
+            paint_discovery(&mut display, hl2_found_ref());
+            Systick::delay(500.millis()).await;
         }
     }
 
