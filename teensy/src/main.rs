@@ -406,7 +406,17 @@ mod app {
         // Boot: fill black (covers the red "HL2 TEENSY" splash), draw the
         // status bar once.
         display::driver::fill_rect(&mut panel, 0, 0, 320, 240, 0x0000);
-        status_redraw(&mut panel);
+        display::driver::draw_text(
+            &mut panel,
+            6,
+            display::WF_ROWS as u16 + 76,
+            1,
+            "7.074MHz RX1 96k",
+            0xF800,
+            0x0000,
+        );
+        let mut status_label = display::driver::TextLine::<9>::new();
+        let mut status_detail = display::driver::TextLine::<32>::new();
 
         let mut painted_seq: u32 = 0;
         let mut last_state: u32 = u32::MAX;
@@ -456,15 +466,19 @@ mod app {
                 last_state = st;
                 last_peer = peer_u32;
                 last_status_ms = now_ms;
-                status_redraw(&mut panel);
+                status_redraw(&mut panel, &mut status_label, &mut status_detail);
             }
 
             Systick::delay(2.millis()).await;
         }
     }
 
-    /// Redraw the status bar, including the live received-frame counter.
-    fn status_redraw(panel: &mut Panel) {
+    /// Update only changed status characters, including the live RX counter.
+    fn status_redraw(
+        panel: &mut Panel,
+        status_label: &mut display::driver::TextLine<9>,
+        status_detail: &mut display::driver::TextLine<32>,
+    ) {
         let label = match shared::state() {
             shared::STATE_WAITING_IP => "WAIT IP",
             shared::STATE_LINK => "LINK",
@@ -476,8 +490,7 @@ mod app {
             _ => "?",
         };
         let wf_y = display::WF_ROWS as u16;
-        display::driver::fill_rect(panel, 0, wf_y, 320, 120, 0x0000);
-        display::driver::draw_text(panel, 6, wf_y + 4, 1, label, 0xF800, 0x0000);
+        status_label.update(panel, 6, wf_y + 4, label, 0xF800, 0x0000);
         use core::fmt::Write;
         let mut line = [0u8; 32];
         let mut w = radio::control::WriteBuf {
@@ -491,7 +504,6 @@ mod app {
         }
         write!(w, " F {}", shared::frames()).unwrap();
         let line_s = core::str::from_utf8(&w.target[..w.pos]).unwrap();
-        display::driver::draw_text(panel, 6, wf_y + 30, 1, line_s, 0xF800, 0x0000);
-        display::driver::draw_text(panel, 6, wf_y + 76, 1, "7.074MHz RX1 96k", 0xF800, 0x0000);
+        status_detail.update(panel, 6, wf_y + 30, line_s, 0xF800, 0x0000);
     }
 }

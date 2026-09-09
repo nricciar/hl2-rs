@@ -136,7 +136,7 @@ pub fn fill_rect(display: &mut Display, x: u16, y: u16, w: u16, h: u16, color: u
 
 /// Draw `text` at (x0, y0) with each source pixel scaled to a `scale` ×
 /// `scale` block. Uses the 5×7 `glyphs::glyph`. Each character uses 6
-/// columns (5 glyph + 1 gap); space is skipped as blank.
+/// columns (5 glyph + 1 gap), including an opaque background.
 pub fn draw_text(
     display: &mut Display,
     x0: u16,
@@ -148,22 +148,95 @@ pub fn draw_text(
 ) {
     let mut x = x0;
     for ch in text.chars() {
-        if ch != ' ' {
-            let g = glyph(ch);
-            for (r, row) in g.iter().enumerate() {
-                for c in 0..5u16 {
-                    let bit = (row >> (5 - c as u32 - 1)) & 1 != 0;
-                    fill_rect(
-                        display,
-                        x + c * scale,
-                        y0 + r as u16 * scale,
-                        scale,
-                        scale,
-                        if bit { fg } else { bg },
-                    );
-                }
+        draw_char(display, x, y0, scale, ch, fg, bg);
+        x += 6 * scale;
+    }
+}
+
+fn draw_char(display: &mut Display, x: u16, y: u16, scale: u16, ch: char, fg: u16, bg: u16) {
+    if scale == 0 {
+        return;
+    }
+    let g = glyph(ch);
+    let width = 6 * scale;
+    let height = 7 * scale;
+    let pixels = (0..height).flat_map(|r| {
+        (0..width).map(move |c| {
+            let col = c / scale;
+            if col < 5 && g[(r / scale) as usize] & (1 << (4 - col)) != 0 {
+                fg
+            } else {
+                bg
+            }
+        })
+    });
+    // Replace the cell directly, without a separate blanking pass.
+    display
+        .draw_raw_iter(x, y, x + width - 1, y + height - 1, pixels)
+        .expect("text draw");
+}
+
+/// Cached ASCII text on a cleared background. Position and colors must stay
+/// fixed, and no other drawing may overwrite its cells between updates.
+pub struct TextLine<const N: usize> {
+    text: [u8; N],
+}
+
+impl<const N: usize> TextLine<N> {
+    pub const fn new() -> Self {
+        Self { text: [b' '; N] }
+    }
+
+    pub fn update(&mut self, display: &mut Display, x: u16, y: u16, text: &str, fg: u16, bg: u16) {
+        self.update_cells(text, |col, ch| {
+            draw_char(display, x + col as u16 * 6, y, 1, ch as char, fg, bg);
+        });
+    }
+
+    fn update_cells(&mut self, text: &str, mut draw: impl FnMut(usize, u8)) {
+        assert!(text.is_ascii() && text.len() <= N);
+        for (col, old) in self.text.iter_mut().enumerate() {
+            let new = text.as_bytes().get(col).copied().unwrap_or(b' ');
+            if *old != new {
+                draw(col, new);
+                *old = new;
             }
         }
-        x += 6 * scale;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::{vec, vec::Vec};
+
+    #[test]
+    fn unchanged_text_does_not_draw() {
+        let mut line = TextLine::<9>::new();
+        let mut cells = Vec::new();
+        line.update_cells("STREAMING", |col, ch| cells.push((col, ch)));
+        assert_eq!(cells.len(), 9);
+        line.update_cells("STREAMING", |_, _| panic!("unchanged cell redrawn"));
+    }
+
+    #[test]
+    fn shorter_text_erases_old_suffix_and_spaces() {
+        let mut line = TextLine::<9>::new();
+        line.update_cells("STREAMING", |_, _| {});
+        let mut cells = Vec::new();
+        line.update_cells("WAIT IP", |col, ch| cells.push((col, ch)));
+        assert!(cells.contains(&(4, b' ')));
+        assert!(cells.contains(&(7, b' ')));
+        assert!(cells.contains(&(8, b' ')));
+        assert_eq!(&line.text, b"WAIT IP  ");
+    }
+
+    #[test]
+    fn counter_updates_leave_address_untouched() {
+        let mut line = TextLine::<32>::new();
+        line.update_cells("192.168.1.5 F 99", |_, _| {});
+        let mut cells = Vec::new();
+        line.update_cells("192.168.1.5 F 100", |col, ch| cells.push((col, ch)));
+        assert_eq!(cells, vec![(14, b'1'), (15, b'0'), (16, b'0')]);
     }
 }
