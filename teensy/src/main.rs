@@ -16,6 +16,39 @@
 
 use teensy4_panic as _;
 
+extern crate alloc;
+use alloc::alloc::{GlobalAlloc, Layout};
+use core::ptr;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+static BUMP_BUF: [u8; 16 * 1024] = [0u8; 16 * 1024];
+static BUMP_OFF: AtomicUsize = AtomicUsize::new(0);
+
+struct BumpAllocator;
+
+unsafe impl GlobalAlloc for BumpAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let size = layout.size().min(BUMP_BUF.len());
+        let off = BUMP_OFF.fetch_add(size, Ordering::AcqRel);
+        if off >= BUMP_BUF.len() {
+            ptr::null_mut()
+        } else {
+            unsafe { BUMP_BUF.as_ptr().add(off) as *mut u8 }
+        }
+    }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let p = unsafe { self.alloc(layout) };
+        if !p.is_null() {
+            unsafe { ptr::write_bytes(p, 0, layout.size().max(1)) };
+        }
+        p
+    }
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+}
+
+#[global_allocator]
+static GLOBAL: BumpAllocator = BumpAllocator;
+
 mod ethernet;
 
 #[rtic::app(device = teensy4_bsp, peripherals = true, dispatchers = [KPP])]
