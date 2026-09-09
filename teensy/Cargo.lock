@@ -46,6 +46,12 @@ checksum = "46afbd2983a5d5a7bd740ccb198caf5b82f45c40c09c0eed36052d91cb92e719"
 
 [[package]]
 name = "bitflags"
+version = "1.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
+
+[[package]]
+name = "bitflags"
 version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
@@ -304,6 +310,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "heapless"
+version = "0.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25ba4bd83f9415b58b4ed8dc5714c76e626a105be4646c02630ad730ad3b5aa4"
+dependencies = [
+ "hash32",
+ "stable_deref_trait",
+]
+
+[[package]]
 name = "hl2"
 version = "0.2.0"
 dependencies = [
@@ -320,10 +336,13 @@ dependencies = [
  "embedded-hal 1.0.0",
  "hl2",
  "ili9341",
+ "imxrt-enet",
  "imxrt-log",
  "log",
  "rtic",
  "rtic-monotonics",
+ "smoltcp",
+ "static_cell",
  "teensy4-bsp",
  "teensy4-panic",
 ]
@@ -356,12 +375,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "imxrt-enet"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3f87bb71b1b16a792039147b5e726ea3da86f75bc9b55f2daf0471eab566afb"
+dependencies = [
+ "imxrt-ral",
+ "mdio",
+ "smoltcp",
+]
+
+[[package]]
 name = "imxrt-hal"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbfcef664c97cc60f6fc3b74ff858ff84b95de89bcfad9884dd0d97823c17d71"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "cfg-if",
  "cortex-m",
  "embedded-hal 0.2.7",
@@ -422,7 +452,7 @@ version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "acac3ea0fc5a0f2cdfe5cf9da318a24b9ee5eb4a51bed893d0637e0d2b78e01f"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "cortex-m",
  "imxrt-ral",
  "usb-device",
@@ -449,6 +479,18 @@ name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+
+[[package]]
+name = "managed"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ca88d725a0a943b096803bd34e73a4437208b6077654cc4ecb2947a5f91618d"
+
+[[package]]
+name = "mdio"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0ca02e3a69fbdda183fba6edc8be085dd508ffdfc700cdcf35c85236f571e95"
 
 [[package]]
 name = "nb"
@@ -611,6 +653,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "388a1df253eca08550bef6c72392cfe7c30914bf41df5269b68cbd6ff8f570a3"
 
 [[package]]
+name = "smoltcp"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f73d40463bba65efc9adc6370b56df76d563cc46e2482bba58351b4afb7535e"
+dependencies = [
+ "bitflags 1.3.2",
+ "byteorder",
+ "cfg-if",
+ "heapless 0.9.3",
+ "managed",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -701,7 +756,7 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "98816b1accafbb09085168b90f27e93d790b4bfa19d883466b5e53315b5f06a6"
 dependencies = [
- "heapless",
+ "heapless 0.8.0",
  "portable-atomic",
 ]
 

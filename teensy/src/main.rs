@@ -29,11 +29,25 @@ mod app {
     use embedded_hal::spi::{ErrorType, Operation, SpiBus, SpiDevice};
     use imxrt_log as logging;
 
-    use rtic_monotonics::systick::{Systick, *};
     use rtic_monotonics::Monotonic;
+    use rtic_monotonics::systick::{Systick, *};
 
     const WIDTH: u16 = 320;
     const HEIGHT: u16 = 240;
+
+    use imxrt_enet::{Enet, ReceiveBuffers, TransmitBuffers};
+    use smoltcp::{
+        iface::{Config, Interface},
+        wire::EthernetAddress,
+    };
+    use static_cell::ConstStaticCell;
+
+    static RX_BUFFERS: ConstStaticCell<ReceiveBuffers<4>> =
+        ConstStaticCell::new(ReceiveBuffers::new());
+    static TX_BUFFERS: ConstStaticCell<TransmitBuffers<4>> =
+        ConstStaticCell::new(TransmitBuffers::new());
+
+    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01]; // Your MAC address.
 
     type Display = ili9341::Ili9341<
         display_interface_spi::SPIInterface<DisplaySpi, hal::gpio::Output>,
@@ -125,18 +139,19 @@ mod app {
     }
 
     impl SpiDevice<u8> for DisplaySpi {
-        fn transaction(
-            &mut self,
-            operations: &mut [Operation<'_, u8>],
-        ) -> Result<(), Self::Error> {
+        fn transaction(&mut self, operations: &mut [Operation<'_, u8>]) -> Result<(), Self::Error> {
             self.cs.set_low();
             let mut result: Result<(), LpspiError> = Ok(());
             for op in operations.iter_mut() {
                 result = match op {
                     Operation::Read(buf) => SpiBus::<u8>::read(&mut self.spi, buf).map(|_| ()),
                     Operation::Write(buf) => SpiBus::<u8>::write(&mut self.spi, buf),
-                    Operation::Transfer(read, write) => SpiBus::<u8>::transfer(&mut self.spi, read, write),
-                    Operation::TransferInPlace(buf) => SpiBus::<u8>::transfer_in_place(&mut self.spi, buf),
+                    Operation::Transfer(read, write) => {
+                        SpiBus::<u8>::transfer(&mut self.spi, read, write)
+                    }
+                    Operation::TransferInPlace(buf) => {
+                        SpiBus::<u8>::transfer_in_place(&mut self.spi, buf)
+                    }
                     Operation::DelayNs(ns) => {
                         let mut d = DwtDelay {};
                         d.delay_ns(*ns);
@@ -192,6 +207,31 @@ mod app {
 
         log::info!("DWT enabled: {} Hz, systick running", board::ARM_FREQUENCY);
 
+        let enet = teensy4_bsp::ral::enet::ENET1;
+        let enet_instance = unsafe { teensy4_bsp::ral::Instance::<_, 1>::new(enet) };
+
+        let mut enet = unsafe {
+            Enet::new(
+                enet_instance,
+                TX_BUFFERS.take().take(),
+                RX_BUFFERS.take().take(),
+                150_000_000,
+                &MAC,
+            )
+        };
+
+        enet.enable_mac(true);
+
+        // suggested fix; does not appear to do anything though
+        unsafe {
+            (*teensy4_bsp::ral::enet::ENET1).MSCR.write(24 << 1);
+        }
+
+        init_phy();
+
+        let now = smoltcp::time::Instant::from_micros(us_now() as i64);
+        let mut iface = Interface::new(Config::new(EthernetAddress(MAC).into()), &mut enet, now);
+
         // Control lines (all on GPIO2): CS=10, DC=9. RESET is not wired.
         let cs = gpio2.output(pins.p10).expect("p10 is GPIO2");
         let dc = gpio2.output(pins.p9).expect("p9 is GPIO2");
@@ -230,9 +270,7 @@ mod app {
             let systick_elapsed = Systick::now() - systick_start;
             let elapsed_ticks = systick_elapsed.ticks();
             let elapsed_ms = elapsed_ticks / 600_000;
-            log::info!(
-                "Delay cross-check: DwtDelay(50 ms) took {elapsed_ms} ms on systick clock"
-            );
+            log::info!("Delay cross-check: DwtDelay(50 ms) took {elapsed_ms} ms on systick clock");
         }
 
         log::info!("Ili9341::new starting (t0 = {} µs)", us_now());
@@ -285,16 +323,109 @@ mod app {
         (Shared {}, Local { poller })
     }
 
+    /// Reads a 16-bit register from a PHY over MDIO using raw ENET registers.
+    fn read_mdio(phy_addr: u8, reg_addr: u8) -> u16 {
+        let enet = teensy4_bsp::ral::enet::ENET1;
+        unsafe {
+            // Clear MII transfer complete flag (bit 23 of EIR)
+            (*enet).EIR.write(1 << 23);
+
+            // MMFR frame format: ST=01 (30..31), OP=10 Read (28..29), PA (23..27), RA (18..22), TA=10 (16..17)
+            let mmfr = (1 << 30)
+                | (2 << 28)
+                | (((phy_addr & 0x1F) as u32) << 23)
+                | (((reg_addr & 0x1F) as u32) << 18)
+                | (2 << 16);
+
+            (*enet).MMFR.write(mmfr);
+
+            // Poll EIR bit 23 until transfer completes
+            while ((*enet).EIR.read() & (1 << 23)) == 0 {
+                core::hint::spin_loop();
+            }
+
+            ((*enet).MMFR.read() & 0xFFFF) as u16
+        }
+    }
+
+    /// Writes a 16-bit register to a PHY over MDIO using raw ENET registers.
+    fn write_mdio(phy_addr: u8, reg_addr: u8, data: u16) {
+        let enet = teensy4_bsp::ral::enet::ENET1;
+        unsafe {
+            // Clear MII transfer complete flag (bit 23 of EIR)
+            (*enet).EIR.write(1 << 23);
+
+            // MMFR frame format: ST=01 (30..31), OP=01 Write (28..29), PA (23..27), RA (18..22), TA=10 (16..17), DATA (0..15)
+            let mmfr = (1 << 30)
+                | (1 << 28)
+                | (((phy_addr & 0x1F) as u32) << 23)
+                | (((reg_addr & 0x1F) as u32) << 18)
+                | (2 << 16)
+                | (data as u32);
+
+            (*enet).MMFR.write(mmfr);
+
+            // Poll EIR bit 23 until transfer completes
+            while ((*enet).EIR.read() & (1 << 23)) == 0 {
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    /// Initializes the DP83825 PHY over MDIO for Teensy 4.1.
+    fn init_phy() {
+        const PHY_ADDR: u8 = 0;
+
+        const REG_BMCR: u8 = 0x00;
+        const REG_PHYID1: u8 = 0x02;
+
+        const BMCR_RESET: u16 = 1 << 15;
+        const BMCR_AN_ENABLE: u16 = 1 << 12;
+        const BMCR_AN_RESTART: u16 = 1 << 9;
+
+        // 1. Issue software reset to PHY
+        write_mdio(PHY_ADDR, REG_BMCR, BMCR_RESET);
+
+        // Wait until the reset bit clears automatically
+        loop {
+            let val = read_mdio(PHY_ADDR, REG_BMCR);
+            if val & BMCR_RESET == 0 {
+                break;
+            }
+        }
+
+        // 2. Read PHY ID register (DP83825 ID1 is 0x2000)
+        let phy_id = read_mdio(PHY_ADDR, REG_PHYID1);
+        log::info!("DP83825 PHY ID1: {:#06X}", phy_id);
+
+        // 3. Enable and restart Auto-Negotiation
+        write_mdio(PHY_ADDR, REG_BMCR, BMCR_AN_ENABLE | BMCR_AN_RESTART);
+    }
+
     /// A 5x7 bitmap for one glyph (7 rows, 5 cols, MSB = leftmost bit).
     fn glyph(ch: char) -> [u8; 7] {
         match ch {
-            'H' => [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
-            'E' => [0b11111, 0b10000, 0b10000, 0b11111, 0b10000, 0b10000, 0b11111],
-            'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
-            'O' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
-            'W' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011],
-            'R' => [0b11100, 0b10010, 0b10010, 0b11100, 0b10100, 0b10010, 0b10001],
-            'D' => [0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110],
+            'H' => [
+                0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+            ],
+            'E' => [
+                0b11111, 0b10000, 0b10000, 0b11111, 0b10000, 0b10000, 0b11111,
+            ],
+            'L' => [
+                0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
+            ],
+            'O' => [
+                0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+            ],
+            'W' => [
+                0b10001, 0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011,
+            ],
+            'R' => [
+                0b11100, 0b10010, 0b10010, 0b11100, 0b10100, 0b10010, 0b10001,
+            ],
+            'D' => [
+                0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
+            ],
             _ => [0u8; 7],
         }
     }
