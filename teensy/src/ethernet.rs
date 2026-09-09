@@ -14,7 +14,11 @@ use teensy4_bsp::{board, ral};
 // Keep descriptors AND payloads in non-cacheable DTCM (.bss), which is
 // accessible to ENET through the CM7 backdoor. Do not move these to cached
 // OCRAM without adding cache maintenance; atomics alone are not sufficient.
-static RX: ConstStaticCell<ReceiveBuffers<4>> = ConstStaticCell::new(ReceiveBuffers::new());
+// 64 RX descriptors so the MAC ring absorbs EP6 bursts while the render
+// task blocks the core for the full-screen SPI blit (≈37 ms at 22 MHz SCK).
+// With only 4 buffers the ring overflows after ~5 ms of starvation and ~50
+// datagrams are dropped per paint, starving the pipeline.
+static RX: ConstStaticCell<ReceiveBuffers<64>> = ConstStaticCell::new(ReceiveBuffers::new());
 static TX: ConstStaticCell<TransmitBuffers<4>> = ConstStaticCell::new(TransmitBuffers::new());
 
 const ENET_CLOCK_HZ: u32 = 50_000_000;

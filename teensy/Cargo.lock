@@ -339,6 +339,7 @@ dependencies = [
  "imxrt-enet",
  "imxrt-log",
  "log",
+ "num-traits",
  "rtic",
  "rtic-monotonics",
  "smoltcp",

@@ -3,8 +3,15 @@ name = "hl2-teensy"
 version = "0.1.0"
 edition = "2024"
 
+# `no_std` lib (spectrum, display, radio) shared by the tests + the RTIC bin.
+[lib]
+name = "hl2_teensy"
+path = "src/lib.rs"
+crate-type = ["lib"]
+
 [dependencies]
 hl2 = { path = "../hl2", default-features = false, features = ["dsp"] }
+num-traits = { version = "0.2", default-features = false, features = ["libm"] }
 rtic = { version = "2", features = ["thumbv7-backend"] }
 rtic-monotonics = { version = "1", default-features = false, features = ["cortex-m-systick", "systick-64bit"] }
 ili9341 = "0.6.0"
@@ -13,7 +20,10 @@ embedded-hal = { version = "1.0.0", default-features = false }
 cortex-m = { version = "0.7", default-features = false }
 imxrt-log = { version = "0.2", default-features = false, features = ["log", "usbd"] }
 log = { version = "0.4", features = ["max_level_debug", "release_max_level_info"] }
-teensy4-panic = { version = "0.3", features = ["log"] }
+# `default-features = false` drops the built-in `#[panic_handler]` (we provide
+# one that flushes the log ring before calling `sos()`); keep the `log`
+# feature so its handler can `log::error!` if it's ever re-enabled.
+teensy4-panic = { version = "0.3", default-features = false, features = ["log"] }
 imxrt-enet = "=0.1.0"
 smoltcp = { version = "0.13.0", default-features = false, features = ["proto-ipv4", "proto-dhcpv4", "socket-raw", "socket-udp", "socket-dhcpv4", "multicast"] }
 static_cell = "2.1.1"

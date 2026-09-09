@@ -578,9 +578,14 @@ pub struct ParsedPacketInto<'a> {
     pub header: DataHeader,
     pub chunk1_command: Option<CommandData>,
     pub chunk2_command: Option<CommandData>,
-    /// EP4 samples (len 0 when the frame is not EP4).
+    /// EP4 samples (len 0 when the frame is not EP4 — this buffer IS
+    /// cleared on non-EP4 frames, so `is_empty()` is the correct probe).
     pub iq: &'a mut Vec<i16>,
-    /// EP6 baseband chunks (len 0 when the frame is not EP6).
+    /// EP6 baseband chunks. **Left alone on non-EP6 frames** — the caller
+    /// must check `header.endpoint == ENDPOINT_DATA_TX` before reading
+    /// `baseband`. This preserves the inner `per_rx` `Vec<Complex<f32>>`
+    /// capacity across frames even when the caller interleaves EP6 data
+    /// with EP2 control (ack, keep-alive) traffic.
     pub baseband: &'a mut Vec<BasebandChunk>,
 }
 
@@ -619,10 +624,12 @@ pub fn parse_receive_packet_into<'a>(
         None
     };
 
-    baseband.clear();
     if header.endpoint == ENDPOINT_DATA_TX {
         parse_baseband_frame_into(buf, n_recv, baseband);
     }
+    // Non-EP6 frames leave `baseband` alone so the inner `per_rx` buffers
+    // keep their capacity — critical on a no-op-dealloc allocator where a
+    // `clear()` + next EP6 `push(Vec::new())` is a permanent leak.
 
     Some(ParsedPacketInto {
         header,
@@ -1201,7 +1208,10 @@ mod tests {
     }
 
     /// `parse_receive_packet_into` must agree with `parse_receive_packet`
-    /// on both the EP4 (`iq_samples`) and EP6 (`baseband`) paths.
+    /// on both the EP4 (`iq_samples`) and EP6 (`baseband`) paths, and the
+    /// non-EP6 branches leave the caller-provided baseband buffer alone
+    /// (so a no-op-dealloc bump-allocator doesn't leak on interleaved
+    /// ACK / data traffic).
     #[test]
     fn receive_packet_into_matches_owned() {
         use crate::protocol::ENDPOINT_DATA_TX;
@@ -1220,11 +1230,22 @@ mod tests {
         ep4[3] = ENDPOINT_WIDEBAND;
 
         let a = parse_receive_packet(&ep4, 1).unwrap();
+        let a_iq = a.iq_samples.unwrap();
         let mut iq: Vec<i16> = Vec::new();
         let mut bb: Vec<BasebandChunk> = Vec::new();
-        let _b = parse_receive_packet_into(&ep4, 1, &mut iq, &mut bb).unwrap();
-        let a_iq = a.iq_samples.unwrap();
+        {
+            let _b = parse_receive_packet_into(&ep4, 1, &mut iq, &mut bb).unwrap();
+            // `header` is `Copy` — capture the endpoint so we can verify the
+            // non-EP6 gate even after `_b` (and its `&mut` borrows on
+            // `iq`/`bb`) is dropped.
+            assert!(_b.header.endpoint != ENDPOINT_DATA_TX);
+        } // `_b` dropped here; `iq`/`bb` borrow released.
         assert_eq!(&*a_iq, &*iq);
+        // EP4: the `Into` variant leaves the caller-provided `baseband`
+        // buffer alone (freshly-empty here, so it stays len 0). The owned
+        /// variant returns an empty `Vec` for `baseband` on EP4 frames.
+        assert!(a.baseband.is_empty());
+        assert!(bb.is_empty());
         assert_eq!(a.baseband, bb);
 
         // EP6 (baseband).
@@ -1248,10 +1269,78 @@ mod tests {
         let a6 = parse_receive_packet(&ep6, 2).unwrap();
         let mut iq2: Vec<i16> = Vec::new();
         let mut bb2: Vec<BasebandChunk> = Vec::new();
-        let _b6 = parse_receive_packet_into(&ep6, 2, &mut iq2, &mut bb2).unwrap();
+        {
+            let _b6 = parse_receive_packet_into(&ep6, 2, &mut iq2, &mut bb2).unwrap();
+            assert!(_b6.header.endpoint == ENDPOINT_DATA_TX);
+        } // `_b6` dropped; `iq2`/`bb2` borrow released.
         assert!(a6.iq_samples.is_none());
         assert!(iq2.is_empty());
         assert_eq!(a6.baseband.len(), bb2.len());
         assert_eq!(a6.baseband, bb2);
+    }
+
+    /// The `Into` variant must *preserve* the caller's baseband chunk (and
+    /// its inner `per_rx` capacity) across a non-EP6 frame. This is the
+    /// invariant the no-std bump-allocator path relies on: on Teensy,
+    /// `dealloc` is a no-op, so a `clear()` followed by the next EP6
+    /// `push(Vec::new())` is a permanent leak of the inner `Vec<Complex>`.
+    /// The owned variant still returns a fresh (empty) `Vec` on non-EP6
+    /// frames — only the `Into` variant's reuse contract differs.
+    #[test]
+    fn receive_packet_into_preserves_baseband_on_non_ep6() {
+        use crate::protocol::ENDPOINT_DATA_TX;
+        // A valid EP6 frame (populates baseband).
+        let mut ep6 = [0u8; DATA_PACKET_SIZE];
+        ep6[0] = 0xEF;
+        ep6[1] = 0xFE;
+        ep6[2] = 0x01;
+        ep6[3] = ENDPOINT_DATA_TX;
+        for (i, byte) in ep6.iter_mut().enumerate() {
+            *byte = (i.wrapping_mul(7) + 1) as u8;
+        }
+        ep6[0] = 0xEF;
+        ep6[1] = 0xFE;
+        ep6[2] = 0x01;
+        ep6[3] = ENDPOINT_DATA_TX;
+        for off in [HEADER_SIZE, HEADER_SIZE + CHUNK_SIZE] {
+            ep6[off] = C_SYNC;
+            ep6[off + 1] = C_SYNC;
+            ep6[off + 2] = C_SYNC;
+        }
+        // A non-EP6 frame (EP2 control) with a well-formed header.
+        let mut cc = [0u8; DATA_PACKET_SIZE];
+        cc[0] = 0xEF;
+        cc[1] = 0xFE;
+        cc[2] = 0x01;
+        cc[3] = ENDPOINT_CONTROL;
+        cc[7] = 1;
+
+        let mut bb: Vec<BasebandChunk> = Vec::new();
+        // 1. Feed the EP6 frame → populates two chunks with non-empty `per_rx`.
+        {
+            let _p = parse_receive_packet_into(&ep6, 1, &mut Vec::new(), &mut bb).unwrap();
+            assert_eq!(bb.len(), 2, "two chunks from the EP6 frame");
+            assert!(!bb[0].per_rx[0].is_empty(), "chunk 0 populated");
+        }
+        let cap_before = bb[0].per_rx[0].capacity();
+        assert!(cap_before > 0, "inner buffer allocated at least once");
+
+        // 2. Feed a non-EP6 frame into the *same* buffer.
+        {
+            let _p = parse_receive_packet_into(&cc, 1, &mut Vec::new(), &mut bb).unwrap();
+        }
+        // The new contract: the chunks and their inner capacity are
+        // preserved (not cleared), so a subsequent EP6 frame refills
+        // without reallocating.
+        assert_eq!(
+            bb.len(),
+            2,
+            "non-EP6 frame must not clear the caller's baseband"
+        );
+        assert_eq!(
+            bb[0].per_rx[0].capacity(),
+            cap_before,
+            "inner capacity must survive a non-EP6 frame"
+        );
     }
 }

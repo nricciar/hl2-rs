@@ -1,6 +1,14 @@
 [build]
 target = "thumbv7em-none-eabihf"
 
+# imxrt-log ring buffer: 8 KiB (default 1024). The 1 KiB default drops
+# messages under load — the render task can block ~50 ms in one SPI
+# transfer, by which time the radio has enqueued multiple WARN lines and
+# the ring overflows, so later lines (including the render side's own
+# heartbeats) are silently dropped. 8 KiB keeps a few seconds of tail.
+[env]
+IMXRT_LOG_BUFFER_SIZE = "8192"
+
 [target.thumbv7em-none-eabihf]
 rustflags = [
     "-C", "link-arg=-Tt4link.x",
