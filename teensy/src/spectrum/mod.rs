@@ -6,8 +6,8 @@
 //! (full width, centred on the NCO).
 //!
 //! Data comes in one EP6 chunk at a time (63 I/Q pairs/chunk at
-//! 96 kSps, `n_recv = 1`). The accumulator drains oldest-first when full,
-//! so a continuous stream produces a smooth 2048-sample window.
+//! 96 kSps, `n_recv = 1`). Each full, non-overlapping 2048-sample window
+//! produces a row, approximately every 21.3 ms at that rate.
 
 pub mod fft;
 
@@ -23,9 +23,6 @@ use crate::spectrum::fft::Fft;
 pub const N_FFT: usize = 2048;
 /// Display bins — one bin per LCD pixel column (ILI9341 is 320 wide).
 pub const BINS: usize = 320;
-/// Frequency span of one FFT (Hz) — matches the `SpectrumSource::Ep6` span in
-/// `api/src/hub.rs::spectrum_span` (96.7 kHz ≈ half of the 96 kSps EP6 rate).
-pub const SPAN_HZ: u32 = 96_700;
 
 /// Accumulator state.
 pub struct Pipeline {
@@ -33,18 +30,17 @@ pub struct Pipeline {
     win: Vec<f32>,
     acc_re: Vec<f32>,
     acc_im: Vec<f32>,
-    /// Last 2048 I/Q samples (post-window & DC-blocked, pre-FFT), reused for
-    /// the `fft.process` call.
+    /// Reused FFT workspace: DC-removed/windowed samples, then FFT output.
     buf_re: Vec<f32>,
     buf_im: Vec<f32>,
     /// Last computed mags (320 display bins). This is what the renderer reads.
-    pub mags: Vec<u16>,
-    /// Last published frame seq (bumped once per publish).
-    pub frame_seq: u32,
+    mags: Vec<u16>,
+    /// Wrapping count of completed FFT windows.
+    frame_seq: u32,
 }
 
 impl Pipeline {
-    /// Build the pipeline. The 2048 twiddle table takes ~1 MB of RAM.
+    /// Build the pipeline. The 1024 complex twiddles occupy 8 KiB.
     pub fn new() -> Result<Self, &'static str> {
         let fft = Fft::new(N_FFT)?;
         let mut win = [0.0f32; N_FFT];
@@ -54,13 +50,12 @@ impl Pipeline {
         let win = win.to_vec();
         let buf_re = vec![0f32; N_FFT];
         let buf_im = vec![0f32; N_FFT];
-        let mut mags = vec![0u16; BINS];
-        mags[0] = 0;
+        let mags = vec![0u16; BINS];
         Ok(Self {
             fft,
             win,
-            acc_re: Vec::with_capacity(N_FFT * 2),
-            acc_im: Vec::with_capacity(N_FFT * 2),
+            acc_re: Vec::with_capacity(N_FFT),
+            acc_im: Vec::with_capacity(N_FFT),
             buf_re,
             buf_im,
             mags,
@@ -73,60 +68,40 @@ impl Pipeline {
         self.acc_re.len()
     }
 
-    /// One 2048-sample I/Q pair. `push`ing one sample at a time is fine for
-    /// EP6 (63 I/Q per chunk × 2 chunks / frame = 126 I/Q per 1032-B packet);
-    /// for 2048 samples we drain ~16 packets.
+    /// Accumulate one complex I/Q sample, committing only full windows.
     pub fn push(&mut self, re: f32, im: f32) {
-        let idx = self.acc_re.len();
-        let w = self.win[idx % N_FFT];
-        self.acc_re.push(re * w);
-        self.acc_im.push(im * w);
-        if self.acc_re.len() >= N_FFT {
+        self.acc_re.push(re);
+        self.acc_im.push(im);
+        if self.acc_re.len() == N_FFT {
             self.commit_frame();
         }
     }
 
     /// Consume the next full 2048-sample window.
-    pub fn commit_frame(&mut self) {
-        let n = N_FFT.min(self.acc_re.len());
-        // Reuse the `buf_*` buffers: copy N_FFT samples from `acc_*` (drained
-        // oldest-first), apply DC-block, FFT, max-pool to `mags`.
-        for i in 0..n {
-            self.buf_re[i] = self.acc_re[i];
-            self.buf_im[i] = self.acc_im[i];
+    fn commit_frame(&mut self) {
+        debug_assert_eq!(self.acc_re.len(), N_FFT);
+        debug_assert_eq!(self.acc_im.len(), N_FFT);
+        // Remove the unwindowed mean first; windowing DC would spread it
+        // into adjacent bins that subtracting a post-window mean cannot fix.
+        let re_mean = self.acc_re.iter().sum::<f32>() / N_FFT as f32;
+        let im_mean = self.acc_im.iter().sum::<f32>() / N_FFT as f32;
+        for i in 0..N_FFT {
+            self.buf_re[i] = (self.acc_re[i] - re_mean) * self.win[i];
+            self.buf_im[i] = (self.acc_im[i] - im_mean) * self.win[i];
         }
-        self.acc_re.drain(..n);
-        self.acc_im.drain(..n);
+        self.acc_re.clear();
+        self.acc_im.clear();
 
-        // DC-block.
-        let mut re_sum = 0f32;
-        let mut im_sum = 0f32;
-        for (r, i) in self.buf_re[..n].iter().zip(self.buf_im[..n].iter()) {
-            re_sum += *r;
-            im_sum += *i;
-        }
-        let n_inv = 1.0 / n as f32;
-        let re_mean = re_sum * n_inv;
-        let im_mean = im_sum * n_inv;
-        for (r, i) in self.buf_re[..n].iter_mut().zip(self.buf_im[..n].iter_mut()) {
-            *r -= re_mean;
-            *i -= im_mean;
-        }
-
-        // FFT (window already applied at push).
         self.fft.process(&mut self.buf_re, &mut self.buf_im);
 
-        // Max-pool onto 320 display bins (port of `display_mags_into`).
-        let target = BINS.min(N_FFT);
-        let stride = (N_FFT / target).max(1);
-        for d in 0..target {
-            let lo = d * stride;
-            let hi = ((d + 1) * stride).min(N_FFT);
-            let nyq = (N_FFT / 2) as i64;
-            let start = (nyq - lo as i64).rem_euclid(N_FFT as i64) as usize;
+        // Partition all FFT bins proportionally. Preserve the reversed
+        // frequency orientation, with raw DC at display column BINS / 2.
+        for d in 0..BINS {
+            let lo = d * N_FFT / BINS;
+            let hi = (d + 1) * N_FFT / BINS;
             let mut peak = 0f32;
-            for j in 0..(hi - lo) {
-                let k = start.wrapping_sub(j).rem_euclid(N_FFT);
+            for j in lo..hi {
+                let k = (N_FFT + N_FFT / 2 - j) % N_FFT;
                 let s = self.buf_re[k] * self.buf_re[k] + self.buf_im[k] * self.buf_im[k];
                 if s > peak {
                     peak = s;
@@ -134,11 +109,6 @@ impl Pipeline {
             }
             let mag = (peak.sqrt() * 65_535.0).min(65_535.0) as u16;
             self.mags[d] = mag;
-        }
-        if self.mags.len() > target {
-            for m in &mut self.mags[target..] {
-                *m = 0;
-            }
         }
         self.frame_seq = self.frame_seq.wrapping_add(1);
     }
@@ -148,7 +118,7 @@ impl Pipeline {
         &self.mags
     }
 
-    /// Last frame seq (monotonic; 0 until first frame).
+    /// Wrapping frame sequence (initially 0).
     pub fn frame_seq(&self) -> u32 {
         self.frame_seq
     }
@@ -160,67 +130,75 @@ mod tests {
     use core::f32 as f32t;
     use num_traits::float::Float;
 
-    /// A complex exponential (single tone) must land in the display bin the
-    /// centred max-pool maps it to. We invert that mapping exactly: display
-    /// bin `d` shows raw bins `start − j` (j in [0,stride)) with
-    /// `start = (N/2 − d·stride) mod N`; so a tone at raw bin `b = start`
-    /// must peak display bin `d`.
+    // Amplitude keeps the unnormalized Hann-windowed FFT below saturation.
     #[test]
     fn peak_at_expected_display_bin() {
-        let n = N_FFT;
         let mut p = Pipeline::new().unwrap();
-        let stride = (n / BINS).max(1);
-        for target in [40usize, 100, 128, 200, 280] {
-            let lo = target * stride;
-            let start = ((n / 2) as i64 - lo as i64).rem_euclid(n as i64) as usize;
-            let b = start; // tone at the centre of the pool window for `target`.
-            let mut re = vec![0f32; n];
-            let mut im = vec![0f32; n];
-            for i in 0..n {
-                let ang = 2.0 * f32t::consts::PI * (i as f32 * b as f32 / n as f32);
-                re[i] = Float::cos(ang);
-                im[i] = Float::sin(ang);
+        // Fixed raw-bin / column pairs include both near-DC sides and bins
+        // in the final 128 positions that floor-stride pooling discarded.
+        for (b, target) in [
+            (1021, 0),
+            (512, 80),
+            (3, 159),
+            (-3, 160),
+            (-512, 240),
+            (-960, 310),
+            (-1020, 319),
+        ] {
+            for i in 0..N_FFT {
+                let ang = 2.0 * f32t::consts::PI * i as f32 * b as f32 / N_FFT as f32;
+                p.push(0.00025 * Float::cos(ang), 0.00025 * Float::sin(ang));
             }
-            for (r, i) in re.iter().zip(im.iter()) {
-                p.push(*r, *i);
-            }
-            let mags = &p.mags;
+            let mags = p.mags();
             let peak = mags.iter().enumerate().max_by_key(|(_, m)| **m).unwrap();
             let (pi, pm) = peak;
             assert!(
                 pi == target,
                 "target {target} (raw bin {b}): peak at {pi}, mag {pm}"
             );
+            let expected = 0.00025 * N_FFT as f32 / 2.0 * 65_535.0;
+            assert!((*pm as f32 - expected).abs() < 8.0, "peak magnitude {pm}");
         }
     }
 
-    /// DC (no signal) should show a flat low noise floor across all bins.
     #[test]
-    fn dc_is_centre() {
-        let n = 2048usize;
+    fn dc_is_removed_before_windowing() {
         let mut p = Pipeline::new().unwrap();
-        for _ in 0..n {
-            p.push(1.0, 0.0); // DC
+        for _ in 0..N_FFT {
+            p.push(0.125, -0.25);
         }
-        let mags: &[u16] = p.mags();
-        assert!(mags.len() == BINS);
-        // Bin BINS/2 = 160 = centre = DC. It should be the peak.
-        let half = BINS / 2;
-        let at_dc = mags[half];
-        assert!(at_dc > 0, "DC bin empty");
-        // All other bins should be near-zero.
-        for (i, m) in mags.iter().enumerate() {
-            if i == half {
-                continue;
-            }
-            let _ = (i, m);
+        assert!(p.mags().iter().all(|&m| m == 0));
+
+        let mut clean = Pipeline::new().unwrap();
+        for i in 0..N_FFT {
+            let ang = 2.0 * f32t::consts::PI * i as f32 * 512.0 / N_FFT as f32;
+            let re = 0.00025 * Float::cos(ang);
+            let im = 0.00025 * Float::sin(ang);
+            clean.push(re, im);
+            p.push(re + 0.125, im - 0.25);
+        }
+        for (&actual, &expected) in p.mags().iter().zip(clean.mags()) {
+            assert!(actual.abs_diff(expected) <= 16, "{actual} vs {expected}");
         }
     }
 
-    /// Max-pool to BINS must be exactly 320.
     #[test]
-    fn mags_len_is_bins() {
-        let p = Pipeline::new().unwrap();
+    fn only_full_windows_commit_and_sequence_wraps() {
+        let mut p = Pipeline::new().unwrap();
         assert_eq!(p.mags().len(), BINS);
+        for _ in 0..N_FFT - 1 {
+            p.push(0.0, 0.0);
+        }
+        assert_eq!(p.frame_seq(), 0);
+        assert_eq!(p.len(), N_FFT - 1);
+        p.push(0.0, 0.0);
+        assert_eq!(p.frame_seq(), 1);
+        assert_eq!(p.len(), 0);
+        p.frame_seq = u32::MAX;
+        for _ in 0..N_FFT {
+            p.push(0.0, 0.0);
+        }
+        assert_eq!(p.frame_seq(), 0);
+        assert_eq!(p.len(), 0);
     }
 }

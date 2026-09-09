@@ -207,6 +207,8 @@ mod tests {
     use crate::receiver::Demodulator;
     use crate::receiver::demod::{IqBlock, RawSampleTap};
     use crate::receiver::sink::VecSink;
+    use alloc::boxed::Box;
+    use std::eprintln;
 
     /// A proper **analytic** complex tone: `amp · e^(j·2π·f·t)`, i.e.
     /// `I = amp·cos(θ)`, `Q = amp·sin(θ)`.

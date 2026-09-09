@@ -2,15 +2,16 @@
 //!
 //! The `radio` task (ENET + EP6 pump + FFT) publishes one 320-bin
 //! `u16` magnitude row per spectrum frame; the `render` task drains the
-//! newest row onto the ILI9341 waterfall and redraws status. Single-core,
-//! one writer / one reader, so a pair of static bands + a monotonic
-//! sequence number is sufficient — no locks, no atomics-for-mutability
-//! beyond the seq.
+//! newest row onto the ILI9341 waterfall and redraws status. Row publication
+//! and snapshots copy a fixed-size buffer with interrupts disabled; readers
+//! own their snapshots, so later publishes cannot invalidate them.
 
+use core::cell::RefCell;
 use core::sync::atomic::{AtomicU32, Ordering};
+use cortex_m::interrupt::{self, Mutex};
 
 /// One spectrum row. Must equal `crate::spectrum::BINS` == `crate::display::WF_COLS`.
-pub const BINS: usize = 320;
+pub const BINS: usize = crate::spectrum::BINS;
 
 /// Session states for the status line (render task reads these).
 pub const STATE_WAITING_IP: u32 = 0;
@@ -21,54 +22,12 @@ pub const STATE_TUNING: u32 = 4;
 pub const STATE_STREAMING: u32 = 5;
 pub const STATE_ERROR: u32 = 6;
 
-struct Band {
-    inner: core::cell::UnsafeCell<[u16; BINS]>,
-}
-
-// Single-core, one writer (radio) + one reader (render).  It is sound to
-// share `&Band` references across tasks: the writer holds `&mut` via a
-// `&'static` pointer it obtains from the static, and the reader uses `&`.
-// They never execute concurrently (RTIC cooperative scheduling), so the
-// interior mutability does not expose a data race.
-unsafe impl Sync for Band {}
-
-impl Band {
-    const fn new() -> Self {
-        Self {
-            inner: core::cell::UnsafeCell::new([0u16; BINS]),
-        }
-    }
-
-    /// `&[u16; BINS]` view for the reader.
-    fn as_slice(&'static self) -> &'static [u16] {
-        unsafe { &*self.inner.get() }
-    }
-
-    /// `[u16; BINS]` writer view for the radio task.
-    fn as_mut(&'static self) -> &'static mut [u16] {
-        unsafe { &mut *self.inner.get() }
-    }
-}
-
-// Double buffer: the radio writes to the band it does NOT expose; the
-// render always reads the band the most-recent `SEQ` published. The two
-// tasks never run concurrently, so a mid-write read cannot happen, and the
-// extra band is defensive (reader keeps a valid frame if it ever yields
-// inside its own copy step).
-const fn band() -> Band {
-    Band::new()
-}
-static BAND0: Band = band();
-static BAND1: Band = band();
-
-/// Monotonic publish counter. Bit 0 is the band index the *reader* is to
-/// read (the band just published); higher bits are a free-running count.
-static SEQ: AtomicU32 = AtomicU32::new(0);
+static SNAPSHOT: Mutex<RefCell<(u32, [u16; BINS])>> = Mutex::new(RefCell::new((0, [0; BINS])));
 
 /// Session state (see `STATE_*`).
 static STATE: AtomicU32 = AtomicU32::new(STATE_WAITING_IP);
 
-/// Peer HL2 IP packed as a `u32` (octet 3 in the high byte) for the status line.
+/// Peer HL2 IP packed as a `u32` (first octet in the high byte).
 static PEER: AtomicU32 = AtomicU32::new(0);
 
 /// EP6 frames consumed by the radio task. Monotonic u32 (wraps at 4.29 B).
@@ -86,34 +45,20 @@ pub fn frames() -> u32 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Publish the next waterfall row. Called once per spectrum frame.
-///
-/// Band selection: `cur & 1` alternates BAND0/BAND1 on each call
-/// (cur 0→B0, cur 1→B1, cur 2→B0, …). `latest()` reads band
-/// `(seq − 1) & 1` — the band just written — so every publish is
-/// immediately visible to the renderer.
+/// Publish one complete waterfall row and advance the wrapping sequence.
 pub fn publish(row: &[u16]) {
-    let n = BINS.min(row.len());
-    let cur = SEQ.load(Ordering::Relaxed);
-    // `cur & 1` alternates band on every call (0 → B0, 1 → B1, 2 → B0, …).
-    // The reader (see `latest`) reads band `(SEQ − 1) & 1`, the band just
-    // written by the most-recent publish. This is correct because a
-    // cooperative-scheduling render task cannot read mid-publish, and the
-    // two publishes are never interleaved.
-    let band = cur & 1;
-    let next = if band == 0 { &BAND0 } else { &BAND1 };
-    next.as_mut()[..n].copy_from_slice(&row[..n]);
-    // Advance: bump the counter; the reader will now read this band.
-    SEQ.store(cur + 1, Ordering::Release);
+    assert_eq!(row.len(), BINS, "publish requires a complete row");
+    interrupt::free(|cs| {
+        let mut snapshot = SNAPSHOT.borrow(cs).borrow_mut();
+        snapshot.1.copy_from_slice(row);
+        snapshot.0 = snapshot.0.wrapping_add(1);
+    });
 }
 
-/// The last published row. Returns `(seq, &rows[..len])` where `seq == 0`
-/// means "no frames yet" (caller should skip the blit).
-pub fn latest() -> (u32, &'static [u16]) {
-    let seq = SEQ.load(Ordering::Acquire);
-    let band = ((seq - 1) & 1) as u32;
-    let body = if band == 0 { BAND0.as_slice() } else { BAND1.as_slice() };
-    (seq, body)
+/// Copy the last published row, initially `(0, [0; BINS])`.
+/// Compare sequence numbers with `!=`, not `>`, to handle wraparound.
+pub fn latest() -> (u32, [u16; BINS]) {
+    interrupt::free(|cs| *SNAPSHOT.borrow(cs).borrow())
 }
 
 pub fn set_state(s: u32) {

@@ -15,13 +15,11 @@ use teensy4_bsp::{board, ral};
 // accessible to ENET through the CM7 backdoor. Do not move these to cached
 // OCRAM without adding cache maintenance; atomics alone are not sufficient.
 // 64 RX descriptors so the MAC ring absorbs EP6 bursts while the render
-// task blocks the core for the full-screen SPI blit (≈37 ms at 22 MHz SCK).
-// With only 4 buffers the ring overflows after ~5 ms of starvation and ~50
-// datagrams are dropped per paint, starving the pipeline.
+// task blocks on SPI. At 96 kSps / 126 pairs per EP6 packet, these hold
+// about 84 ms of EP6 traffic (less with other Ethernet traffic).
 static RX: ConstStaticCell<ReceiveBuffers<64>> = ConstStaticCell::new(ReceiveBuffers::new());
 static TX: ConstStaticCell<TransmitBuffers<4>> = ConstStaticCell::new(TransmitBuffers::new());
 
-const ENET_CLOCK_HZ: u32 = 50_000_000;
 const PHY_RESET: u32 = 1 << 14; // GPIO_B0_14 / GPIO2_IO14
 const PHY_POWER: u32 = 1 << 15; // GPIO_B0_15 / GPIO2_IO15
 
@@ -99,7 +97,8 @@ impl Ethernet {
             instance,
             TX.take().take(),
             RX.take().take(),
-            ENET_CLOCK_HZ,
+            // MDC is divided from IPG, not the 50 MHz RMII reference.
+            board::IPG_FREQUENCY,
             mac,
         ));
         device.0.enable_rmii_mode(true);

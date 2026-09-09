@@ -55,21 +55,10 @@ pub trait DemodCore: Send + 'static {
     /// type name (e.g. `SsbCore` → `"SsbCore"`); override per-mode when you
     /// want `"ssb-usb"` etc.
     fn kind(&self) -> &'static str {
-        // `core::any::type_name` is not (yet) stabilised for `no_std`; the
-        // `std`-gated fallback below keeps the nice type-name in `std` builds
-        // while `no_std` consumers get a stable `"DemodCore"` label (per-mode
-        // cores override it with a fixed string anyway).
-        #[cfg(feature = "std")]
-        {
-            std::any::type_name::<Self>()
-                .rsplit("::")
-                .next()
-                .unwrap_or("DemodCore")
-        }
-        #[cfg(not(feature = "std"))]
-        {
-            "DemodCore"
-        }
+        core::any::type_name::<Self>()
+            .rsplit("::")
+            .next()
+            .unwrap_or("DemodCore")
     }
 
     /// Compose this core with the shared audio tail into a full [`Demodulator`].

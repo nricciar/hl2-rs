@@ -4,24 +4,22 @@
 //! Wire bytes come from `hl2::protocol` (AGENTS.md layering rule); this
 //! module only sequences them through smoltcp + tracks the send sequence.
 //!
-//! Session parameters (hardwired, matches the old monolith):
+//! Fixed session parameters:
 //!
 //!   RX1          7.074 MHz   (OC filter bank relay: `OC_RELAY`)
 //!   DDC rate     96 kSps     (C1 SPEED = `C1_SPEED_96K`)
 //!   n_recv       1
 //!   LNA          +6 dB       (`DEFAULT_LNA_GAIN_DB`)
-//!   keepalive    40 ms       (watchdog limit ≈ 168 ms)
+//!   keepalive    25 ms target (watchdog limit approximately 168 ms)
 //!
-//! Socket handles: `add()` returns a `SocketHandle` equal to the insertion
-//! index, so the DHCP socket added first is `#0` and the HL2 socket added
-//! second is `#1`. `make_radio` captures both return values into a
-//! `SocketHandles` struct; pass `&handles` to each `RadioHandle` call.
+//! Socket handles are captured from `SocketSet::add` during setup, not
+//! constructed from assumed slot indices.
 //!
 //! Port model: `LOCAL_PORT` is the local UDP source port the Teensy binds
 //! AND uses when sending C&C frames to the HL2. The HL2 echoes this
 //! source port back as the destination of its EP6 data stream (the same
-//! mechanism the `hl2` crate uses with an ephemeral port + `SO_REUSEADDR`
-//! on a real socket). smoltcp `udp::Socket::bind` requires a non-zero
+//! mechanism the `hl2` crate uses with an ephemeral source port).
+//! smoltcp `udp::Socket::bind` requires a non-zero
 //! port; once bound, all packets destined to `LOCAL_PORT` land on this
 //! socket regardless of source (UDP is connectionless on this socket).
 
@@ -30,26 +28,27 @@ use core::net::Ipv4Addr;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::{dhcpv4, udp};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, IpEndpoint, IpListenEndpoint, IpAddress};
+use smoltcp::wire::{EthernetAddress, IpAddress, IpEndpoint, IpListenEndpoint};
+use static_cell::ConstStaticCell;
 
-use hl2::protocol::discovery::{discovery_request, parse_discovery_response, DiscoveryInfo};
+use hl2::protocol::data::{
+    build_keepalive_packet, build_lna_gain_frame, build_nco_packet, build_start_stop_frame,
+};
+use hl2::protocol::discovery::{DiscoveryInfo, discovery_request, parse_discovery_response};
 use hl2::protocol::{
     C1_SPEED_96K, DATA_PACKET_SIZE, DEFAULT_LNA_GAIN_DB, DISCOVERY_RESPONSE_SIZE, HL2_PORT,
     OC_MASK_RX, START_REQUEST_SIZE,
 };
-use hl2::protocol::data::{
-    build_keepalive_packet, build_lna_gain_frame, build_nco_packet, build_start_stop_frame,
-};
 
 /// OC filter bank relay mask.
 /// LSB-first: bit 0 = relay 1 … bit 6 = relay 7 (see `hl2::protocol::OC_MASK_RX`).
-/// Current value selects relay 7 (`0b010_0000` = `0x40`).
+/// Current value selects relay 7 (`0b100_0000` = `0x40`).
 pub const OC_RELAY: u8 = 0x40 & OC_MASK_RX;
 
 /// RX1 NCO target (Hz) — 7.074 MHz.
 pub const TUNE_HZ: u32 = 7_074_000;
 
-/// RX1 slot (1-based; `build_nco_packet` maps slot → C0 = slot << 1).
+/// RX1 slot (1-based; `build_nco_packet` maps slot 1 to C0 = 0x04).
 const RX1_SLOT: u8 = 1;
 
 /// Active receiver count (1 = single-slot RX1).
@@ -61,14 +60,8 @@ pub const SAMPLE_RATE_KHZ: u32 = 96;
 /// Default LNA gain (dB), re-exported for the status text.
 pub const LNA_GAIN_DB: i8 = DEFAULT_LNA_GAIN_DB;
 
-/// Keep-alive cadence in ms (HL2 resets after ≈ 168 ms of silence).
-///
-/// The `hl2` crate ships 40 ms as the host default; this board runs a
-/// single-core cooperative RTIC app where the render task can hold the
-/// core for tens of milliseconds per waterfull row, so we tighten the
-/// cadence to 25 ms. Even if the render task eats one tick, the worst
-/// gap between two actual sends is ~50 ms — well inside the 168 ms
-/// watchdog, instead of ~80 ms at the 40 ms cadence.
+/// Target keep-alive cadence in ms. Blocking work can delay actual sends;
+/// the caller must keep gaps below the approximately 168 ms watchdog limit.
 pub const KEEPALIVE_INTERVAL_MS_CONST: u64 = 25;
 
 /// Local (Teensy) MAC. Change for each board on the same LAN.
@@ -79,73 +72,38 @@ pub const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
 pub const LOCAL_PORT: u16 = 40000;
 
 /// UDP datagram slot count per direction (rx and tx are separate arrays).
-/// Each slot holds one in-flight datagram; 8 is enough for a 1032 B EP6
-/// burst with ~6 ms inter-frame spacing (≈ 3 in flight at peak).
+/// At 96 kSps, 126 pairs per EP6 packet means about 1.31 ms per packet.
+/// Eight slots buffer about 10.5 ms; the ENET ring buffers additional traffic.
 const HL2_SLOTS: usize = 8;
-/// Payload length per slot. Must be ≥ `DATA_PACKET_SIZE` (1032) + 8 B
-/// for the smoltcp UDP metadata envelope + L2/L3/IP/UDP overhead.
+/// Payload capacity budget per slot. UDP metadata is stored separately;
+/// link, IP and UDP headers are not part of this payload buffer.
 const HL2_SLOT: usize = 1280;
 
-// Per-socket storage (`SocketStorage<'static>`). Held in an
-// `UnsafeCell` because we need a `&'static mut [..]` slice to pass to
-// `SocketSet::new` while also returning a `SocketSet<'static>` owned by
-// the caller. Single-core system; `get()` is called exactly once from
-// `build_iface_and_sockets`, which is called exactly once at startup.
-// Safety invariant: after the first `get()` call, no second call happens.
-struct SocketStorageUnsafe {
-    inner: core::cell::UnsafeCell<[smoltcp::iface::SocketStorage<'static>; 2]>,
-}
-unsafe impl Sync for SocketStorageUnsafe {}
-static SOCKET_STORAGE_UNSAFE: SocketStorageUnsafe = SocketStorageUnsafe {
-    inner: core::cell::UnsafeCell::new([smoltcp::iface::SocketStorage::EMPTY; 2]),
-};
+static SOCKET_STORAGE: ConstStaticCell<[smoltcp::iface::SocketStorage<'static>; 2]> =
+    ConstStaticCell::new([smoltcp::iface::SocketStorage::EMPTY; 2]);
+static UDP_RX_META: ConstStaticCell<[udp::PacketMetadata; HL2_SLOTS]> =
+    ConstStaticCell::new([udp::PacketMetadata::EMPTY; HL2_SLOTS]);
+static UDP_TX_META: ConstStaticCell<[udp::PacketMetadata; HL2_SLOTS]> =
+    ConstStaticCell::new([udp::PacketMetadata::EMPTY; HL2_SLOTS]);
+static UDP_RX: ConstStaticCell<[u8; HL2_SLOTS * HL2_SLOT]> =
+    ConstStaticCell::new([0; HL2_SLOTS * HL2_SLOT]);
+static UDP_TX: ConstStaticCell<[u8; HL2_SLOTS * HL2_SLOT]> =
+    ConstStaticCell::new([0; HL2_SLOTS * HL2_SLOT]);
 
-/// `udp::PacketMetadata` ring + payload rings. One per slot. Consumed
-/// exactly once by `make_udp_socket` via raw pointer reassembly.
-static UDP_META: [udp::PacketMetadata; HL2_SLOTS] = [udp::PacketMetadata::EMPTY; HL2_SLOTS];
-static UDP_RX: [u8; HL2_SLOTS * HL2_SLOT] = [0u8; HL2_SLOTS * HL2_SLOT];
-static UDP_TX: [u8; HL2_SLOTS * HL2_SLOT] = [0u8; HL2_SLOTS * HL2_SLOT];
-
-/// Build the HL2 `udp::Socket`. `UDP_META` / `UDP_RX` / `UDP_TX` are
-/// declared once per process and consumed exactly once here.
+/// Build the HL2 UDP socket, taking its separate RX/TX storage once.
+/// Panics if called a second time.
 pub fn make_udp_socket() -> udp::Socket<'static> {
-    // Safety: `UDP_META`/`UDP_RX`/`UDP_TX` are declared once per process,
-    // passed in here exactly once, and are `static` (no aliasing). smoltcp
-    // does not copy the metadata; it owns them from this point.
-    unsafe {
-        let rx_meta = core::slice::from_raw_parts_mut(
-            UDP_META.as_ptr() as *mut udp::PacketMetadata,
-            UDP_META.len(),
-        );
-        let rx_payload = core::slice::from_raw_parts_mut(
-            UDP_RX.as_ptr() as *mut u8,
-            UDP_RX.len(),
-        );
-        let tx_meta = core::slice::from_raw_parts_mut(
-            UDP_META.as_ptr() as *mut udp::PacketMetadata,
-            UDP_META.len(),
-        );
-        let tx_payload = core::slice::from_raw_parts_mut(
-            UDP_TX.as_ptr() as *mut u8,
-            UDP_TX.len(),
-        );
-        let rx = udp::PacketBuffer::new(rx_meta, rx_payload);
-        let tx = udp::PacketBuffer::new(tx_meta, tx_payload);
-        let mut s = udp::Socket::new(rx, tx);
-        // Bind to `LOCAL_PORT` — this becomes both the local source port
-        // for C&C sends (below: `IpEndpoint { addr: peer, port: HL2_PORT }`)
-        // and the destination we receive EP6 data frames on (the HL2
-        // echoes our source port as the data-stream destination).
-        if let Err(e) = s.bind(IpListenEndpoint::from(LOCAL_PORT)) {
-            log::error!("HL2 socket bind: {e}");
-        }
-        s
-    }
+    let rx = udp::PacketBuffer::new(&mut UDP_RX_META.take()[..], &mut UDP_RX.take()[..]);
+    let tx = udp::PacketBuffer::new(&mut UDP_TX_META.take()[..], &mut UDP_TX.take()[..]);
+    let mut s = udp::Socket::new(rx, tx);
+    s.bind(IpListenEndpoint::from(LOCAL_PORT))
+        .expect("nonzero local port on a new socket");
+    s
 }
 
 /// The radio-side state the `radio` task owns.
 pub struct Radio {
-    pub peer: Ipv4Addr,
+    peer: Ipv4Addr,
     /// Monotonically-increasing send sequence. The HL2 does not
     /// strictly enforce monotonicity; wrap-around is allowed.
     seq: u32,
@@ -157,14 +115,6 @@ impl Radio {
             peer: Ipv4Addr::UNSPECIFIED,
             seq: 0,
         }
-    }
-
-    pub fn set_peer(&mut self, ip: Ipv4Addr) {
-        self.peer = ip;
-    }
-
-    pub fn peer(&self) -> Ipv4Addr {
-        self.peer
     }
 
     fn next_seq(&mut self) -> u32 {
@@ -190,7 +140,14 @@ impl Radio {
 
     /// Build an RX1 NCO frame (1032 B) at `hz`.
     pub fn build_tune(&mut self, hz: u32) -> [u8; DATA_PACKET_SIZE] {
-        build_nco_packet(self.next_seq(), RX1_SLOT, hz, C1_SPEED_96K, OC_RELAY, N_RECV)
+        build_nco_packet(
+            self.next_seq(),
+            RX1_SLOT,
+            hz,
+            C1_SPEED_96K,
+            OC_RELAY,
+            N_RECV,
+        )
     }
 
     /// Build a keep-alive frame (1032 B).
@@ -205,9 +162,7 @@ impl Radio {
     }
 }
 
-/// Socket handles captured at setup time. `add()` returns handles matching
-/// the insertion index, so a fixed `SocketHandles { dhcp: 0, hl2: 1 }`
-/// works for a `SocketSet` whose first two slots are DHCP + HL2.
+/// Socket handles returned by `SocketSet::add` at setup time.
 #[derive(Debug)]
 pub struct SocketHandles {
     pub dhcp: SocketHandle,
@@ -216,32 +171,17 @@ pub struct SocketHandles {
 
 /// Build the smoltcp `Interface` + a two-socket `SocketSet` (DHCP + HL2 UDP).
 ///
-/// The `socket_storage` array must outlive the returned `SocketSet` — it
-/// holds per-socket metadata. It is declared `static` in this module
-/// (`SOCKET_STORAGE`), not a local, so the returned `SocketSet<'static>`
-/// can borrow it for the life of the process.
+/// Takes static socket storage once; panics if called a second time.
 pub fn build_iface_and_sockets(
     dev: &mut (impl smoltcp::phy::Device + ?Sized),
     mac: [u8; 6],
     now: Instant,
 ) -> (Interface, SocketSet<'static>, SocketHandles) {
     let iface = Interface::new(Config::new(EthernetAddress(mac).into()), dev, now);
-    // SAFETY: `SOCKET_STORAGE_UNSAFE.inner` is `static`, written to exactly
-    // once (this `get()` call) and read thereafter only by the `SocketSet`
-    // that borrows from it. Single-core, cooperative scheduling.
-    let storage: &mut [smoltcp::iface::SocketStorage<'static>] =
-        unsafe { &mut *SOCKET_STORAGE_UNSAFE.inner.get() };
-    let mut set = SocketSet::new(storage);
+    let mut set = SocketSet::new(&mut SOCKET_STORAGE.take()[..]);
     let dhcp = set.add(dhcpv4::Socket::new());
     let hl2 = set.add(make_udp_socket());
-    (
-        iface,
-        set,
-        SocketHandles {
-            dhcp,
-            hl2,
-        },
-    )
+    (iface, set, SocketHandles { dhcp, hl2 })
 }
 
 /// `Radio` + the smoltcp surfaces the `radio` task needs to drive
@@ -357,7 +297,7 @@ impl<'a, D: smoltcp::phy::Device + ?Sized> RadioHandle<'a, D> {
         self.pump();
     }
 
-    /// Broadcast a discovery request (60 B datagram) to `HL2_PORT`.
+    /// Broadcast a discovery request (63 B datagram) to `HL2_PORT`.
     pub fn send_discovery(&mut self) {
         let s = self.sockets.get_mut::<udp::Socket>(self.handles.hl2);
         let dst = IpEndpoint {
@@ -372,7 +312,7 @@ impl<'a, D: smoltcp::phy::Device + ?Sized> RadioHandle<'a, D> {
     }
 
     /// Receive the next datagram into `buf` (non-blocking). Returns
-    /// `(len, src_ip)` or `None` if the socket is empty.
+    /// `(len, src_ip)` or `None` if empty or the datagram exceeds `buf`.
     pub fn recv(&mut self, buf: &mut [u8]) -> Option<(usize, Ipv4Addr)> {
         let s = self.sockets.get_mut::<udp::Socket>(self.handles.hl2);
         if !s.can_recv() {
@@ -415,21 +355,10 @@ impl<'a, D: smoltcp::phy::Device + ?Sized> RadioHandle<'a, D> {
         self.send_cc(&buf);
     }
 
-    /// Send one keep-alive. Logs the result so a USB capture shows the
-    /// keep-alive cadence (HL2 watchdog is ≈168 ms; our cadence is 40 ms).
+    /// Send one keep-alive through the normal C&C path.
     pub fn send_keepalive(&mut self) {
         let buf = self.radio.build_keepalive();
-        let dst = self.cc_dst();
-        let s = self.sockets.get_mut::<udp::Socket>(self.handles.hl2);
-        match s.send_slice(&buf, dst) {
-            Ok(()) => {
-                log::info!("keepalive → {dst}");
-                self.pump();
-            }
-            Err(e) => {
-                log::warn!("keepalive → {dst} FAILED: {e:?}");
-            }
-        }
+        self.send_cc(&buf);
     }
 
     /// Parse a datagram as a discovery reply.
@@ -445,24 +374,19 @@ impl<'a, D: smoltcp::phy::Device + ?Sized> RadioHandle<'a, D> {
     pub fn peer(&self) -> Ipv4Addr {
         self.radio.peer
     }
-
-    /// Keep-alive cadence (ms).
-    pub const fn keepalive_interval_ms() -> u64 {
-        KEEPALIVE_INTERVAL_MS_CONST
-    }
 }
 
-/// A minimal `core::fmt::Write` target over a byte slice, used by
-/// `main.rs::fmt_ip` to format the peer IP without `alloc`.
-pub struct WriteBuf {
-    pub target: &'static mut [u8],
+/// A bounded `core::fmt::Write` target borrowing caller-owned storage.
+pub struct WriteBuf<'a> {
+    pub target: &'a mut [u8],
     pub pos: usize,
 }
 
-impl core::fmt::Write for WriteBuf {
+impl core::fmt::Write for WriteBuf<'_> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let end = (self.pos + s.len()).min(self.target.len());
-        self.target[self.pos..end].copy_from_slice(&s.as_bytes()[..end - self.pos]);
+        let end = self.pos.checked_add(s.len()).ok_or(core::fmt::Error)?;
+        let dst = self.target.get_mut(self.pos..end).ok_or(core::fmt::Error)?;
+        dst.copy_from_slice(s.as_bytes());
         self.pos = end;
         Ok(())
     }
@@ -471,6 +395,40 @@ impl core::fmt::Write for WriteBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_buf_borrows_local_storage_and_rejects_overflow() {
+        use core::fmt::Write;
+        let mut buf = [0; 8];
+        let mut w = WriteBuf {
+            target: &mut buf,
+            pos: 0,
+        };
+        write!(w, "F {}", 123).unwrap();
+        assert_eq!(&w.target[..w.pos], b"F 123");
+        assert!(w.write_str("4567").is_err());
+        assert_eq!(w.pos, 5);
+        w.write_str("456").unwrap();
+        assert_eq!(&w.target[..w.pos], b"F 123456");
+        w.write_str("").unwrap();
+        assert!(w.write_str("7").is_err());
+        w.pos = usize::MAX;
+        assert!(w.write_str("7").is_err());
+    }
+
+    #[test]
+    fn udp_storage_is_separate_and_taken_once() {
+        let mut socket = make_udp_socket();
+        assert_eq!(socket.endpoint().port, LOCAL_PORT);
+        socket
+            .send_slice(b"control", (Ipv4Addr::LOCALHOST, HL2_PORT))
+            .unwrap();
+        assert!(!socket.can_recv());
+        assert!(UDP_RX_META.try_take().is_none());
+        assert!(UDP_TX_META.try_take().is_none());
+        assert!(UDP_RX.try_take().is_none());
+        assert!(UDP_TX.try_take().is_none());
+    }
 
     /// `OC_RELAY` (currently relay 7 = 0x40) encodes to the C2 wire byte
     /// expected by `build_keepalive_packet`: bits 7:1 ← `oc_bits & 0x7F`,
@@ -495,7 +453,7 @@ mod tests {
         );
     }
 
-    /// NCO frame for RX1 @ 7.074 MHz has C0 = 0x04 (slot 1 → << 1).
+    /// NCO frame for RX1 @ 7.074 MHz has C0 = 0x04.
     #[test]
     fn nco_frame_rx1() {
         let mut radio = Radio::new();

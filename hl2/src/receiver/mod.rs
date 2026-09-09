@@ -79,6 +79,8 @@ pub use demod::{
 /// at least one digital mode is enabled.
 #[cfg(any(feature = "ft8", feature = "ft4", feature = "js8"))]
 pub use demod::{DigitalCore, DigitalDemodulator};
+#[cfg(feature = "std")]
+pub use fanout::BasebandFanout;
 #[cfg(feature = "ft4")]
 pub use ft4::{
     FT4_SAMPLE_RATE_HZ, FT4_SLOT_MS, FT4_SLOT_WINDOW_SAMPLES, Ft4Decoder, Ft4Message, Ft4Tap,
@@ -113,13 +115,7 @@ pub use sink::{BUF_SINK_DEFAULT_CAP, BufSink, BufSinkHandle};
 pub use source::{BasebandSource, VecSource};
 
 /// A receiver-mode-specific error.
-/// A receiver-mode-specific error. Same shape as
-/// [`crate::receiver::demod::DemodError`]: `std::error::Error` in `std`
-/// builds (so callers can print `{e}`) and `Debug` in `no_std` builds.
-#[cfg(feature = "std")]
-pub type ReceiverError = Box<dyn std::error::Error + Send + Sync>;
-#[cfg(not(feature = "std"))]
-pub type ReceiverError = Box<dyn core::fmt::Debug + Send + Sync>;
+pub type ReceiverError = Box<dyn core::error::Error + Send + Sync>;
 
 /// SSB sideband.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -330,9 +326,7 @@ impl VirtualReceiver {
     /// (its AGC/DC-block accumulator) and then the sink itself.
     pub fn flush(&mut self) -> Result<(), ReceiverError> {
         self.demod.flush(&mut *self.sink)?;
-        self.sink
-            .flush()
-            .map_err(|e| -> ReceiverError { Box::new(e) })
+        self.sink.flush()
     }
 
     /// Stream an entire [`BasebandSource`] through the demodulator to the
@@ -419,5 +413,30 @@ mod tests {
         ] {
             VirtualReceiver::new(cfg(m), Box::new(VecSink::new())).expect("receiver build");
         }
+    }
+
+    #[test]
+    fn virtual_receiver_preserves_sink_errors() {
+        struct FailingSink;
+        impl AudioSink for FailingSink {
+            fn write(&mut self, _: &[i16]) -> Result<usize, SinkError> {
+                Err(std::io::Error::other("write failed").into())
+            }
+
+            fn flush(&mut self) -> Result<(), SinkError> {
+                Err(std::io::Error::other("flush failed").into())
+            }
+        }
+
+        let mut rx = VirtualReceiver::new(ReceiverConfig::default(), Box::new(FailingSink))
+            .expect("receiver build");
+        let err = rx.flush().unwrap_err();
+        assert!(err.downcast_ref::<std::io::Error>().is_some());
+        assert_eq!(alloc::format!("{err}"), "flush failed");
+
+        let iq = tone(rx.config().source_rate_hz, 1_500.0, 12000, 0.5);
+        let err = rx.process(&iq).unwrap_err();
+        assert!(err.downcast_ref::<std::io::Error>().is_some());
+        assert_eq!(alloc::format!("{err}"), "write failed");
     }
 }

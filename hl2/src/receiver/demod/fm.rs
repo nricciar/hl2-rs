@@ -177,6 +177,8 @@ mod tests {
     use super::*;
     use crate::receiver::Demodulator;
     use crate::receiver::sink::VecSink;
+    use alloc::{boxed::Box, vec};
+    use std::eprintln;
 
     const PI: f64 = std::f64::consts::PI;
 

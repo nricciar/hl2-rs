@@ -25,6 +25,8 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
+#[cfg(all(test, not(feature = "std")))]
+extern crate std;
 
 /// The `tokio`-based control client ([`hl2`]): one owned, clonable handle to a
 /// radio plus a spawned receive pump. Requires `client`.
@@ -48,7 +50,7 @@ pub use hl2::{
 pub use protocol::data::{BasebandChunk, IQBlock};
 pub use protocol::discovery::DiscoveryInfo;
 /// Per-slot EP6 baseband fan-out (one [`BasebandRing`] per active slot).
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "dsp"))]
 pub use receiver::fanout::BasebandFanout;
 
 /// RX LNA gain register + default (dB). See PROTOCOL.md §11.3.

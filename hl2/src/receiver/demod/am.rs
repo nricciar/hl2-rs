@@ -125,6 +125,7 @@ mod tests {
     use super::*;
     use crate::receiver::Demodulator;
     use crate::receiver::sink::VecSink;
+    use alloc::{boxed::Box, vec};
 
     /// Analytic complex tone.
     fn complex_sine(rate_hz: u32, freq_hz: f64, n_pairs: usize, amp: f32) -> super::super::IqBlock {

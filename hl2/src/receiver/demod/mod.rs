@@ -87,18 +87,10 @@ impl fmt::Display for RateTooClose {
         )
     }
 }
-#[cfg(feature = "std")]
-impl std::error::Error for RateTooClose {}
+impl ::core::error::Error for RateTooClose {}
 
-/// Demodulator error. Carries `Display + Debug` in `std` builds (via the
-/// `std::error::Error` supertrait, so callers can print `{e}`) and `Debug`
-/// in `no_std` builds where `std::error::Error` isn't available. Two
-/// non-auto traits can't be combined in one `dyn` object, so each world gets
-/// a single-trait box.
-#[cfg(feature = "std")]
-pub type DemodError = Box<dyn std::error::Error + Send + Sync>;
-#[cfg(not(feature = "std"))]
-pub type DemodError = Box<dyn fmt::Debug + Send + Sync>;
+/// Demodulator error.
+pub type DemodError = Box<dyn ::core::error::Error + Send + Sync>;
 
 /// A block of complex I/Q baseband samples: `Vec<Complex<f32>>`.
 pub type IqBlock = Vec<Complex<f32>>;

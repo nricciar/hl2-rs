@@ -14,47 +14,11 @@
 //! a complex baseband (or 24-bit) output can add a *sibling* trait instead of
 //! complicating the common one (PROTOCOL.md §16.3).
 
-use alloc::string::String;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-/// Sink error. A small concrete enum (instead of a `Box<dyn std::error::Error>`)
-/// so the sink trait works in `no_std` builds. `std::io::Error` (used by
-/// `AlsaSink`) can be carried in [`SinkError::Io`]. Not `PartialEq`/`Eq`/
-/// `Clone` because the `Io` variant holds a plain-old `std::io::Error`
-/// (which itself is a non-`PartialEq`, non-`Clone` type).
-#[derive(Debug)]
-pub enum SinkError {
-    /// The sink is not in a state to accept the sample(s) (e.g. its buffer is
-    /// full and the overflow policy is to refuse, not to drop).
-    Full,
-    /// A transport / device failure (e.g. the ALSA device vanished). Carries
-    /// the underlying `std::io::Error` for `std`-build callers.
-    #[cfg(feature = "std")]
-    Io(std::io::Error),
-    /// A sink-specific message (e.g. "no default output device").
-    Message(String),
-}
-
-impl core::fmt::Display for SinkError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Full => write!(f, "sink buffer full"),
-            #[cfg(feature = "std")]
-            Self::Io(e) => write!(f, "sink I/O error: {e}"),
-            Self::Message(m) => write!(f, "{m}"),
-        }
-    }
-}
-
-#[cfg(feature = "std")]
-impl From<std::io::Error> for SinkError {
-    fn from(e: std::io::Error) -> Self {
-        Self::Io(e)
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for SinkError {}
+/// Sink error.
+pub type SinkError = Box<dyn core::error::Error + Send + Sync>;
 
 /// An audio sink takes demodulated `i16` mono samples and does something with
 /// them (play, record, etc.).
@@ -385,10 +349,8 @@ impl AlsaSink {
                 error_handler,
                 None,
             )
-            .map_err(|e| SinkError::Message(e.to_string()))?;
-        stream
-            .play()
-            .map_err(|e| SinkError::Message(e.to_string()))?;
+            .map_err(|e| Box::new(e) as SinkError)?;
+        stream.play().map_err(|e| Box::new(e) as SinkError)?;
 
         Ok(Self {
             _stream: stream,

@@ -81,12 +81,12 @@ js8 = ["std", "dsp", "dep:rustfft", "dep:hl2-common"]
 digital = ["ft8", "ft4", "js8"]
 
 # ALSA sink via `cpal`.
-alsa = ["std", "dep:cpal"]
+alsa = ["std", "dsp", "dep:cpal"]
 
 # Integration tests (a live HL2 + the `client` API).
 integration-tests = ["client"]
 
-# JS8 decoder tracing (no-op without `js8`).
+# JS8 decoder tracing (enables `js8`).
 js8_trace = ["js8"]
 
 [[bin]]

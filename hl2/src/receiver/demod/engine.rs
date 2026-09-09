@@ -11,7 +11,6 @@
 //! The normalisation itself — DC block, slow RMS-targeted AGC, gain — is in
 //! [`normalize_to_i16_with_agc`].
 
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -35,8 +34,6 @@ use crate::receiver::sink::AudioSink;
 const AUDIO_EMIN: usize = 240;
 
 /// Gated (HL2_DEBUG) instrument counter so we don't flood on every emit.
-/// Present only in `std` builds: the debug `eprintln!` gate it feeds is
-/// `std`-only (a `no_std` consumer reads the env var via its own runtime).
 #[cfg(feature = "std")]
 static EMIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -55,9 +52,7 @@ pub struct AudioEngine {
     /// task.
     tap: Option<Arc<dyn RawSampleTap>>,
     /// A short label for the HL2_DEBUG gated emit trace (`"ssb"` / `"am"` / …).
-    /// Only read in `std` builds (the debug `eprintln!` gate), so it is dead
-    /// code in a pure `no_std` build — kept for the `std` diagnostic path.
-    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    #[cfg(feature = "std")]
     mode_label: &'static str,
 }
 
@@ -65,11 +60,14 @@ impl AudioEngine {
     /// Build an empty tail at `rate_hz` / `gain_db`, AGC gain seeded at
     /// 1000.0 (updated on the first emit).
     pub fn new(rate_hz: u32, gain_db: f32, mode_label: &'static str) -> Self {
+        #[cfg(not(feature = "std"))]
+        let _ = mode_label;
         Self {
             audio_cfg: AudioConfig { rate_hz, gain_db },
             agc_gain: 1000.0,
             audio_buf: Vec::with_capacity(256),
             tap: None,
+            #[cfg(feature = "std")]
             mode_label,
         }
     }
@@ -154,7 +152,6 @@ impl AudioEngine {
             }
         }
         sink.write(&out[..written])
-            .map_err(|e| -> super::DemodError { Box::new(e) })
     }
 }
 

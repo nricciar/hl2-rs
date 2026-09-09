@@ -1,6 +1,6 @@
 //! Radix-2 in-place complex FFT for power-of-two sizes.
 //!
-//! `no_std` — only `core` and libm (via `num-traits::float::Float`) are used.
+//! `no_std` with an allocated twiddle table and libm via `num-traits`.
 //! Pre-computes the twiddle-factor table once, so steady-state frames run
 //! without any trig calls.
 
@@ -15,22 +15,13 @@ pub struct Fft {
 }
 
 impl Fft {
-    /// Size of the DFT. Must be a power of two; 4 or larger.
-    pub fn n(&self) -> usize {
-        self.n
-    }
-
-    /// Build the twiddle table once for all stages. The largest twiddle index
-    /// used in any butterfly is `(n/2 - 1) * 2` (the first stage,
-    /// `step = 1`, `k = m = n/2 - 1`). We store `4 * (n/2)` entries so every
-    /// index fits — `n/4 * 4 == n` covers both halves of the unit circle;
-    /// indices above `n` wrap modulo `n` in the table because
-    /// `e^(2πi*k/n)` is periodic in `k` with period `n`.
+    /// Build an FFT for a power-of-two size of at least four. Every stage
+    /// uses twiddle indices below n/2; the final stage reaches n/2 - 1.
     pub fn new(n: usize) -> Result<Self, &'static str> {
         if n < 4 || n & (n - 1) != 0 {
             return Err("n must be a power of two ≥ 4");
         }
-        let tw: Vec<(f32, f32)> = (0..n)
+        let tw: Vec<(f32, f32)> = (0..n / 2)
             .map(|k| {
                 let ang = -2.0_f32 * core::f32::consts::PI * (k as f32 / n as f32);
                 (Float::cos(ang), Float::sin(ang))
@@ -39,16 +30,12 @@ impl Fft {
         Ok(Self { n, tw })
     }
 
-    /// In-place forward DFT over `re[0..n)`, `im[0..n)`.
-    ///
-    /// The result is in bit-reversed order corrected by the standard
-    /// iterative radix-2 butterfly sequence, so `out[k]` is the `k`-th DFT
-    /// bin in natural order.
+    /// In-place, unnormalized forward DFT, returned in natural bin order.
+    /// Panics unless both input slices have exactly the configured length.
     pub fn process(&self, re: &mut [f32], im: &mut [f32]) {
-        let n = self.n.min(re.len()).min(im.len());
-        let n_full = self.n;
-        debug_assert_eq!(re.len(), n_full, "re.len() must equal fft.n");
-        debug_assert_eq!(im.len(), n_full, "im.len() must equal fft.n");
+        let n = self.n;
+        assert_eq!(re.len(), n, "re.len() must equal fft.n");
+        assert_eq!(im.len(), n, "im.len() must equal fft.n");
         let tw = &self.tw;
 
         // Bit-reversal permutation.
@@ -75,7 +62,7 @@ impl Fft {
                 let mut k = 0usize;
                 let mut m = start;
                 while m < start + half {
-                    let (wr, wi) = tw[k % tw.len()];
+                    let (wr, wi) = tw[k];
                     let a_re = re[m + half];
                     let a_im = im[m + half];
                     let b_re = a_re * wr - a_im * wi;
@@ -98,10 +85,6 @@ mod tests {
     use super::*;
     use alloc::vec;
     use core::f32::consts;
-
-    fn power_of_two(n: usize) -> bool {
-        n > 0 && n & (n - 1) == 0
-    }
 
     #[test]
     fn new_rejects_bad_n() {
@@ -127,7 +110,10 @@ mod tests {
             f.process(&mut re, &mut im);
             for k in 0..n {
                 let mag = (re[k] * re[k] + im[k] * im[k]).sqrt();
-                assert!((mag - 1.0).abs() < 1e-3, "impulse p={p} bin {k}: mag={mag} (want 1)");
+                assert!(
+                    (mag - 1.0).abs() < 1e-3,
+                    "impulse p={p} bin {k}: mag={mag} (want 1)"
+                );
             }
         }
     }
@@ -211,6 +197,17 @@ mod tests {
             let d_im = (y_im[k] - sum_im).abs();
             assert!(d_re < 1e-2 && d_im < 1e-2, "bin {k}: diff ({d_re}, {d_im})");
         }
-        let _ = power_of_two;
+    }
+
+    #[test]
+    #[should_panic(expected = "re.len() must equal fft.n")]
+    fn rejects_short_real_input() {
+        Fft::new(4).unwrap().process(&mut [0.0; 3], &mut [0.0; 4]);
+    }
+
+    #[test]
+    #[should_panic(expected = "im.len() must equal fft.n")]
+    fn rejects_long_imaginary_input() {
+        Fft::new(4).unwrap().process(&mut [0.0; 4], &mut [0.0; 5]);
     }
 }

@@ -206,6 +206,15 @@ for the first acknowledgement datagram, drain a few more, then start the pump �
 lives in `Hl2::start()`, `hl2/src/hl2.rs:106`. `Hl2::stop()` sends the Stop
 frame, `hl2.rs:290`.
 
+The Teensy proof of concept uses the same frame builders through
+`teensy/src/radio/control.rs::RadioHandle`. It sends STOP, waits 150 ms,
+then sends START, LNA and RX1 tuning before entering the receive loop.
+The loop targets a 25 ms keep-alive interval; display work yields between
+the waterfall blit and status redraw to let reception and keep-alives run.
+Discovery uses the UDP reply's source IP rather than its stored EEPROM IP.
+Its receive path (`teensy/src/radio/rx.rs::Rx`) retains two chunk buffers,
+including across invalid sync prefixes, for its non-reclaiming allocator.
+
 > **[full spec]** See openHPSDR for the original protocol 1 `Command`/`C&C`
 > semantics that Start/Stop sit on top of.
 
@@ -875,11 +884,23 @@ offset  8: R records, each = N×(I 3B BE | Q 3B BE) | mic 2B
   a slot ID — the old "C0 >> 3 = slot" gating dropped valid chunks and is what
   made the UI spectrum read flat-max.
 
-→ Implemented in [`parse_baseband_chunk`](hl2/src/protocol/data.rs:128) /
-  [`parse_baseband_frame`](hl2/src/protocol/data.rs:172); the resulting
-  [`BasebandChunk.per_rx`](hl2/src/protocol/data.rs:92) holds
+→ Implemented in `hl2/src/protocol/data.rs`:
+  `parse_baseband_chunk` / `parse_baseband_frame`; the resulting
+  `BasebandChunk.per_rx` holds
   `Vec<Vec<Complex<f32>>>` (one inner `Vec` per active receiver, in RX1, RX2, …
   order).
+
+`parse_receive_packet_into` in the same module reuses caller-owned scratch
+buffers. Its `ParsedPacketInto.baseband` is a current-frame slice (empty on
+EP2/EP4), not a mutable reference to the scratch vector. The baseband scratch
+vector is left untouched on non-EP6 frames to retain its inner allocations;
+consumers must read the returned view rather than the scratch vector. With
+valid EP6 chunks and a constant receiver count, interleaved EP2/EP4 frames do
+not cause baseband reallocation. `iq` is filled on EP4 and cleared otherwise.
+The owned `parse_receive_packet` output and wire layout are unchanged.
+→ Regression: `receive_packet_into_preserves_baseband_on_non_ep6` in
+  `hl2/src/protocol/data.rs` checks EP6 → EP2 → EP4 → changed EP6, including
+  current-frame output and buffer reuse for both chunks.
 
 #### Per-receiver rate
 
@@ -1566,7 +1587,8 @@ The EP6 pump now feeds **every** active slot, not just RX1. This is the
   slot order.
 * **Parse = de-interleave.** Each frame the pump snapshots
   `(N, rings)` from the fan-out and calls
-  `parse_receive_packet(&buf, N)` → `parse_baseband_chunk(…, N)`, splitting the
+  `parse_receive_packet_into(&buf, N, …)` → `parse_baseband_frame_into` →
+  `parse_baseband_chunk_into`, splitting the
   payload into `per_rx[0..N]`. `N = fanout.rx_count()` is also the value in
   the C4 receiver-count bit of the baseline chunk (→ §16.1), so the wire and
   the de-interleave always agree.
@@ -1925,4 +1947,3 @@ spot-able row into a wire `Spot` and enqueues it. No per-mode `add_*` methods re
 **On/off**: spot posting is **inactive unless `PSK_CALL` is set** (env);
 `PSK_GRID` / `PSK_ANTENNA` / `PSK_RIG` fill the receiver-information
 record. The decode broadcasts (`WsEvent::Log`) are unaffected.
-

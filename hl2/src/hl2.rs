@@ -830,37 +830,24 @@ async fn run_loop(hl2: Hl2, tx: mpsc::UnboundedSender<Hl2Event>) {
                         }
                     }
 
-                    if parsed.header.endpoint == crate::protocol::ENDPOINT_DATA_TX {
-                        for chunk in parsed.baseband.iter() {
-                            // Fan every per_rx stream into its slot's ring.
-                            // `rings` is in position order (= ascending slot
-                            // order), which is the same order the
-                            // de-interleaver produced `per_rx`. `per_rx.len()`
-                            // is `n_recv` (= `rings.len()`), so index
-                            // one-to-one. The `endpoint == ENDPOINT_DATA_TX`
-                            // gate above is required: the `Into` parse keeps
-                            // stale baseband chunks across non-EP6 frames to
-                            // avoid re-allocating their inner `per_rx` Vecs,
-                            // so we never read `baseband` on EP2/EP4 frames.
-                            for (p, samples) in chunk.per_rx.iter().enumerate() {
-                                if p < rings.len() {
-                                    // `unwrap_or` (not `unwrap`): a dead demod
-                                    // thread poisoned the lock must not kill
-                                    // the whole RX data path — the ring stays
-                                    // consistent after a peek/push panic
-                                    // (both are simple copies/counts), so we
-                                    // keep writing into it until the reader
-                                    // is gone. The push cost is the same.
-                                    rings[p]
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                        .push(samples);
-                                    delivered.fetch_add(samples.len(), Ordering::Relaxed);
-                                }
+                    for chunk in parsed.baseband.iter() {
+                        // Fan every per_rx stream into its slot's ring.
+                        // `rings` is in position order (= ascending slot
+                        // order), which is the same order the de-interleaver
+                        // produced `per_rx`. `per_rx.len()` is `n_recv` (=
+                        // `rings.len()`), so index one-to-one.
+                        for (p, samples) in chunk.per_rx.iter().enumerate() {
+                            if p < rings.len() {
+                                // Keep reception running if a reader poisoned the lock.
+                                rings[p]
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .push(samples);
+                                delivered.fetch_add(samples.len(), Ordering::Relaxed);
                             }
-                            if tx.send(Hl2Event::Baseband(chunk.clone())).is_err() {
-                                break;
-                            }
+                        }
+                        if tx.send(Hl2Event::Baseband(chunk.clone())).is_err() {
+                            break;
                         }
                     }
                 }

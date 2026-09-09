@@ -1,15 +1,13 @@
 //! ILI9341 + LPSPI4 + text helpers. `no_std`.
 //!
-//! Extracted from the old `main.rs`: `DisplaySpi` (software-CS), `NopPin`
-//! (placeholder reset), `new_display`, `fill_rect`, `draw_text`. The display
-//! stays task-local (owned by the `render` task) so no cross-task locking is
-//! required.
+//! The display stays task-local (owned by the `render` task), so no
+//! cross-task locking is required.
 
 use core::convert::Infallible;
 use core::result::Result;
 
 use embedded_hal::delay::DelayNs;
-use embedded_hal::digital::{ErrorType as DigitalErrorType, OutputPin, StatefulOutputPin};
+use embedded_hal::digital::{ErrorType as DigitalErrorType, OutputPin};
 use embedded_hal::spi::{ErrorType, Operation, SpiBus, SpiDevice};
 use teensy4_bsp::{board, hal};
 
@@ -35,40 +33,15 @@ impl OutputPin for NopPin {
         Ok(())
     }
 }
-impl StatefulOutputPin for NopPin {
-    fn is_set_high(&mut self) -> Result<bool, Self::Error> {
-        Ok(true)
-    }
-    fn is_set_low(&mut self) -> Result<bool, Self::Error> {
-        Ok(false)
-    }
-}
 
 /// `SpiBus<u8>` → `SpiDevice<u8>` adapter with a software chip-select.
 pub struct DisplaySpi {
-    pub spi: board::Lpspi,
-    pub cs: hal::gpio::Output,
+    spi: board::Lpspi,
+    cs: hal::gpio::Output,
 }
 
 impl ErrorType for DisplaySpi {
     type Error = LpspiError;
-}
-impl SpiBus<u8> for DisplaySpi {
-    fn read(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
-        SpiBus::<u8>::read(&mut self.spi, words)
-    }
-    fn write(&mut self, words: &[u8]) -> Result<(), Self::Error> {
-        SpiBus::<u8>::write(&mut self.spi, words)
-    }
-    fn transfer(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), Self::Error> {
-        SpiBus::<u8>::transfer(&mut self.spi, read, write)
-    }
-    fn transfer_in_place(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
-        SpiBus::<u8>::transfer_in_place(&mut self.spi, words)
-    }
-    fn flush(&mut self) -> Result<(), Self::Error> {
-        SpiBus::<u8>::flush(&mut self.spi)
-    }
 }
 impl SpiDevice<u8> for DisplaySpi {
     fn transaction(&mut self, operations: &mut [Operation<'_, u8>]) -> Result<(), Self::Error> {
@@ -76,7 +49,7 @@ impl SpiDevice<u8> for DisplaySpi {
         let mut result: Result<(), LpspiError> = Ok(());
         for op in operations.iter_mut() {
             result = match op {
-                Operation::Read(buf) => SpiBus::<u8>::read(&mut self.spi, buf).map(|_| ()),
+                Operation::Read(buf) => SpiBus::<u8>::read(&mut self.spi, buf),
                 Operation::Write(buf) => SpiBus::<u8>::write(&mut self.spi, buf),
                 Operation::Transfer(read, write) => {
                     SpiBus::<u8>::transfer(&mut self.spi, read, write)
@@ -84,11 +57,10 @@ impl SpiDevice<u8> for DisplaySpi {
                 Operation::TransferInPlace(buf) => {
                     SpiBus::<u8>::transfer_in_place(&mut self.spi, buf)
                 }
-                Operation::DelayNs(ns) => {
+                Operation::DelayNs(ns) => SpiBus::<u8>::flush(&mut self.spi).map(|()| {
                     let mut d = DwtDelay;
                     d.delay_ns(*ns);
-                    Ok(())
-                }
+                }),
             };
             if result.is_err() {
                 break;
@@ -110,8 +82,7 @@ pub type Display =
 pub struct DwtDelay;
 impl DelayNs for DwtDelay {
     fn delay_ns(&mut self, ns: u32) {
-        let ticks =
-            (ns as u64 * board::ARM_FREQUENCY as u64).div_ceil(1_000_000_000) as u32;
+        let ticks = (ns as u64 * board::ARM_FREQUENCY as u64).div_ceil(1_000_000_000) as u32;
         let start = cortex_m::peripheral::DWT::cycle_count();
         while cortex_m::peripheral::DWT::cycle_count().wrapping_sub(start) < ticks {
             core::hint::spin_loop();
@@ -141,13 +112,16 @@ pub fn new_display(
         ili9341::Orientation::Landscape,
         ili9341::DisplaySize240x320,
     )?;
-    let _ = display.invert_mode(ili9341::ModeState::Off);
-    let _ = display.brightness(255);
+    display.invert_mode(ili9341::ModeState::Off)?;
+    display.brightness(255)?;
     Ok(display)
 }
 
-/// Fill a rectangle with a solid colour (one SPI transaction, `w*h` u16).
+/// Fill a rectangle with a solid colour (`w*h` u16 pixels).
 pub fn fill_rect(display: &mut Display, x: u16, y: u16, w: u16, h: u16, color: u16) {
+    if w == 0 || h == 0 {
+        return;
+    }
     let count = (w as usize) * (h as usize);
     display
         .draw_raw_iter(
