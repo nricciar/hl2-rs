@@ -16,6 +16,8 @@
 
 use teensy4_panic as _;
 
+mod ethernet;
+
 #[rtic::app(device = teensy4_bsp, peripherals = true, dispatchers = [KPP])]
 mod app {
     use bsp::board;
@@ -35,19 +37,14 @@ mod app {
     const WIDTH: u16 = 320;
     const HEIGHT: u16 = 240;
 
-    use imxrt_enet::{Enet, ReceiveBuffers, TransmitBuffers};
     use smoltcp::{
-        iface::{Config, Interface},
+        iface::{Config, Interface, SocketSet, SocketStorage},
+        socket::dhcpv4,
         wire::EthernetAddress,
     };
-    use static_cell::ConstStaticCell;
 
-    static RX_BUFFERS: ConstStaticCell<ReceiveBuffers<4>> =
-        ConstStaticCell::new(ReceiveBuffers::new());
-    static TX_BUFFERS: ConstStaticCell<TransmitBuffers<4>> =
-        ConstStaticCell::new(TransmitBuffers::new());
-
-    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01]; // Your MAC address.
+    // Locally administered test MAC. Change this for each board on the same LAN.
+    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
 
     type Display = ili9341::Ili9341<
         display_interface_spi::SPIInterface<DisplaySpi, hal::gpio::Output>,
@@ -70,11 +67,10 @@ mod app {
 
     impl DelayNs for DwtDelay {
         fn delay_ns(&mut self, ns: u32) {
-            let hz = board::ARM_FREQUENCY as u128;
-            // Cycles = ns * hz / 1e9. Use u128 so ns*hz can't overflow u64.
-            let ticks = (ns as u128) * hz / 1_000_000_000u128;
-            let start = dwt_cycles_now() as u64;
-            while (dwt_cycles_now() as u64 - start) < ticks as u64 {
+            let ticks = (ns as u64 * board::ARM_FREQUENCY as u64).div_ceil(1_000_000_000);
+            let start = dwt_cycles_now();
+            // CYCCNT wraps every ~7.16 seconds at 600 MHz.
+            while dwt_cycles_now().wrapping_sub(start) < ticks as u32 {
                 core::hint::spin_loop();
             }
         }
@@ -185,15 +181,15 @@ mod app {
             pins,
             usb,
             lpspi4,
+            ccm,
+            ccm_analog,
+            iomuxc_gpr,
             ..
         } = board::t41(cx.device);
 
         let poller = logging::log::usbd(usb, logging::Interrupts::Enabled).unwrap();
 
-        // FIRST things we do in init (before anything else that uses DwtDelay):
-        // enable the DWT cycle counter. On Cortex-M7 DWT.CYCCNT is gated by
-        // DCB.C_DEBUGEN (enable_trace) AND DWT.CTRL.CYCCNTENA. Without both,
-        // the counter never ticks and our DelayNs implementation hangs forever.
+        // Enable DEMCR.TRCENA and DWT.CTRL.CYCCNTENA before using DwtDelay.
         let mut dcb = cx.core.DCB;
         dcb.enable_trace();
         let mut dwt = cx.core.DWT;
@@ -206,31 +202,6 @@ mod app {
         );
 
         log::info!("DWT enabled: {} Hz, systick running", board::ARM_FREQUENCY);
-
-        let enet = teensy4_bsp::ral::enet::ENET1;
-        let enet_instance = unsafe { teensy4_bsp::ral::Instance::<_, 1>::new(enet) };
-
-        let mut enet = unsafe {
-            Enet::new(
-                enet_instance,
-                TX_BUFFERS.take().take(),
-                RX_BUFFERS.take().take(),
-                150_000_000,
-                &MAC,
-            )
-        };
-
-        enet.enable_mac(true);
-
-        // suggested fix; does not appear to do anything though
-        unsafe {
-            (*teensy4_bsp::ral::enet::ENET1).MSCR.write(24 << 1);
-        }
-
-        init_phy();
-
-        let now = smoltcp::time::Instant::from_micros(us_now() as i64);
-        let mut iface = Interface::new(Config::new(EthernetAddress(MAC).into()), &mut enet, now);
 
         // Control lines (all on GPIO2): CS=10, DC=9. RESET is not wired.
         let cs = gpio2.output(pins.p10).expect("p10 is GPIO2");
@@ -253,25 +224,6 @@ mod app {
         );
 
         let mut delay = DwtDelay {};
-
-        // --- Sanity check: is DWT.CYCCNT actually ticking at ARM_FREQUENCY? ---
-        // We ask DwtDelay to wait 50 ms, then measure with Systick (which the
-        // BSP starts from ARM_FREQUENCY, so it's an independent clock source).
-        // If the two disagree by a lot, DWT is running slower than we assume
-        // and every DelayNs call is being stretched.
-        {
-            // Cross-check: DwtDelay asks for 50 ms; measure the real time with
-            // Systick (a *different* clock source). Systick runs at 600 MHz
-            // (core clock), so 50 ms = 30_000_000 ticks. We want to see a value
-            // close to 50 ms — if DWT were broken (running slower than that,
-            // or not running at all) the measured time would be much larger.
-            let systick_start = Systick::now();
-            delay.delay_ms(50);
-            let systick_elapsed = Systick::now() - systick_start;
-            let elapsed_ticks = systick_elapsed.ticks();
-            let elapsed_ms = elapsed_ticks / 600_000;
-            log::info!("Delay cross-check: DwtDelay(50 ms) took {elapsed_ms} ms on systick clock");
-        }
 
         log::info!("Ili9341::new starting (t0 = {} µs)", us_now());
         let mut display = ili9341::Ili9341::new(
@@ -300,7 +252,7 @@ mod app {
                     0,
                     WIDTH - 1,
                     HEIGHT - 1,
-                    core::iter::repeat(0xF800).take(total),
+                    core::iter::repeat_n(0xF800, total),
                 )
                 .expect("red screen draw");
             let dt = us_now() - t0;
@@ -320,86 +272,103 @@ mod app {
         log::info!("Banner painted");
 
         hello_world::spawn().unwrap();
+        assert!(ethernet::spawn(ccm, ccm_analog, iomuxc_gpr).is_ok());
         (Shared {}, Local { poller })
     }
 
-    /// Reads a 16-bit register from a PHY over MDIO using raw ENET registers.
-    fn read_mdio(phy_addr: u8, reg_addr: u8) -> u16 {
-        let enet = teensy4_bsp::ral::enet::ENET1;
-        unsafe {
-            // Clear MII transfer complete flag (bit 23 of EIR)
-            (*enet).EIR.write(1 << 23);
-
-            // MMFR frame format: ST=01 (30..31), OP=10 Read (28..29), PA (23..27), RA (18..22), TA=10 (16..17)
-            let mmfr = (1 << 30)
-                | (2 << 28)
-                | (((phy_addr & 0x1F) as u32) << 23)
-                | (((reg_addr & 0x1F) as u32) << 18)
-                | (2 << 16);
-
-            (*enet).MMFR.write(mmfr);
-
-            // Poll EIR bit 23 until transfer completes
-            while ((*enet).EIR.read() & (1 << 23)) == 0 {
-                core::hint::spin_loop();
-            }
-
-            ((*enet).MMFR.read() & 0xFFFF) as u16
-        }
-    }
-
-    /// Writes a 16-bit register to a PHY over MDIO using raw ENET registers.
-    fn write_mdio(phy_addr: u8, reg_addr: u8, data: u16) {
-        let enet = teensy4_bsp::ral::enet::ENET1;
-        unsafe {
-            // Clear MII transfer complete flag (bit 23 of EIR)
-            (*enet).EIR.write(1 << 23);
-
-            // MMFR frame format: ST=01 (30..31), OP=01 Write (28..29), PA (23..27), RA (18..22), TA=10 (16..17), DATA (0..15)
-            let mmfr = (1 << 30)
-                | (1 << 28)
-                | (((phy_addr & 0x1F) as u32) << 23)
-                | (((reg_addr & 0x1F) as u32) << 18)
-                | (2 << 16)
-                | (data as u32);
-
-            (*enet).MMFR.write(mmfr);
-
-            // Poll EIR bit 23 until transfer completes
-            while ((*enet).EIR.read() & (1 << 23)) == 0 {
-                core::hint::spin_loop();
-            }
-        }
-    }
-
-    /// Initializes the DP83825 PHY over MDIO for Teensy 4.1.
-    fn init_phy() {
-        const PHY_ADDR: u8 = 0;
-
-        const REG_BMCR: u8 = 0x00;
-        const REG_PHYID1: u8 = 0x02;
-
-        const BMCR_RESET: u16 = 1 << 15;
-        const BMCR_AN_ENABLE: u16 = 1 << 12;
-        const BMCR_AN_RESTART: u16 = 1 << 9;
-
-        // 1. Issue software reset to PHY
-        write_mdio(PHY_ADDR, REG_BMCR, BMCR_RESET);
-
-        // Wait until the reset bit clears automatically
+    #[task]
+    async fn ethernet(
+        _cx: ethernet::Context,
+        mut ccm: bsp::ral::ccm::CCM,
+        mut analog: bsp::ral::ccm_analog::CCM_ANALOG,
+        mut gpr: bsp::ral::iomuxc_gpr::IOMUXC_GPR,
+    ) {
+        // Let init return and USB enumerate before touching experimental hardware.
+        Systick::delay(2_000.millis()).await;
+        log::info!("Ethernet: configuring clocks, pins and DP83825");
+        let mut device = match crate::ethernet::Ethernet::new(
+            &mut ccm,
+            &mut analog,
+            &mut gpr,
+            &mut DwtDelay {},
+            &MAC,
+        ) {
+            Ok(device) => device,
+            Err(error) => loop {
+                log::error!("Ethernet init failed: {error}; LCD/USB still running");
+                Systick::delay(5_000.millis()).await;
+            },
+        };
+        let now = || smoltcp::time::Instant::from_millis(Systick::now().ticks() as i64);
+        let mut iface =
+            Interface::new(Config::new(EthernetAddress(MAC).into()), &mut device, now());
+        let mut storage = [SocketStorage::EMPTY];
+        let mut sockets = SocketSet::new(&mut storage[..]);
+        let dhcp = sockets.add(dhcpv4::Socket::new());
+        let mut link_up = false;
+        let mut next_status = Systick::now();
+        let mut next_report = Systick::now();
         loop {
-            let val = read_mdio(PHY_ADDR, REG_BMCR);
-            if val & BMCR_RESET == 0 {
-                break;
+            if Systick::now() >= next_status {
+                next_status = Systick::now() + 250.millis();
+                match device.link_up() {
+                    Ok(up) => {
+                        if up != link_up {
+                            link_up = up;
+                            log::info!(
+                                "Ethernet link: {}",
+                                if up { "100 Mbps full duplex" } else { "down" }
+                            );
+                            sockets.get_mut::<dhcpv4::Socket>(dhcp).reset();
+                            iface.update_ip_addrs(|addrs| addrs.clear());
+                            iface.routes_mut().remove_default_ipv4_route();
+                        }
+                    }
+                    Err(error) => {
+                        log::error!("Ethernet link check failed: {error}");
+                        link_up = false;
+                        iface.update_ip_addrs(|addrs| addrs.clear());
+                        iface.routes_mut().remove_default_ipv4_route();
+                        sockets.get_mut::<dhcpv4::Socket>(dhcp).reset();
+                    }
+                }
             }
+            if link_up {
+                // Bound RX work so a busy LAN cannot starve the other tasks.
+                for _ in 0..4 {
+                    iface.poll_ingress_single(now(), &mut device, &mut sockets);
+                }
+                iface.poll_egress(now(), &mut device, &mut sockets);
+                match sockets.get_mut::<dhcpv4::Socket>(dhcp).poll() {
+                    Some(dhcpv4::Event::Configured(config)) => {
+                        iface.update_ip_addrs(|addrs| {
+                            addrs.clear();
+                            addrs.push(config.address.into()).unwrap();
+                        });
+                        iface.routes_mut().remove_default_ipv4_route();
+                        if let Some(router) = config.router {
+                            iface.routes_mut().add_default_ipv4_route(router).unwrap();
+                        }
+                        log::info!("DHCP address: {}; try pinging this address", config.address);
+                    }
+                    Some(dhcpv4::Event::Deconfigured) => {
+                        iface.update_ip_addrs(|addrs| addrs.clear());
+                        iface.routes_mut().remove_default_ipv4_route();
+                        log::info!("DHCP: waiting for a lease");
+                    }
+                    None => {}
+                }
+            }
+            if Systick::now() >= next_report {
+                next_report = Systick::now() + 5_000.millis();
+                log::info!(
+                    "Ethernet: link={}, addresses={:?}",
+                    link_up,
+                    iface.ip_addrs()
+                );
+            }
+            Systick::delay(1.millis()).await;
         }
-
-        // 2. Read PHY ID register (DP83825 ID1 is 0x2000)
-        let phy_id = read_mdio(PHY_ADDR, REG_PHYID1);
-        log::info!("DP83825 PHY ID1: {:#06X}", phy_id);
-
-        // 3. Enable and restart Auto-Negotiation
-        write_mdio(PHY_ADDR, REG_BMCR, BMCR_AN_ENABLE | BMCR_AN_RESTART);
     }
 
     /// A 5x7 bitmap for one glyph (7 rows, 5 cols, MSB = leftmost bit).
@@ -438,7 +407,7 @@ mod app {
                 y,
                 x.saturating_add(w) - 1,
                 y.saturating_add(h) - 1,
-                core::iter::repeat(color).take(count),
+                core::iter::repeat_n(color, count),
             )
             .expect("fill_rect draw");
     }
@@ -512,7 +481,7 @@ mod app {
         }
     }
 
-    #[task(binds = USB_OTG1, local = [poller])]
+    #[task(binds = USB_OTG1, priority = 2, local = [poller])]
     fn log_over_usb(cx: log_over_usb::Context) {
         cx.local.poller.poll();
     }
