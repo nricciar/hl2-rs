@@ -54,7 +54,11 @@
 //! [`RawSampleTap`](super::RawSampleTap) + `i16` sink write) is shared with
 //! every mode by the [`AudioEngine`](super::AudioEngine).
 
+use core::f32::consts as f32_consts;
+use core::f64::consts;
 use num_complex::Complex;
+#[cfg(not(feature = "std"))]
+use num_traits::Float as _;
 
 use super::core::DemodCore;
 use super::dsp::{F32Fir, KAISER_BETA, Nco, PolyphaseDecimator};
@@ -119,7 +123,7 @@ impl FmCore {
         // complex sample.
         let lp_i = PolyphaseDecimator::new(&h, m);
         let lp_q = PolyphaseDecimator::new(&h, m);
-        let nco = Nco::new(2.0 * std::f64::consts::PI * source_center_hz / source_rate_hz as f64);
+        let nco = Nco::new(2.0 * consts::PI * source_center_hz / source_rate_hz as f64);
         Self {
             nco,
             lp_i,
@@ -152,10 +156,10 @@ impl DemodCore for FmCore {
             let phase = q.atan2(i);
             let mut delta = phase - self.prev_phase;
             self.prev_phase = phase;
-            if delta > std::f32::consts::PI {
-                delta -= 2.0 * std::f32::consts::PI;
-            } else if delta < -std::f32::consts::PI {
-                delta += 2.0 * std::f32::consts::PI;
+            if delta > f32_consts::PI {
+                delta -= 2.0 * f32_consts::PI;
+            } else if delta < -f32_consts::PI {
+                delta += 2.0 * f32_consts::PI;
             }
             Some(delta)
         } else {
@@ -173,6 +177,8 @@ mod tests {
     use super::*;
     use crate::receiver::Demodulator;
     use crate::receiver::sink::VecSink;
+    use alloc::{boxed::Box, vec};
+    use std::eprintln;
 
     const PI: f64 = std::f64::consts::PI;
 

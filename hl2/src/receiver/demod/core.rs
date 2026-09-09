@@ -20,6 +20,8 @@
 //! + a mode-specific discriminator), add the `Mode` enum variant and a
 //! dispatch arm in `demod/mod.rs`, and that's the whole change.
 
+use alloc::boxed::Box;
+use alloc::sync::Arc;
 use num_complex::Complex;
 
 use super::engine::AudioEngine;
@@ -53,7 +55,7 @@ pub trait DemodCore: Send + 'static {
     /// type name (e.g. `SsbCore` → `"SsbCore"`); override per-mode when you
     /// want `"ssb-usb"` etc.
     fn kind(&self) -> &'static str {
-        std::any::type_name::<Self>()
+        core::any::type_name::<Self>()
             .rsplit("::")
             .next()
             .unwrap_or("DemodCore")
@@ -69,7 +71,7 @@ pub trait DemodCore: Send + 'static {
     fn demodulator(
         self,
         audio: AudioConfig,
-        tap: Option<std::sync::Arc<dyn RawSampleTap>>,
+        tap: Option<Arc<dyn RawSampleTap>>,
     ) -> Box<dyn Demodulator>
     where
         Self: Sized,

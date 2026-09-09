@@ -891,9 +891,9 @@ dependencies = [
  "hl2-common",
  "mfsk-core",
  "num-complex",
+ "num-traits",
  "rustfft",
  "tokio",
- "tokio-util",
 ]
 
 [[package]]

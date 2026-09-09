@@ -11,7 +11,16 @@
 //! The normalisation itself — DC block, slow RMS-targeted AGC, gain — is in
 //! [`normalize_to_i16_with_agc`].
 
-use std::sync::atomic::AtomicUsize;
+use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::mem;
+#[cfg(feature = "std")]
+use core::sync::atomic::AtomicUsize;
+#[cfg(feature = "std")]
+use core::sync::atomic::Ordering;
+#[cfg(not(feature = "std"))]
+use num_traits::Float as _;
 
 use super::RawSampleTap;
 use crate::receiver::AudioConfig;
@@ -25,6 +34,7 @@ use crate::receiver::sink::AudioSink;
 const AUDIO_EMIN: usize = 240;
 
 /// Gated (HL2_DEBUG) instrument counter so we don't flood on every emit.
+#[cfg(feature = "std")]
 static EMIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// The mode-agnostic audio tail (see module docs). Not `Clone` (it owns an
@@ -40,8 +50,9 @@ pub struct AudioEngine {
     /// Optional pre-AGC raw-sample tap (e.g. FT8 decode). `Arc` so the API
     /// layer keeps one handle for the demod and hands a clone to the decode
     /// task.
-    tap: Option<std::sync::Arc<dyn RawSampleTap>>,
+    tap: Option<Arc<dyn RawSampleTap>>,
     /// A short label for the HL2_DEBUG gated emit trace (`"ssb"` / `"am"` / …).
+    #[cfg(feature = "std")]
     mode_label: &'static str,
 }
 
@@ -49,18 +60,21 @@ impl AudioEngine {
     /// Build an empty tail at `rate_hz` / `gain_db`, AGC gain seeded at
     /// 1000.0 (updated on the first emit).
     pub fn new(rate_hz: u32, gain_db: f32, mode_label: &'static str) -> Self {
+        #[cfg(not(feature = "std"))]
+        let _ = mode_label;
         Self {
             audio_cfg: AudioConfig { rate_hz, gain_db },
             agc_gain: 1000.0,
             audio_buf: Vec::with_capacity(256),
             tap: None,
+            #[cfg(feature = "std")]
             mode_label,
         }
     }
 
     /// Attach a pre-AGC [`RawSampleTap`] (builder; cheap — just a pointer).
     /// Pass `None` to keep no tap (the default).
-    pub fn with_tap(mut self, tap: Option<std::sync::Arc<dyn RawSampleTap>>) -> Self {
+    pub fn with_tap(mut self, tap: Option<Arc<dyn RawSampleTap>>) -> Self {
         if let Some(t) = tap {
             self.tap = Some(t);
         }
@@ -103,7 +117,7 @@ impl AudioEngine {
         if self.audio_buf.is_empty() {
             return Ok(0);
         }
-        let n = std::mem::take(&mut self.audio_buf);
+        let n = mem::take(&mut self.audio_buf);
         self.emit(&n, sink)
     }
 
@@ -122,8 +136,9 @@ impl AudioEngine {
         let mut out = vec![0i16; slice.len()];
         let written =
             normalize_to_i16_with_agc(slice, &mut out, self.audio_cfg.gain_db, &mut self.agc_gain);
+        #[cfg(feature = "std")]
         if std::env::var("HL2_DEBUG").is_ok() {
-            let c = EMIT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let c = EMIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
             if c % 50 == 1 {
                 let in_max = slice.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
                 let in_rms =

@@ -6,7 +6,13 @@
 //! voice path ([`super::ssb`]) and the 12 kHz digital path
 //! ([`super::digital`]) — no external DSP crate.
 
+use alloc::vec;
+use alloc::vec::Vec;
 use num_complex::Complex;
+#[cfg(not(feature = "std"))]
+use num_traits::Float as _;
+
+use core::f64::consts;
 
 /// Kaiser-window shape parameter β for the channel-select and Hilbert
 /// windows.
@@ -133,7 +139,7 @@ impl F32Fir {
             let h = if t.abs() < 1e-9 {
                 ratio
             } else {
-                (std::f64::consts::PI * ratio * t).sin() / (std::f64::consts::PI * t)
+                (consts::PI * ratio * t).sin() / (consts::PI * t)
             } * window;
             norm += h;
             taps.push(h as f32);
@@ -174,7 +180,7 @@ impl F32Fir {
             let h = if m.abs() < 1e-9 {
                 0.0
             } else {
-                (2.0 / (std::f64::consts::PI * m)) * window
+                (2.0 / (consts::PI * m)) * window
             };
             taps.push(h as f32);
         }

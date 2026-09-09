@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 use num_complex::Complex;
 
 /// A continuous stream of complex I/Q baseband samples, per radio slot.
@@ -85,6 +87,7 @@ impl BasebandSource for VecSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     fn c(re: f32, im: f32) -> Complex<f32> {
         Complex::new(re, im)

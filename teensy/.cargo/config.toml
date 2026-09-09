@@ -1,6 +1,10 @@
 [build]
 target = "thumbv7em-none-eabihf"
 
+# Buffer startup diagnostics while the USB host enumerates.
+[env]
+IMXRT_LOG_BUFFER_SIZE = "8192"
+
 [target.thumbv7em-none-eabihf]
 rustflags = [
     "-C", "link-arg=-Tt4link.x",

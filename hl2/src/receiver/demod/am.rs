@@ -32,7 +32,10 @@
 //! (√(I²+Q²)) is a per-sample operation that consumes the two decimated
 //! samples and produces one envelope value.
 
+use core::f64::consts;
 use num_complex::Complex;
+#[cfg(not(feature = "std"))]
+use num_traits::Float as _;
 
 use super::core::DemodCore;
 use super::dsp::{F32Fir, KAISER_BETA, Nco, PolyphaseDecimator};
@@ -78,7 +81,7 @@ impl AmCore {
         // and the envelope (√(I²+Q²)) aligns sample-for-sample.
         let lp_i = PolyphaseDecimator::new(&h, m);
         let lp_q = PolyphaseDecimator::new(&h, m);
-        let nco = Nco::new(2.0 * std::f64::consts::PI * source_center_hz / source_rate_hz as f64);
+        let nco = Nco::new(2.0 * consts::PI * source_center_hz / source_rate_hz as f64);
         Self { nco, lp_i, lp_q }
     }
 }
@@ -122,6 +125,7 @@ mod tests {
     use super::*;
     use crate::receiver::Demodulator;
     use crate::receiver::sink::VecSink;
+    use alloc::{boxed::Box, vec};
 
     /// Analytic complex tone.
     fn complex_sine(rate_hz: u32, freq_hz: f64, n_pairs: usize, amp: f32) -> super::super::IqBlock {

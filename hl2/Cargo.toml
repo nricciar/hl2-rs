@@ -4,19 +4,114 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-tokio = { workspace = true }
-tokio-util = { version = "0.7", features = ["net", "codec"] }
-num-complex = "0.4"
-rustfft = "6"
-mfsk-core = "0.9.1"
-hl2-common = { workspace = true }
+# Complex I/Q sample type. Built `no_std` by default; the `std` feature
+# below opts `num-complex` into `std` when this crate's `std` is on.
+[dependencies.num-complex]
+version = "0.4"
+default-features = false
+
+# `Float` trait (sin/cos/sqrt/atan2/powf/…) — already in the tree via
+# `num-complex`, but we call it directly in the DSP path for `no_std` builds
+# where `std::primitive` methods aren't in scope.
+[dependencies.num-traits]
+version = "0.2"
+default-features = false
+
+# Async control client (`hl2` module: `Hl2`, `discover`, pump). Pulls `tokio`.
+[dependencies.tokio]
+workspace = true
+optional = true
+
+# Digital-mode decoders — opt-out by dropping the mode feature.
+[dependencies.mfsk-core]
+version = "0.9.1"
+optional = true
+
+# JS8's FFT backend.
+[dependencies.rustfft]
+version = "6"
+optional = true
+
+# Shared wire / spot / `DecodedMessage` types — only the digital decoders need
+# it, so it's optional (a no-digital build has zero `hl2-common` / serde).
+[dependencies.hl2-common]
+workspace = true
+optional = true
+
+# ALSA audio sink (`receiver::AlsaSink`), off by default.
 [dependencies.cpal]
 version = "0.15"
 optional = true
 
 [features]
-js8_trace = []
-default = []
+default = ["std", "dsp", "client", "digital"]
+
+# `std`: heap + sync primitives + trait-object `std::error::Error`.
+# Required for the multi-threaded `client` (tokio + `Arc<Mutex<...>>` shared
+# rings / decoders) and the ALSA sink. Off = pure `no_std` (uses `core` +
+# `alloc` only). `dsp` does **not** imply `std`.
+std = ["num-complex/std"]
+
+# `dsp`: the DSP core — NCO, FIR, polyphase, SSB/AM/FM mode cores, the AGC
+# `AudioEngine`, `VecSink`/`DropSink`, `VirtualReceiver`, `IqBlock`.
+# Requires only `alloc` + `num-complex` + a floating-point `sin`/`cos`/`sqrt`
+# source. In a `std` build those are the inherent `f32`/`f64` methods; in a
+# `no_std` build we pull `libm` (via `num-traits`) since `core` has no
+# `f32::sin`. This is the `no_std`-usable demod path: a single-threaded
+# consumer can drive [`crate::receiver::VirtualReceiver::process`] over
+# whatever I/Q source is wired.
+dsp = ["num-traits/libm"]
+
+# The `tokio`-based control client: `Hl2`, `discover*`, `start`/`stop`/`tune`,
+# the receive pump + the per-slot [`crate::receiver::BasebandFanout`].
+# Requires `std` (for `Arc<Mutex<BasebandRing>>`) and `dsp` (the pump builds
+# the `VirtualReceiver`s it hands to each slot's ring).
+client = ["std", "dsp", "dep:tokio"]
+
+# WSJT-family slot decoders. `dsp` for the shared 12 kHz USB core + `AudioEngine`
+# tap; `std` for the `Arc<Mutex<...>>` shared decoder handle + tap that the
+# tokio decode task needs.
+ft8 = ["std", "dsp", "dep:mfsk-core", "dep:hl2-common"]
+ft4 = ["std", "dsp", "dep:mfsk-core", "dep:hl2-common"]
+# JS8Call decoder (larger: carries `rustfft`).
+js8 = ["std", "dsp", "dep:rustfft", "dep:hl2-common"]
+
+# Sugar: every digital mode at once. Drop a single mode with
+# `default-features = false, features = ["std", "client", "ft8", "ft4"]`.
+digital = ["ft8", "ft4", "js8"]
+
 # ALSA sink via `cpal`.
-alsa = ["dep:cpal"]
-integration-tests = []
+alsa = ["std", "dsp", "dep:cpal"]
+
+# Integration tests (a live HL2 + the `client` API).
+integration-tests = ["client"]
+
+# JS8 decoder tracing (enables `js8`).
+js8_trace = ["js8"]
+
+[[bin]]
+name = "hl2"
+path = "src/bin/main.rs"
+required-features = ["client", "ft8"]
+
+# Network probes: use `hl2::protocol` + their own `tokio` (enabled by `client`).
+[[example]]
+name = "ep6probe"
+required-features = ["client"]
+
+[[example]]
+name = "rateprobe"
+required-features = ["client"]
+
+[[example]]
+name = "tune_sweep"
+required-features = ["client"]
+
+[[example]]
+name = "tune_validate"
+required-features = ["client"]
+
+# Demod benchmark: needs the `Mode::Ft8` digital path.
+[[example]]
+name = "bench_demod"
+required-features = ["ft8"]

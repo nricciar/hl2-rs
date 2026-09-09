@@ -33,13 +33,18 @@
 
 pub mod am;
 pub mod core;
+/// FT8/FT4/JS8 12 kHz USB core — present only when a digital mode is enabled.
+#[cfg(any(feature = "ft8", feature = "ft4", feature = "js8"))]
 pub mod digital;
 pub mod dsp;
 pub mod engine;
 pub mod fm;
 pub mod ssb;
 
-use std::fmt;
+use ::core::fmt;
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use num_complex::Complex;
 
@@ -50,6 +55,8 @@ use super::sink::AudioSink;
 // Nco, …}` (and `super::demod::RawSampleTap` from ft8/ft4/js8) resolve.
 pub use am::AmCore;
 pub use core::{DemodCore, StandardDemod};
+/// The FT8/FT4/JS8 shared core — present only when a digital mode is enabled.
+#[cfg(any(feature = "ft8", feature = "ft4", feature = "js8"))]
 pub use digital::DigitalCore;
 pub use dsp::{F32Fir, F32FirState, KAISER_BETA, Nco, PolyphaseDecimator};
 pub use engine::AudioEngine;
@@ -60,6 +67,8 @@ pub use ssb::SsbCore;
 /// for each mode's core.
 pub type SsbDemodulator = StandardDemod<SsbCore>;
 pub type AmDemodulator = StandardDemod<AmCore>;
+/// Full-tail demodulator for the digital (FT8/FT4/JS8) core.
+#[cfg(any(feature = "ft8", feature = "ft4", feature = "js8"))]
 pub type DigitalDemodulator = StandardDemod<DigitalCore>;
 pub type FmDemodulator = StandardDemod<FmCore>;
 
@@ -78,10 +87,10 @@ impl fmt::Display for RateTooClose {
         )
     }
 }
-impl std::error::Error for RateTooClose {}
+impl ::core::error::Error for RateTooClose {}
 
 /// Demodulator error.
-pub type DemodError = Box<dyn std::error::Error + Send + Sync>;
+pub type DemodError = Box<dyn ::core::error::Error + Send + Sync>;
 
 /// A block of complex I/Q baseband samples: `Vec<Complex<f32>>`.
 pub type IqBlock = Vec<Complex<f32>>;
@@ -138,14 +147,17 @@ pub fn make_demod_tap(
     source_center_hz: f64,
     bandwidth_hz: u32,
     audio: AudioConfig,
-    tap: Option<std::sync::Arc<dyn RawSampleTap>>,
+    tap: Option<Arc<dyn RawSampleTap>>,
 ) -> Result<Box<dyn Demodulator>, DemodError> {
     ensure_decimable(source_rate_hz, audio)?;
     Ok(match mode {
+        #[cfg(feature = "ft8")]
         Mode::Ft8 => digital::DigitalCore::new(source_rate_hz, source_center_hz, audio, "ft8")
             .demodulator(audio, tap),
+        #[cfg(feature = "js8")]
         Mode::Js8 => digital::DigitalCore::new(source_rate_hz, source_center_hz, audio, "js8")
             .demodulator(audio, tap),
+        #[cfg(feature = "ft4")]
         Mode::Ft4 => digital::DigitalCore::new(source_rate_hz, source_center_hz, audio, "ft4")
             .demodulator(audio, tap),
         Mode::Am => am::AmCore::new(source_rate_hz, source_center_hz, bandwidth_hz, audio)
@@ -220,7 +232,7 @@ pub trait Demodulator: Send {
 /// The tap is consumed by the **engine** ([`AudioEngine`]), not by the
 /// core — so a new-mode impl does not have to thread the tap through
 /// `DemodCore`.
-pub trait RawSampleTap: std::fmt::Debug + Send + Sync {
+pub trait RawSampleTap: fmt::Debug + Send + Sync {
     /// Append `samples` to the tap. May be called concurrently from the
     /// demod thread; implementers should be `Send + Sync` and keep calls
     /// short (no allocation, no blocking).

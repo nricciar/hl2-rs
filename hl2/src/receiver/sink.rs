@@ -14,8 +14,11 @@
 //! a complex baseband (or 24-bit) output can add a *sibling* trait instead of
 //! complicating the common one (PROTOCOL.md §16.3).
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+
 /// Sink error.
-pub type SinkError = Box<dyn std::error::Error + Send + Sync>;
+pub type SinkError = Box<dyn core::error::Error + Send + Sync>;
 
 /// An audio sink takes demodulated `i16` mono samples and does something with
 /// them (play, record, etc.).
@@ -43,12 +46,14 @@ pub trait AudioSink: Send {
 /// ever held across the lock, so `std::sync::Mutex` is correct and cheaper
 /// than `tokio::sync::Mutex`). Oldest frames are dropped on overflow so a slow
 /// drainer can never make the demod block.
+#[cfg(feature = "std")]
 #[derive(Debug)]
 struct SharedAudioBuf {
     buf: std::sync::Mutex<Vec<i16>>,
     cap: usize,
 }
 
+#[cfg(feature = "std")]
 impl SharedAudioBuf {
     fn new(cap: usize) -> Self {
         Self {
@@ -94,6 +99,7 @@ impl SharedAudioBuf {
 /// blocks, so 200 ms comfortably covers a handful of ticks without adding
 /// perceptible end-to-end latency (a dropped/old FT8 cycle is the cost of
 /// going larger). Bounded so a slow browser can't make the demod wait.
+#[cfg(feature = "std")]
 pub const BUF_SINK_DEFAULT_CAP: usize = 960;
 
 /// An [`AudioSink`] that appends every `i16` block into a *shared* buffer so
@@ -103,11 +109,16 @@ pub const BUF_SINK_DEFAULT_CAP: usize = 960;
 ///
 /// `BufSink` is moved into a [`crate::receiver::VirtualReceiver`]; the paired
 /// [`BufSinkHandle`] is what the API keeps for reading.
+///
+/// Only available under `std` (it uses `Arc<Mutex<...>>` for the shared
+/// buffer).
+#[cfg(feature = "std")]
 #[derive(Debug)]
 pub struct BufSink {
     inner: std::sync::Arc<SharedAudioBuf>,
 }
 
+#[cfg(feature = "std")]
 impl BufSink {
     /// Build a [`BufSink`] and a [`BufSinkHandle`] that share the same buffer.
     ///
@@ -124,6 +135,7 @@ impl BufSink {
     }
 }
 
+#[cfg(feature = "std")]
 impl Default for BufSink {
     fn default() -> Self {
         let (sink, _handle) = Self::pair(BUF_SINK_DEFAULT_CAP);
@@ -132,11 +144,13 @@ impl Default for BufSink {
 }
 
 /// A cloneable read handle for a [`BufSink`]'s shared buffer.
+#[cfg(feature = "std")]
 #[derive(Debug, Clone)]
 pub struct BufSinkHandle {
     inner: std::sync::Arc<SharedAudioBuf>,
 }
 
+#[cfg(feature = "std")]
 impl BufSinkHandle {
     /// Frames currently queued.
     pub fn len(&self) -> usize {
@@ -162,6 +176,7 @@ impl BufSinkHandle {
     }
 }
 
+#[cfg(feature = "std")]
 impl AudioSink for BufSink {
     fn write(&mut self, samples: &[i16]) -> Result<usize, SinkError> {
         self.inner.push(samples);
@@ -395,6 +410,7 @@ mod tests {
         assert_eq!(s.into_samples(), [9]);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn bufsink_drains_fifo() {
         let (mut s, h) = BufSink::pair(16);
@@ -407,6 +423,7 @@ mod tests {
         assert!(h.is_empty());
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn bufsink_drops_oldest_over_cap() {
         let (mut s, h) = BufSink::pair(4);
@@ -415,6 +432,7 @@ mod tests {
         assert_eq!(h.drain(8), vec![3, 4, 5, 6]);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn bufsink_shared_across_handles() {
         let (mut s, h1) = BufSink::pair(16);

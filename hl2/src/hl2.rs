@@ -838,13 +838,7 @@ async fn run_loop(hl2: Hl2, tx: mpsc::UnboundedSender<Hl2Event>) {
                         // `rings.len()`), so index one-to-one.
                         for (p, samples) in chunk.per_rx.iter().enumerate() {
                             if p < rings.len() {
-                                // `unwrap_or` (not `unwrap`): a dead demod
-                                // thread poisoned the lock must not kill the
-                                // whole RX data path — the ring stays
-                                // consistent after a peek/push panic (both
-                                // are simple copies/counts), so we keep
-                                // writing into it until the reader is
-                                // gone. The push cost is the same.
+                                // Keep reception running if a reader poisoned the lock.
                                 rings[p]
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)

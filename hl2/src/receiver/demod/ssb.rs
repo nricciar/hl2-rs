@@ -46,6 +46,9 @@
 //! [`PolyphaseDecimator`], so only ≈ 1/M of its taps touch each sample (~M×
 //! fewer MACs, M = the decimation factor).
 
+use alloc::vec;
+use alloc::vec::Vec;
+use core::f64::consts;
 use num_complex::Complex;
 
 use super::core::DemodCore;
@@ -119,7 +122,7 @@ impl SsbCore {
         // has a symmetric impulse centred on sample `(len−1)/2`, so the group
         // delay is exactly `(len−1)/2` full-rate samples.
         let i_delay_samples = (hilb_fir.len() - 1) / 2;
-        let nco = Nco::new(2.0 * std::f64::consts::PI * source_center_hz / source_rate_hz as f64);
+        let nco = Nco::new(2.0 * consts::PI * source_center_hz / source_rate_hz as f64);
         Self {
             sideband,
             nco,
@@ -204,6 +207,8 @@ mod tests {
     use crate::receiver::Demodulator;
     use crate::receiver::demod::{IqBlock, RawSampleTap};
     use crate::receiver::sink::VecSink;
+    use alloc::boxed::Box;
+    use std::eprintln;
 
     /// A proper **analytic** complex tone: `amp · e^(j·2π·f·t)`, i.e.
     /// `I = amp·cos(θ)`, `Q = amp·sin(θ)`.
