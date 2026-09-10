@@ -34,12 +34,15 @@ pub mod audio_scale;
 #[cfg(any(feature = "ft8", feature = "ft4", feature = "js8"))]
 pub mod auto;
 /// Bounded, drop-oldest complex I/Q ring the EP6 pump writes into (pump
-/// plumbing — needs `std` for the `Arc<Mutex<..>>` the fan-out hands out).
-#[cfg(feature = "std")]
+/// plumbing). `no_std`-capable (only `alloc` + `num-complex`); the
+/// multi-reader `Arc<Mutex<..>>` view is an additive `std`-only layer the
+/// fan-out hands out.
+#[cfg(feature = "dsp")]
 pub mod baseband_ring;
 pub mod demod;
-/// Per-slot EP6 baseband fan-out (pump plumbing — `std`-only).
-#[cfg(feature = "std")]
+/// Per-slot EP6 baseband fan-out. `no_std`-capable (owned core); the
+/// `Arc<Mutex<..>>` multi-reader view is an additive `std`-only layer.
+#[cfg(feature = "dsp")]
 pub mod fanout;
 /// FT4 slot decoder (`mfsk-core`). `ft4` feature.
 #[cfg(feature = "ft4")]
@@ -67,7 +70,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 /// enabled; the API iterates `AUTO_MODES` to build slot decoders).
 #[cfg(any(feature = "ft8", feature = "ft4", feature = "js8"))]
 pub use auto::{AUTO_MODES, AutoMode};
-#[cfg(feature = "std")]
+#[cfg(feature = "dsp")]
 pub use baseband_ring::{BASEBAND_RING_CAP, BasebandRing};
 pub use demod::AudioEngine;
 pub use demod::{
@@ -79,7 +82,7 @@ pub use demod::{
 /// at least one digital mode is enabled.
 #[cfg(any(feature = "ft8", feature = "ft4", feature = "js8"))]
 pub use demod::{DigitalCore, DigitalDemodulator};
-#[cfg(feature = "std")]
+#[cfg(feature = "dsp")]
 pub use fanout::BasebandFanout;
 #[cfg(feature = "ft4")]
 pub use ft4::{

@@ -70,6 +70,7 @@ The fastest way into the code, by protocol concept:
 | Start / Stop command byte                 | `hl2/src/protocol/command.rs` → `StartCommand`; `hl2/src/protocol/data.rs` → `build_start_stop_frame` |
 | C0–C4 build / parse (RQST, MOX, ACK, PTT)| `hl2/src/protocol/command.rs` → `CommandHeader`, `CommandData`, `ResponseHeader` |
 | 1032-byte frame build/parse, IQ, assembler| `hl2/src/protocol/data.rs` → `build_keepalive_packet`, `build_nco_packet`, `parse_receive_packet`, `BlockAssembler` |
+| Send-sequence counter + persistent C&C config (SPEED/OC/N) + frame drivers + RX datagram classify | `hl2/src/protocol/session.rs` → `Session`, `SessionConfig`, `classify` |
 | High-level `Hl2` handle + receive pump    | `hl2/src/hl2.rs` → `Hl2::start/stop/tune`, `run_loop`, `discover`    |
 | WebSocket command/status contract         | `common/src/lib.rs` → `ClientCmd`, `ServerResponse`, `SharedState`, `SpectrumFrame` |
 | Server orchestration + FFT fan-out        | `api/src/hub.rs` → `RadioHub`, `run_spectral`                        |
