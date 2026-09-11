@@ -12,9 +12,7 @@
 //! [`normalize_to_i16_with_agc`].
 
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
-use core::mem;
 #[cfg(feature = "std")]
 use core::sync::atomic::AtomicUsize;
 #[cfg(feature = "std")]
@@ -47,6 +45,12 @@ pub struct AudioEngine {
     /// Accumulated decimated `f32` audio, ready to be normalised + emitted once
     /// it reaches `AUDIO_EMIN`.
     audio_buf: Vec<f32>,
+    /// Persistent `i16` output scratch (see [`emit_block`](Self::emit_block)).
+    /// Sized once in [`new`](Self::new) and reused on every emit, so steady
+    /// state never hits the heap — safe under a `no_std` bump allocator with no
+    /// free. `1024` is the max `sink.write` block, the cap used by both `push`
+    /// paths, so `resize` below only sets the length, it never reallocates.
+    out_buf: Vec<i16>,
     /// Optional pre-AGC raw-sample tap (e.g. FT8 decode). `Arc` so the API
     /// layer keeps one handle for the demod and hands a clone to the decode
     /// task.
@@ -66,6 +70,7 @@ impl AudioEngine {
             audio_cfg: AudioConfig { rate_hz, gain_db },
             agc_gain: 1000.0,
             audio_buf: Vec::with_capacity(256),
+            out_buf: Vec::with_capacity(1024),
             tap: None,
             #[cfg(feature = "std")]
             mode_label,
@@ -98,6 +103,11 @@ impl AudioEngine {
     /// Normalise + emit every `AUDIO_EMIN`-complete block currently buffered,
     /// up to 1024 samples per `sink.write` (matching the previous
     /// `flush_full_blocks`). Returns the total `i16` frames written.
+    ///
+    /// Allocation-free in steady state: each block is a *window* into
+    /// [`audio_buf`](Self::audio_buf) (no copy), and the normalisation writes
+    /// into the reused [`out_buf`](Self::out_buf). The block is drained with a
+    /// single `drain` (one `memmove`, no new allocation) once it is emitted.
     pub fn emit_full_blocks(
         &mut self,
         sink: &mut dyn AudioSink,
@@ -105,53 +115,79 @@ impl AudioEngine {
         let mut frames_written = 0usize;
         while self.audio_buf.len() >= AUDIO_EMIN {
             let block_len = self.audio_buf.len().min(1024);
-            let slice: Vec<f32> = self.audio_buf.drain(..block_len).collect();
-            frames_written = frames_written.saturating_add(self.emit(&slice, sink)?);
+            // Split-borrow the disjoint fields (a view of `audio_buf`, the
+            // output scratch, and the AGC state) so the window stays live
+            // while `audio_buf` is read without a copy.
+            let (input, out_slot, tap_ref) =
+                (&self.audio_buf[..block_len], &mut self.out_buf, &self.tap);
+            let audio_cfg = self.audio_cfg;
+            let agc = &mut self.agc_gain;
+            #[cfg(feature = "std")]
+            let label = self.mode_label;
+            // Pre-AGC raw-sample tap (FT8/JS8/FT4 decode): the untouched
+            // decimated `f32` stream, in arrival order.
+            if let Some(t) = tap_ref.as_deref() {
+                t.append(input);
+            }
+            out_slot.resize_with(input.len(), i16::default);
+            let out = &mut out_slot[..input.len()];
+            let written = normalize_to_i16_with_agc(input, out, audio_cfg.gain_db, agc);
+            #[cfg(feature = "std")]
+            if std::env::var("HL2_DEBUG").is_ok() {
+                let c = EMIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                if c % 50 == 1 {
+                    let in_max = input.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                    let in_rms =
+                        (input.iter().map(|v| v * v).sum::<f32>() / input.len().max(1) as f32).sqrt();
+                    let o_max = out[..written].iter().map(|v| v.abs()).max().unwrap_or(0);
+                    eprintln!(
+                        "[aud] {label} in_rms={in_rms:.6e} in_max={in_max:.6e} agc={agc:.3e} out_i16_max={o_max} (n={written})",
+                        agc = *agc,
+                    );
+                }
+            }
+            sink.write(&out[..written])?;
+            self.audio_buf.drain(..block_len);
+            frames_written = frames_written.saturating_add(written);
         }
         Ok(frames_written)
     }
 
     /// Emit the residual partial block (sub-`AUDIO_EMIN` tail) so the final
-    /// ~50 ms isn't silently dropped at shutdown.
+    /// ~50 ms isn't silently dropped at shutdown. Reads the buffer as a
+    /// window and clears it in place — no allocation, even on `no_std`.
     pub fn flush_residue(&mut self, sink: &mut dyn AudioSink) -> Result<usize, super::DemodError> {
         if self.audio_buf.is_empty() {
             return Ok(0);
         }
-        let n = mem::take(&mut self.audio_buf);
-        self.emit(&n, sink)
-    }
-
-    /// Normalise + write one slice to `sink`, advancing the AGC. Returns the
-    /// number of `i16` frames written.
-    fn emit(
-        &mut self,
-        slice: &[f32],
-        sink: &mut dyn AudioSink,
-    ) -> Result<usize, super::DemodError> {
-        // Pre-AGC raw-sample tap (FT8/JS8/FT4 decode): the untouched
-        // decimated `f32` stream, in arrival order.
-        if let Some(tap) = self.tap.as_ref() {
-            tap.append(slice);
+        let (input, out_slot, tap_ref) = (&self.audio_buf, &mut self.out_buf, &self.tap);
+        let audio_cfg = self.audio_cfg;
+        let agc = &mut self.agc_gain;
+        #[cfg(feature = "std")]
+        let label = self.mode_label;
+        if let Some(t) = tap_ref.as_deref() {
+            t.append(input);
         }
-        let mut out = vec![0i16; slice.len()];
-        let written =
-            normalize_to_i16_with_agc(slice, &mut out, self.audio_cfg.gain_db, &mut self.agc_gain);
+        out_slot.resize_with(input.len(), i16::default);
+        let out = &mut out_slot[..input.len()];
+        let written = normalize_to_i16_with_agc(input, out, audio_cfg.gain_db, agc);
         #[cfg(feature = "std")]
         if std::env::var("HL2_DEBUG").is_ok() {
             let c = EMIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
             if c % 50 == 1 {
-                let in_max = slice.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                let in_max = input.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
                 let in_rms =
-                    (slice.iter().map(|v| v * v).sum::<f32>() / slice.len().max(1) as f32).sqrt();
+                    (input.iter().map(|v| v * v).sum::<f32>() / input.len().max(1) as f32).sqrt();
                 let o_max = out[..written].iter().map(|v| v.abs()).max().unwrap_or(0);
                 eprintln!(
-                    "[aud] {mode_label} in_rms={in_rms:.6e} in_max={in_max:.6e} agc={agc:.3e} out_i16_max={o_max} (n={written})",
-                    mode_label = self.mode_label,
-                    agc = self.agc_gain,
+                    "[aud] {label} in_rms={in_rms:.6e} in_max={in_max:.6e} agc={agc:.3e} out_i16_max={o_max} (n={written})",
+                    agc = *agc,
                 );
             }
         }
-        sink.write(&out[..written])
+        sink.write(&out[..written])?;
+        self.audio_buf.clear();
+        Ok(written)
     }
 }
 

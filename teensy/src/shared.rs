@@ -45,6 +45,45 @@ pub fn frames() -> u32 {
     FRAMES.load(Ordering::Relaxed)
 }
 
+/// The virtual receiver's S-meter reading, an S1..S9 index (0 = below S1).
+/// Set by the radio task from the spectrum passband-over-floor margin; read
+/// by the render task to paint the S1-S9 bar. See `crate::smeter`.
+static SLEVEL: AtomicU32 = AtomicU32::new(0);
+
+/// The raw signal-over-noise margin (dB) behind the S-unit reading
+/// (`level - floor`, scale-independent). Stored as `f32` bits so the render
+/// task can show "+N dB" next to the bar.
+static SMARGIN: AtomicU32 = AtomicU32::new(0.0f32.to_bits());
+
+/// The demod + waterfall share of the CPU, in percent (0..=100). Computed by
+/// the radio task over a ~1 s window (DWT cycles spent in the feed vs. wall);
+/// shown on the status line so the pipeline "runs at CPU speed" is visible.
+static CPU_PCT: AtomicU32 = AtomicU32::new(0);
+
+/// Publish the S1..S9 index + the raw dB margin the render task displays.
+pub fn set_slevel(sunits: u8, margin_db: f32) {
+    SLEVEL.store(u32::from(sunits), Ordering::Release);
+    SMARGIN.store(margin_db.to_bits(), Ordering::Release);
+}
+
+/// The current S1..S9 index (or 0).
+pub fn slevel() -> u8 {
+    SLEVEL.load(Ordering::Acquire) as u8
+}
+
+/// The raw dB-over-floor margin (0.0 until the first reading).
+pub fn smargin_db() -> f32 {
+    f32::from_bits(SMARGIN.load(Ordering::Acquire))
+}
+
+pub fn set_cpu_pct(pct: u32) {
+    CPU_PCT.store(pct.min(100), Ordering::Release);
+}
+
+pub fn cpu_pct() -> u32 {
+    CPU_PCT.load(Ordering::Acquire)
+}
+
 /// Publish one complete waterfall row and advance the wrapping sequence.
 pub fn publish(row: &[u16]) {
     assert_eq!(row.len(), BINS, "publish requires a complete row");

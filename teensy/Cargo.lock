@@ -339,6 +339,7 @@ dependencies = [
  "imxrt-enet",
  "imxrt-log",
  "log",
+ "num-complex",
  "num-traits",
  "rtic",
  "rtic-monotonics",

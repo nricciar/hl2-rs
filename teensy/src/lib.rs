@@ -21,4 +21,5 @@ pub mod display;
 pub mod ethernet;
 pub mod radio;
 pub mod shared;
+pub mod smeter;
 pub mod spectrum;

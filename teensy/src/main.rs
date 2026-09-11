@@ -365,13 +365,33 @@ mod app {
         poll_log();
 
         let mut last_keepalive = cycles_now();
-        let mut seen_frame_seq: u32 = pipeline.frame_seq();
+        // S-meter + CPU% instrumentation.
+        //   * `last_row_pub` — the frame_seq at which we last republished the
+        //     row. The S-level is computed from the *same* `mags()` snapshot we
+        //     hand to the render task, so the meter and the waterfall agree.
+        //   * `cpu_*` — a rolling 1-second DWT window. `busy_cycles` is the
+        //     time inside the pump + feed loop (the real per-DP work: MAC
+        //     poll + EP6 parse + virtual-receiver demod + FFT commit); the
+        //     `Systick::delay(1)` between iterations is the scheduler's free
+        //     time and is *not* counted. `busy / wall × 100` is the radio
+        //     task's CPU utilisation — the honest "we are running at CPU
+        //     speed" number. Because a no-std bump heap never frees, the
+        //     demod's per-emit buffers are amortised against persistent `Vec`s
+        //     (see `hl2::receiver::AudioEngine`); if DSP grows, this climbs.
+        let mut last_row_pub: u32 = pipeline.frame_seq();
+        let mut cpu_start: u32 = cycles_now();
+        let mut busy_cycles: u64 = 0;
+        let mut wall_cycles: u64 = 0;
+
         loop {
+            let iter_t0 = cycles_now();
+
             handle.set_now(smoltcp::time::Instant::from_millis(now_millis()));
 
             // Drain a bounded batch from the MAC as well as the UDP socket.
             // One ingress poll per millisecond cannot keep up at 96 kSps.
             let mut dgram = [0u8; hl2::protocol::DATA_PACKET_SIZE + 64];
+            let busy_t0 = cycles_now();
             for _ in 0..64 {
                 handle.pump();
                 while let Some((n, src)) = handle.recv(&mut dgram) {
@@ -380,15 +400,38 @@ mod app {
                     }
                 }
             }
+            busy_cycles += cycles_now() as u64 - busy_t0 as u64;
 
             // Publish only completed FFT frames, coalescing to the latest row.
             let cur_seq = pipeline.frame_seq();
-            if cur_seq != seen_frame_seq {
-                seen_frame_seq = cur_seq;
+            if cur_seq != last_row_pub {
+                last_row_pub = cur_seq;
                 shared::publish(pipeline.mags());
+                // The S-meter is a spectrum consumer (PROTOCOL.md §16.3e) — the
+                // same 320-bin row the render task blits. Compute it here, off
+                // the render path, so the render task just paints.
+                let m = hl2_teensy::smeter::compute(pipeline.mags());
+                shared::set_slevel(m.sunits, m.margin_db);
             }
 
+            // Roll the CPU% window forward every ~1 s and publish.
             let now_c = cycles_now();
+            wall_cycles += now_c as u64 - iter_t0 as u64;
+            if ms_since(cpu_start, now_c) >= 1_000 {
+                let wall = wall_cycles;
+                // `busy <= wall` always (the busy window is a sub-interval), so
+                // the clamped ratio is naturally ≤ 100 and never wraps.
+                let pct = if wall == 0 {
+                    0
+                } else {
+                    (100u64.saturating_mul(busy_cycles)).min(wall) as u32
+                };
+                shared::set_cpu_pct(pct);
+                busy_cycles = 0;
+                wall_cycles = 0;
+                cpu_start = now_c;
+            }
+
             if ms_since(last_keepalive, now_c) >= radio::control::KEEPALIVE_INTERVAL_MS_CONST {
                 last_keepalive = now_c;
                 handle.send_keepalive();
@@ -417,6 +460,7 @@ mod app {
         );
         let mut status_label = display::driver::TextLine::<9>::new();
         let mut status_detail = display::driver::TextLine::<32>::new();
+        let mut status_meter = display::driver::TextLine::<16>::new();
 
         let mut painted_seq: u32 = 0;
         let mut last_state: u32 = u32::MAX;
@@ -466,7 +510,12 @@ mod app {
                 last_state = st;
                 last_peer = peer_u32;
                 last_status_ms = now_ms;
-                status_redraw(&mut panel, &mut status_label, &mut status_detail);
+                status_redraw(
+                    &mut panel,
+                    &mut status_label,
+                    &mut status_detail,
+                    &mut status_meter,
+                );
             }
 
             Systick::delay(2.millis()).await;
@@ -478,6 +527,7 @@ mod app {
         panel: &mut Panel,
         status_label: &mut display::driver::TextLine<9>,
         status_detail: &mut display::driver::TextLine<32>,
+        status_meter: &mut display::driver::TextLine<16>,
     ) {
         let label = match shared::state() {
             shared::STATE_WAITING_IP => "WAIT IP",
@@ -505,5 +555,47 @@ mod app {
         write!(w, " F {}", shared::frames()).unwrap();
         let line_s = core::str::from_utf8(&w.target[..w.pos]).unwrap();
         status_detail.update(panel, 6, wf_y + 30, line_s, 0xF800, 0x0000);
+
+        // S-meter + CPU% readout. The bar is `S1..S9` (one segment per unit);
+        // below it, the raw dB margin + the DSP/network CPU% — the "we are
+        // running at CPU speed" proof. The bar sits below the state label
+        // (y = `wf_y + 14`) and the meter text one row further down
+        // (y = `wf_y + 24`), so the left-side status label at `y = wf_y + 4`
+        // and the IP / F counter at `y = wf_y + 30` stay clear.
+        let s = shared::slevel();
+        let margin = shared::smargin_db();
+        let pct = shared::cpu_pct();
+
+        // `fill_rect(display, x, y, w, h, color)` — the last 4 args are
+        // width/height, NOT x2/y2. This was the source of the "big red box":
+        // segment i=8 (x=78) had `w = x+seg_w-1 = 85` and `h = bar_y+seg_h-1 = 141`,
+        // covering the IP text at (6, 150) and the state label at (6, 124).
+        let bar_y = wf_y + 14u16;
+        let seg_w = 8u16;
+        let seg_h = 8u16;
+        // Nine 8×8 segments spaced 1 px apart — 80 px wide, x = [6..85].
+        let x0 = 6u16;
+        for i in 0..9u16 {
+            let x = x0 + (i as u32 * ((seg_w + 1) as u32)) as u16;
+            let on = (i as u8 + 1) <= s;
+            let fg: u16 = if on { 0xFFFF } else { 0x4020 };
+            display::driver::fill_rect(panel, x, bar_y, seg_w, seg_h, fg);
+        }
+
+        // Right of the bar: "S{n} +{N} dB {pct} C" (≤ 14 cells), same row as the
+        // bar. `TextLine<16>` is 96 px wide — more than enough for "S9 +54 dB 100 C".
+        let mut meter = [0u8; 16];
+        let mut w2 = radio::control::WriteBuf {
+            target: &mut meter,
+            pos: 0,
+        };
+        if s == 0 {
+            let _ = write!(w2, "S0 +{:.0} dB {pct} C", margin);
+        } else {
+            let _ = write!(w2, "S{s} +{:.0} dB {pct} C", margin);
+        }
+        let meter_s = core::str::from_utf8(&w2.target[..w2.pos]).unwrap();
+        let meter_x = x0 + (9u16 * (seg_w + 1) as u16) + 2u16;
+        status_meter.update(panel, meter_x, bar_y, meter_s, 0xF800, 0x0000);
     }
 }

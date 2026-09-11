@@ -12,6 +12,7 @@ crate-type = ["lib"]
 [dependencies]
 hl2 = { path = "../hl2", default-features = false, features = ["dsp"] }
 num-traits = { version = "0.2", default-features = false, features = ["libm"] }
+num-complex = { version = "0.4", default-features = false }
 rtic = { version = "2", features = ["thumbv7-backend"] }
 rtic-monotonics = { version = "1", default-features = false, features = ["cortex-m-systick", "systick-64bit"] }
 ili9341 = "0.6.0"
