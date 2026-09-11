@@ -55,7 +55,7 @@ const N_RECV: u8 = 1;
 pub const SAMPLE_RATE_KHZ: u32 = 96;
 
 /// Default LNA gain (dB), re-exported for the status text.
-pub const LNA_GAIN_DB: i8 = DEFAULT_LNA_GAIN_DB;
+pub const LNA_GAIN_DB: i8 = 30; //DEFAULT_LNA_GAIN_DB;
 
 /// Target keep-alive cadence in ms. Blocking work can delay actual sends;
 /// the caller must keep gaps below the approximately 168 ms watchdog limit.

@@ -137,8 +137,9 @@ impl AudioEngine {
                 let c = EMIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
                 if c % 50 == 1 {
                     let in_max = input.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-                    let in_rms =
-                        (input.iter().map(|v| v * v).sum::<f32>() / input.len().max(1) as f32).sqrt();
+                    let in_rms = (input.iter().map(|v| v * v).sum::<f32>()
+                        / input.len().max(1) as f32)
+                        .sqrt();
                     let o_max = out[..written].iter().map(|v| v.abs()).max().unwrap_or(0);
                     eprintln!(
                         "[aud] {label} in_rms={in_rms:.6e} in_max={in_max:.6e} agc={agc:.3e} out_i16_max={o_max} (n={written})",

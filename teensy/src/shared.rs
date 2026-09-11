@@ -80,6 +80,23 @@ pub fn set_cpu_pct(pct: u32) {
     CPU_PCT.store(pct.min(100), Ordering::Release);
 }
 
+/// Diagnostic: increment the counter for each DMA completion interrupt.
+/// The `dma_irq` ISR in `main.rs` bumps this on every DMA0_DMA16 vector
+/// entry. `draw_pixels` samples the delta across a blit to see how many
+/// chunks actually completed and raised their IRQ.
+///
+/// Uses `AtomicUsize` (not `AtomicU32`) to survive both `#[no_std]`
+/// cortex-m and 32-bit pointer arithmetic without an extra import.
+static IRQ_FIRES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+pub fn irq_fires() -> usize {
+    IRQ_FIRES.load(core::sync::atomic::Ordering::Acquire)
+}
+
+pub fn irq_fires_inc() {
+    IRQ_FIRES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn cpu_pct() -> u32 {
     CPU_PCT.load(Ordering::Acquire)
 }

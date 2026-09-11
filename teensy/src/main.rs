@@ -147,6 +147,30 @@ mod app {
     use rtic_monotonics::systick::ExtU64;
     use rtic_monotonics::systick::Systick;
 
+    /// DMA0-15 completion IRQ. The `render` task `.await`s the LPSPI
+    /// `dma_write` future on channel 0, which stores its waker on the
+    /// `imxrt-dma` channel before enabling it. When the eDMA sets the
+    /// channel's `DONE` bit the `INTMAJOR` request fires this vector; the
+    /// handler routes it into the driver's `on_interrupt`, which clears the
+    /// flag (`DONE` + `INT`) and wakes the parked `render` task. The RTIC
+    /// executor then re-polls `render`, which observes `is_complete()` and
+    /// resumes — freeing the CPU to `radio_task` meanwhile.
+    /// Diagnostic counter incremented in the `dma_irq` ISR. Lets us count
+    /// how many DMA completion interrupts actually fired during a blit —
+    /// if we only see ~15 IRQs instead of 150, most chunks never completed
+    /// (or completed so fast the IRQ coalesced).
+    #[task(binds = DMA0_DMA16, priority = 3)]
+    fn dma_irq(_cx: dma_irq::Context) {
+        shared::irq_fires_inc();
+        // Safety: channel 0 is exclusively owned by the `render` task's
+        // `DmaDisplay` (`init` hands it `dma[0]`), so no concurrent
+        // `on_interrupt` can race this one. Only channels 0..=15 share the
+        // `DMA0_DMA16` vector; we only ever arm channel 0 here.
+        unsafe {
+            bsp::hal::dma::DMA.on_interrupt(0);
+        }
+    }
+
     /// Task-local type alias for the ILI9341 panel.
     type Panel = display::driver::Display;
 
@@ -170,8 +194,16 @@ mod app {
             ccm,
             ccm_analog,
             iomuxc_gpr,
+            mut dma,
             ..
         } = board::t41(cx.device);
+
+        // eDMA channel for the ILI9341 pixel blit. USB (imxrt-usbd) on this
+        // chip is CPU-polled by the logger, so all 32 channels are free;
+        // channel 0 is the smallest index the RT1060's eDMA can address on
+        // any bus domain that can reach both OCRAM (source) and LPSPI4 TDR
+        // (destination).
+        let display_dma = dma[0].take().expect("dma channel 0 available");
 
         let poller = logging::log::usbd(usb, logging::Interrupts::Disabled).unwrap();
         cortex_m::interrupt::free(|cs| POLLER.borrow(cs).replace(Some(poller)));
@@ -193,7 +225,7 @@ mod app {
         // Keep SPI fast enough that full-band blits fit within the watchdog.
         let cs = gpio2.output(pins.p10).expect("p10 is GPIO2");
         let dc = gpio2.output(pins.p9).expect("p9 is GPIO2");
-        let spi: board::Lpspi = board::lpspi(
+        let mut spi: board::Lpspi = board::lpspi(
             lpspi4,
             board::LpspiPins {
                 sdo: pins.p11,
@@ -202,14 +234,29 @@ mod app {
             },
             33_000_000,
         );
+        // Override: the HAL clamps sckdiv to >=4 (22 MHz). Push to 33 MHz
+        // (sckdiv=2: 132/(2+2)). ILI9341 max SPI is 50 MHz so this is safe.
+        spi.disabled(|d| d.set_clock_configs(bsp::hal::lpspi::ClockConfigs {
+            sckdiv: 2,
+            dbt: 0,
+            pcssck: 0,
+            sckpcs: 0,
+        }));
 
-        // ILI9341 + red background so the operator knows the display is
-        // alive before the radio comes up.
+        // Construct the DMA-accelerated panel *before* the ILI9341 driver
+        // moves `spi` into itself, so `DmaDisplay::new` can bitwise-copy
+        // the `board::Lpspi` + CS pin out of a temporary `DisplaySpi`
+        // (which then keeps its own copy for the boot splash + status text).
+        // Build the DMA handle first: it bitwise-copies the LPSPI + CS + DC
+        // pins from their `&` references. The originals are then moved into
+        // the blocking `Display` (which owns them for the boot splash +
+        // status text).
+        let dma = display::driver::DmaDisplay::new(&spi, &cs, &dc, display_dma);
         let mut panel = display::driver::new_display(spi, cs, dc).expect("ILI9341 init");
         display::driver::fill_rect(&mut panel, 0, 0, 320, 240, 0xF800);
         display::driver::draw_text(&mut panel, 10, 10, 2, "HL2 TEENSY 4.1", 0x0000, 0xF800);
 
-        let _ = render::spawn(panel);
+        let _ = render::spawn(panel, dma);
         let _ = radio_task::spawn(ccm, ccm_analog, iomuxc_gpr);
 
         (Shared {}, Local {})
@@ -442,8 +489,21 @@ mod app {
         }
     }
 
-    #[task]
-    async fn render(_cx: render::Context, mut panel: Panel) {
+    /// DMA-accelerated waterfall blit, task-local (owned by the `render`
+    /// task). See `display::driver::DmaDisplay` for the bitwise-copy
+    /// safety argument behind sharing the LPSPI + GPIO bits with the
+    /// blocking `Display` (which owns the original handles).
+    type Dma = display::driver::DmaDisplay;
+
+    /// Priority 1 (> the default 0 used by `radio_task`), so that when a
+    /// DMA chunk's completion IRQ wakes a suspended `render` continuation
+    /// the RTIC scheduler is allowed to **preempt** `radio_task` — letting
+    /// the ~150 × 125 µs blit chunks run back-to-back without queueing
+    /// behind `radio_task`'s ~200 ms blocking FFT/demod/AGC slices.
+    /// Without this inversion fix, every render `.await` that landed
+    /// inside one of those blocking slices stalled ~200 ms.
+    #[task(priority = 1)]
+    async fn render(_cx: render::Context, mut panel: Panel, mut dma: Dma) {
         let fb = WF.take();
 
         // Boot: fill black (covers the red "HL2 TEENSY" splash), draw the
@@ -494,9 +554,13 @@ mod app {
                 for (i, px) in fb[..cols].iter_mut().enumerate() {
                     *px = display::palette::bin_color(row.get(i).copied().unwrap_or(0u16));
                 }
-                panel
-                    .draw_raw_slice(0, 0, (cols as u16) - 1, (rows as u16) - 1, &fb[..total])
-                    .expect("waterfall draw");
+                // 3. Blit the band via eDMA. This hands the pixel work over
+                //    to the eDMA engine (which drives the LPSPI TDR while
+                //    the panel clocks in the bytes), so the CPU is free to
+                //    poll the radio's MAC ring between chunks — the exact
+                //    "we're not stalling the network" win the DMA path was
+                //    meant to buy.
+                dma.draw_pixels(0, 0, (cols as u16) - 1, (rows as u16) - 1, &fb[..total]).await;
                 painted_seq = seq;
                 // Let the radio drain its MAC ring before further SPI work.
                 Systick::delay(1.millis()).await;
