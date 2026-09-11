@@ -25,6 +25,7 @@ teensy4-panic = { version = "0.3", default-features = false }
 imxrt-enet = "=0.1.0"
 smoltcp = { version = "0.13.0", default-features = false, features = ["proto-ipv4", "proto-dhcpv4", "socket-raw", "socket-udp", "socket-dhcpv4", "multicast"] }
 static_cell = "2.1.1"
+wm8731 = "0.1.0"
 
 [dependencies.teensy4-bsp]
 version = "0.6"

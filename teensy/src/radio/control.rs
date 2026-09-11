@@ -32,7 +32,7 @@ use smoltcp::wire::{EthernetAddress, IpAddress, IpEndpoint, IpListenEndpoint};
 use static_cell::ConstStaticCell;
 
 use hl2::protocol::discovery::{DiscoveryInfo, discovery_request};
-use hl2::protocol::session::{Session, SessionConfig};
+use hl2::protocol::session::Session;
 use hl2::protocol::{
     C1_SPEED_96K, DATA_PACKET_SIZE, DEFAULT_LNA_GAIN_DB, HL2_PORT, OC_MASK_RX, START_REQUEST_SIZE,
 };
@@ -113,11 +113,7 @@ impl Radio {
     pub fn new() -> Self {
         Self {
             peer: Ipv4Addr::UNSPECIFIED,
-            session: Session::new(SessionConfig {
-                c1_speed: C1_SPEED_96K,
-                oc_bits: OC_RELAY,
-                n_recv: N_RECV,
-            }),
+            session: Session::new(C1_SPEED_96K, OC_RELAY),
         }
     }
 
@@ -133,17 +129,17 @@ impl Radio {
 
     /// Build an LNA-gain frame (1032 B).
     pub fn build_lna(&mut self, gain_db: i8) -> [u8; DATA_PACKET_SIZE] {
-        self.session.lna_frame(gain_db)
+        self.session.lna_frame(gain_db, N_RECV)
     }
 
     /// Build an RX1 NCO frame (1032 B) at `hz`.
     pub fn build_tune(&mut self, hz: u32) -> [u8; DATA_PACKET_SIZE] {
-        self.session.tune_frame(RX1_SLOT, hz)
+        self.session.tune_frame(RX1_SLOT, hz, N_RECV)
     }
 
     /// Build a keep-alive frame (1032 B).
     pub fn build_keepalive(&mut self) -> [u8; DATA_PACKET_SIZE] {
-        self.session.keepalive_frame()
+        self.session.keepalive_frame(N_RECV)
     }
 
     /// Attempt to parse `dgram` as an HL2 discovery reply.

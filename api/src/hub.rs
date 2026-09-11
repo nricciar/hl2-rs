@@ -714,7 +714,7 @@ impl RadioHub {
                     sample_format,
                     tuning: BTreeMap::new(),
                     lna_gain_db: ctrl.lna_gain().await,
-                    oc_bits: ctrl.oc_bits(),
+                    oc_bits: ctrl.oc_bits().await,
                     device,
                     vrx: std::collections::BTreeMap::new(),
                     auto: std::collections::BTreeMap::new(),
@@ -992,7 +992,7 @@ impl RadioHub {
         match ctrl {
             Some(c) => {
                 c.set_oc_bits(oc_bits).await;
-                let active = c.oc_bits();
+                let active = c.oc_bits().await;
                 {
                     let mut guard = self.session.lock().await;
                     if let Some(s) = guard.as_mut() {

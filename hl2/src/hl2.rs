@@ -13,7 +13,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
@@ -21,10 +21,10 @@ use tokio::sync::mpsc;
 use tokio::time;
 
 use crate::protocol::data::{
-    BasebandChunk, BlockAssembler, IQBlock, Item, SampleFormat, build_keepalive_packet,
-    build_lna_gain_frame, build_nco_packet, build_start_stop_frame, parse_receive_packet_into,
+    BasebandChunk, BlockAssembler, IQBlock, Item, SampleFormat, parse_receive_packet_into,
 };
 use crate::protocol::discovery::{DiscoveryInfo, discovery_request, parse_discovery_response};
+use crate::protocol::session::Session;
 use crate::protocol::{
     BOARD_ID_HL2, DATA_PACKET_SIZE, DEFAULT_LNA_GAIN_DB, DISCOVERY_RESPONSE_SIZE, HL2_PORT,
     KEEPALIVE_INTERVAL_MS, speed_bits_for_khz,
@@ -91,21 +91,22 @@ struct Shared {
     rx_count: Mutex<u8>,
     /// Serializes control writes (start/stop/tune) across clients.
     write_lock: Mutex<()>,
-    /// Monotonic send-sequence counter (shared by control + keep-alive).
-    next_seq: Mutex<u32>,
-    /// The C1 SPEED bits requested from the radio (per-receiver DDC rate
-    /// option: 48/96/192/384 kHz). This is what the keep-alives re-assert so
-    /// the board holds that rate between tune writes.
-    c1_speed: u8,
-    /// RX open-collector filter relay mask (LSB-first, bit 0 = relay/checkbox 1,
-    /// bit 6 = relay/checkbox 7). Re-asserted in every keep-alive's C2 byte
-    /// (wire position C2[7:1]) so the MRF101 companion filter board holds its
-    /// selected band between NCO tunes. See PROTOCOL.md §11.4 and
-    /// `build_keepalive_packet`.
-    /// Atomic because it is written by any client thread and read by the pump
-    /// task without holding the `write_lock` (it is a hint, not a register, so
-    /// a stale single-byte read is acceptable).
-    oc_bits: Arc<AtomicU8>,
+    /// The shared HL2 [`Session`]: the monotonic send-sequence counter **plus**
+    /// the persistent C&C config — the C1 SPEED bits (per-receiver DDC rate
+    /// 48/96/192/384 kHz, re-asserted by every keep-alive so the board holds
+    /// that rate between tune writes) and the RX open-collector filter relay
+    /// mask (LSB-first, bit 0 = relay 1 … bit 6 = relay 7; re-asserted in
+    /// every keep-alive's C2 so the MRF101 companion filter board holds its
+    /// band between NCO tunes — see PROTOCOL.md §11.4 and
+    /// `build_keepalive_packet`).
+    ///
+    /// Held behind a [`tokio::sync::Mutex`] because it is written by any
+    /// control client and read/built by the pump's keep-alive tick; the
+    /// critical section is a few-byte copy + a frame build, never an `.await`
+    /// point inside it. `n_recv` is deliberately **not** stored here — it is
+    /// derived live from the [`BasebandFanout`] per frame (it changes as slots
+    /// are tuned on/off) and passed to the frame builders as a parameter.
+    session: Mutex<Session>,
     /// The RX LNA gain currently programmed on the board (dB), so a `State`
     /// snapshot can report it without a register read.
     lna_gain_db: Mutex<i8>,
@@ -131,13 +132,6 @@ impl Shared {
     async fn send_packet(&self, bytes: &[u8]) -> std::io::Result<usize> {
         let dst = SocketAddr::new(self.hl2_peer, HL2_PORT);
         self.socket.send_to(bytes, dst).await
-    }
-
-    async fn next_send_seq(&self) -> u32 {
-        let mut s = self.next_seq.lock().await;
-        let cur = *s;
-        *s = cur.wrapping_add(1);
-        cur
     }
 }
 
@@ -202,6 +196,7 @@ impl Hl2 {
             );
         }
 
+        let session = Session::new(c1_speed, 0u8);
         let shared = Arc::new(Shared {
             socket: socket.clone(),
             hl2_peer: hl2_addr,
@@ -209,9 +204,7 @@ impl Hl2 {
             started: Mutex::new(false),
             rx_count: Mutex::new(0),
             write_lock: Mutex::new(()),
-            next_seq: Mutex::new(0),
-            c1_speed,
-            oc_bits: Arc::new(AtomicU8::new(0x00)),
+            session: Mutex::new(session),
             lna_gain_db: Mutex::new(DEFAULT_LNA_GAIN_DB),
             fanout: Arc::new(BasebandFanout::new()),
             delivered: AtomicUsize::new(0),
@@ -229,7 +222,10 @@ impl Hl2 {
         if std::env::var("HL2_DEBUG").is_ok() {
             eprintln!("[DBG] sending STOP + drain to reset device state");
         }
-        let stop = build_start_stop_frame(0, false);
+        let stop = {
+            let mut s = self_.inner.session.lock().await;
+            s.stop_frame()
+        };
         let _ = self_.inner.send_packet(&stop).await;
         let drain_deadline = time::Instant::now() + time::Duration::from_secs(3);
         let mut last_frame_at = time::Instant::now() - time::Duration::from_millis(300);
@@ -277,7 +273,10 @@ impl Hl2 {
         // after collecting 5+ frames (device can take a few frames to produce
         // non-zero output after a watchdog reset). The pump task will handle
         // the rest of the stream.
-        let pkt = build_start_stop_frame(0, true);
+        let pkt = {
+            let mut s = self_.inner.session.lock().await;
+            s.start_frame()
+        };
         if std::env::var("HL2_DEBUG").is_ok() {
             let dst = SocketAddr::new(self_.inner.hl2_peer, HL2_PORT);
             eprintln!(
@@ -374,14 +373,10 @@ impl Hl2 {
             let g = self_.inner.lna_gain_db.lock().await;
             *g
         };
-        let lna_seq = self_.inner.next_send_seq().await;
-        let lna_pkt = build_lna_gain_frame(
-            lna_seq,
-            lna,
-            c1_speed,
-            self_.inner.oc_bits.load(Ordering::Relaxed),
-            1,
-        );
+        let lna_pkt = {
+            let mut s = self_.inner.session.lock().await;
+            s.lna_frame(lna, 1)
+        };
         self_
             .inner
             .send_packet(&lna_pkt)
@@ -411,8 +406,10 @@ impl Hl2 {
 
     /// Send the Metis stop command.
     pub async fn stop(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let seq = self.inner.next_send_seq().await;
-        let pkt = build_start_stop_frame(seq, false);
+        let pkt = {
+            let mut s = self.inner.session.lock().await;
+            s.stop_frame()
+        };
         self.inner
             .send_packet(&pkt)
             .await
@@ -470,9 +467,10 @@ impl Hl2 {
         // (`nreceivers = radio->receivers`, which already includes the
         // receiver being tuned).
         let n_recv = self.inner.fanout.rx_count() as u8;
-        let oc_bits = self.inner.oc_bits.load(Ordering::Relaxed);
-        let seq = self.inner.next_send_seq().await;
-        let pkt = build_nco_packet(seq, slot, freq_hz, self.inner.c1_speed, oc_bits, n_recv);
+        let pkt = {
+            let mut s = self.inner.session.lock().await;
+            s.tune_frame(slot, freq_hz, n_recv)
+        };
         if std::env::var("HL2_DEBUG").is_ok() {
             // C0 now lives in the *second* chunk (the register-write chunk).
             let c0 = pkt[8 + crate::protocol::CHUNK_SIZE + 3];
@@ -543,15 +541,11 @@ impl Hl2 {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let clamped = gain_db.clamp(-12, 48);
         let _guard = self.inner.write_lock.lock().await;
-        let seq = self.inner.next_send_seq().await;
         let n_recv = self.inner.fanout.rx_count() as u8;
-        let pkt = build_lna_gain_frame(
-            seq,
-            clamped,
-            self.inner.c1_speed,
-            self.inner.oc_bits.load(Ordering::Relaxed),
-            n_recv,
-        );
+        let pkt = {
+            let mut s = self.inner.session.lock().await;
+            s.lna_frame(clamped, n_recv)
+        };
         self.inner
             .send_packet(&pkt)
             .await
@@ -580,15 +574,14 @@ impl Hl2 {
     /// ignored. This takes effect on the *next* keep-alive tick (≤ 40 ms), so
     /// there is no blocking round-trip and no register ACK to await.
     pub async fn set_oc_bits(&self, oc_bits: u8) {
-        self.inner
-            .oc_bits
-            .store(oc_bits & crate::protocol::OC_MASK_RX, Ordering::Relaxed);
+        let mut s = self.inner.session.lock().await;
+        s.set_oc_bits(oc_bits & crate::protocol::OC_MASK_RX);
     }
 
     /// The RX open-collector filter relay mask currently held, LSB-first
     /// (bit 0 = relay/checkbox 1 … bit 6 = relay/checkbox 7).
-    pub fn oc_bits(&self) -> u8 {
-        self.inner.oc_bits.load(Ordering::Relaxed) & crate::protocol::OC_MASK_RX
+    pub async fn oc_bits(&self) -> u8 {
+        self.inner.session.lock().await.oc_bits() & crate::protocol::OC_MASK_RX
     }
 
     /// The local port the hardware streams wideband data to.
@@ -768,11 +761,11 @@ async fn run_loop(hl2: Hl2, tx: mpsc::UnboundedSender<Hl2Event>) {
             _ = tx.closed() => break,
 
             _ = keepalive.tick() => {
-                let seq = hl2.inner.next_send_seq().await;
-                let c1_speed = hl2.inner.c1_speed;
-                let oc_bits = hl2.inner.oc_bits.load(Ordering::Relaxed);
                 let n_recv = fanout.rx_count() as u8;
-                let pkt = build_keepalive_packet(seq, c1_speed, oc_bits, n_recv);
+                let pkt = {
+                    let mut s = hl2.inner.session.lock().await;
+                    s.keepalive_frame(n_recv)
+                };
                 let _ = socket.send_to(&pkt, SocketAddr::new(hl2.inner.hl2_peer, HL2_PORT)).await;
 
                 // 1 Hz delivery-rate diagnostic.

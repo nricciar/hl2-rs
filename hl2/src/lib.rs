@@ -49,7 +49,7 @@ pub use hl2::{
 };
 pub use protocol::data::{BasebandChunk, IQBlock};
 pub use protocol::discovery::DiscoveryInfo;
-pub use protocol::session::{DatagramKind, Session, SessionConfig};
+pub use protocol::session::{DatagramKind, Session};
 /// Per-slot EP6 baseband fan-out (one [`BasebandRing`] per active slot).
 /// `std`-flavoured multi-reader `Arc` API or a `no_std` single-owner `&mut` API,
 /// depending on whether `std` is on; either way it's `dsp`-available.
