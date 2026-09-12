@@ -143,7 +143,7 @@ mod app {
 
     use super::{POLLER, cycles_now, ms_since, now_millis, poll_log};
     use cortex_m::peripheral::DWT;
-    use hl2_teensy::{display, radio, shared, spectrum};
+    use hl2_teensy::{autoscale, display, radio, shared, spectrum};
     use imxrt_log as logging;
     use rtic_monotonics::systick::ExtU64;
     use rtic_monotonics::systick::Systick;
@@ -433,6 +433,11 @@ mod app {
         //     demod + fft + lcd cannot sum past 100 — the whole point is
         //     seeing *which* slice ate the CPU, not three independent 100s.
         let mut last_row_pub: u32 = pipeline.frame_seq();
+        // Auto floor/ceil for the waterfall (UI `Shared::update_auto_scale`).
+        // Seeded to the UI's initial auto window; `recenter` snaps it to the
+        // first real frame's band instead of blending up from the seed.
+        let mut scale = autoscale::AutoScale::new();
+        scale.recenter();
         let mut cpu_start: u32 = cycles_now();
         let mut window_start: u64 = rx.demod_cycles();
         let mut fft_start: u64 = rx.fft_cycles();
@@ -462,6 +467,13 @@ mod app {
                 // the render path, so the render task just paints.
                 let m = hl2_teensy::smeter::compute(pipeline.mags());
                 shared::set_slevel(m.sunits, m.margin_db);
+                // Auto floor/ceil: advance the window from the *same* row and
+                // publish it so the render task's `bin_color` ramps the live
+                // band (only the top row repaints; prior rows keep their ramp).
+                if scale.step(pipeline.mags()) {
+                    let (f, c) = scale.scale();
+                    shared::set_scale(f, c);
+                }
             }
 
             // Roll the CPU window forward every ~1 s and publish all three
@@ -558,6 +570,10 @@ mod app {
                 let rows = display::WF_ROWS;
                 let total = cols * rows;
 
+                // The auto floor/ceil window for the ramp (the radio task
+                // publishes it each frame; the seed before the first frame).
+                let (floor, ceil) = shared::scale();
+
                 // 1. shift down in RAM (newest → top row). The shift + the
                 //    colourise below *is* the *lcd* CPU stage for the status
                 //    readout — the DWT delta is appended to the shared
@@ -566,9 +582,9 @@ mod app {
                 //    offloaded to the engine and is *not* counted as CPU.
                 let c0 = DWT::cycle_count();
                 fb.copy_within(..total - cols, cols);
-                // 2. new row at the top.
+                // 2. new row at the top, ramped by the auto floor/ceil window.
                 for (i, px) in fb[..cols].iter_mut().enumerate() {
-                    *px = display::palette::bin_color(row.get(i).copied().unwrap_or(0u16));
+                    *px = display::palette::bin_color(row.get(i).copied().unwrap_or(0u16), floor, ceil);
                 }
                 shared::add_lcd_cycles(DWT::cycle_count() as u64 - c0 as u64);
                 // 3. Blit the band via eDMA. This hands the pixel work over

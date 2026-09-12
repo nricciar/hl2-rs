@@ -55,6 +55,32 @@ static SLEVEL: AtomicU32 = AtomicU32::new(0);
 /// task can show "+N dB" next to the bar.
 static SMARGIN: AtomicU32 = AtomicU32::new(0.0f32.to_bits());
 
+/// The auto floor/ceil (dB) window for the waterfall colour ramp.
+///
+/// The `radio` task advances `crate::autoscale::AutoScale` once per spectrum
+/// frame and publishes the resulting window here; the `render` task feeds it to
+/// `display::palette::bin_color` so the ramp tracks the live band. Stored as
+/// two `f32` bit patterns (`AtomicU32` — `f32::to_bits()`/`from_bits()`, the
+/// same trick as [`SMARGIN`]) so the read is lock-free across tasks. Seeded at
+/// the `AutoScale` seed (−85/−15) so the very first render before a frame has
+/// landed uses the full UI default window.
+static SCALE_FLOOR: AtomicU32 = AtomicU32::new((-85.0f32).to_bits());
+static SCALE_CEIL: AtomicU32 = AtomicU32::new((-15.0f32).to_bits());
+
+/// Publish the current auto floor/ceil (dB) window for the render task.
+pub fn set_scale(floor_db: f32, ceil_db: f32) {
+    SCALE_FLOOR.store(floor_db.to_bits(), Ordering::Relaxed);
+    SCALE_CEIL.store(ceil_db.to_bits(), Ordering::Release);
+}
+
+/// The current auto floor/ceil (dB) window; initially (−85, −15).
+pub fn scale() -> (f32, f32) {
+    (
+        f32::from_bits(SCALE_FLOOR.load(Ordering::Acquire)),
+        f32::from_bits(SCALE_CEIL.load(Ordering::Acquire)),
+    )
+}
+
 /// Published per-stage CPU shares, each 0..=100, for the status line.
 ///
 /// The pipeline's three workloads are reported as a fraction of the shared

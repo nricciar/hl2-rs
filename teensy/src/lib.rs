@@ -17,6 +17,7 @@
 
 extern crate alloc;
 
+pub mod autoscale;
 pub mod display;
 pub mod ethernet;
 pub mod radio;
