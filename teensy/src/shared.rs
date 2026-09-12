@@ -55,10 +55,44 @@ static SLEVEL: AtomicU32 = AtomicU32::new(0);
 /// task can show "+N dB" next to the bar.
 static SMARGIN: AtomicU32 = AtomicU32::new(0.0f32.to_bits());
 
-/// The demod + waterfall share of the CPU, in percent (0..=100). Computed by
-/// the radio task over a ~1 s window (DWT cycles spent in the feed vs. wall);
-/// shown on the status line so the pipeline "runs at CPU speed" is visible.
-static CPU_PCT: AtomicU32 = AtomicU32::new(0);
+/// Published per-stage CPU shares, each 0..=100, for the status line.
+///
+/// The pipeline's three workloads are reported as a fraction of the shared
+/// rolling 1-second window on **the one core the whole system runs on**:
+///   * demod — EP6 baseband parse + the virtual-USB receiver's DSP (radio task)
+///   * fft   — the 2048-commit spectrum window (radio task)
+///   * lcd   — the waterfall RAM shift + colourise (render task)
+///
+/// On a single core, demod + fft + lcd + idle = 1 second, so the three
+/// percentages should sum to ≈ the total CPU busy fraction (≤ 100). This is
+/// why all three are measured against the same denominator (1 s in cycles),
+/// not against each task's own busy wall.
+static CPU_DEMOD_PCT: AtomicU32 = AtomicU32::new(0);
+static CPU_FFT_PCT: AtomicU32 = AtomicU32::new(0);
+static CPU_LCD_PCT: AtomicU32 = AtomicU32::new(0);
+
+/// Cross-task DWT accumulator for the *lcd* stage (waterfall shift + colourise).
+/// The render task appends its per-iteration cycle delta; the radio task
+/// takes the accumulated value on each 1-second rollover and publishes it.
+/// Uses `Mutex<RefCell<u64>>` (matching `SNAPSHOT`'s pattern) rather than
+/// `AtomicU64` (not guaranteed on 32-bit thumbv7).
+static LCD_CYCLES: Mutex<RefCell<u64>> = Mutex::new(RefCell::new(0));
+
+/// Add `delta` cycles to the shared *lcd* accumulator.
+pub fn add_lcd_cycles(delta: u64) {
+    interrupt::free(|cs| *LCD_CYCLES.borrow(cs).borrow_mut() += delta);
+}
+
+/// Take-and-zero the shared *lcd* accumulator. The radio task calls this on
+/// each 1-second rollover so the three published shares share the same wall.
+pub fn take_lcd_cycles() -> u64 {
+    interrupt::free(|cs| {
+        let mut acc = LCD_CYCLES.borrow(cs).borrow_mut();
+        let v = *acc;
+        *acc = 0;
+        v
+    })
+}
 
 /// Publish the S1..S9 index + the raw dB margin the render task displays.
 pub fn set_slevel(sunits: u8, margin_db: f32) {
@@ -76,8 +110,36 @@ pub fn smargin_db() -> f32 {
     f32::from_bits(SMARGIN.load(Ordering::Acquire))
 }
 
-pub fn set_cpu_pct(pct: u32) {
-    CPU_PCT.store(pct.min(100), Ordering::Release);
+pub fn set_cpu_demod_pct(pct: u32) {
+    CPU_DEMOD_PCT.store(pct.min(100), Ordering::Release);
+}
+
+pub fn set_cpu_fft_pct(pct: u32) {
+    CPU_FFT_PCT.store(pct.min(100), Ordering::Release);
+}
+
+pub fn set_cpu_lcd_pct(pct: u32) {
+    CPU_LCD_PCT.store(pct.min(100), Ordering::Release);
+}
+
+/// One shot: publish all three shares as a fraction of `wall` cycles (the
+/// rolling 1-second window on the shared core). Called by the radio task at
+/// rollover — `lcd_cycles` is the accumulated render-task work (shift +
+/// colourise) that has happened so far this window.
+pub fn publish_cpu_stages(demod_cycles: u64, fft_cycles: u64, lcd_cycles: u64, wall: u64) {
+    if wall == 0 {
+        set_cpu_demod_pct(0);
+        set_cpu_fft_pct(0);
+        set_cpu_lcd_pct(0);
+        return;
+    }
+    // `busy / wall * 100`, integer math. `busy` is always ≤ `wall` (a
+    // sub-interval), so `100 * busy` ≤ `100 * wall` and the .min(100) is a
+    // safety clamp for integer-truncation edge cases.
+    let pct = |busy: u64| -> u32 { (((100u64 * busy) / wall).min(100)) as u32 };
+    set_cpu_demod_pct(pct(demod_cycles));
+    set_cpu_fft_pct(pct(fft_cycles));
+    set_cpu_lcd_pct(pct(lcd_cycles));
 }
 
 /// Diagnostic: increment the counter for each DMA completion interrupt.
@@ -97,8 +159,16 @@ pub fn irq_fires_inc() {
     IRQ_FIRES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
-pub fn cpu_pct() -> u32 {
-    CPU_PCT.load(Ordering::Acquire)
+pub fn cpu_demod_pct() -> u32 {
+    CPU_DEMOD_PCT.load(Ordering::Acquire)
+}
+
+pub fn cpu_fft_pct() -> u32 {
+    CPU_FFT_PCT.load(Ordering::Acquire)
+}
+
+pub fn cpu_lcd_pct() -> u32 {
+    CPU_LCD_PCT.load(Ordering::Acquire)
 }
 
 /// Publish one complete waterfall row and advance the wrapping sequence.

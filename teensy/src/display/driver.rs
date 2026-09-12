@@ -290,8 +290,12 @@ impl DmaDisplay {
             let result = w.await;
             let b = cortex_m::peripheral::DWT::cycle_count();
             let wait_us = ((b.wrapping_sub(a)) as u64 * 1_000_000) / (board::ARM_FREQUENCY as u64);
-            if wait_us < min_wait_us { min_wait_us = wait_us; }
-            if wait_us > max_wait_us { max_wait_us = wait_us; }
+            if wait_us < min_wait_us {
+                min_wait_us = wait_us;
+            }
+            if wait_us > max_wait_us {
+                max_wait_us = wait_us;
+            }
             if sample_i < SAMPLE_N {
                 sample[sample_i] = wait_us as u32;
                 sample_i += 1;
@@ -315,8 +319,7 @@ impl DmaDisplay {
         let fsr = self.spi.fifo_status();
         let sr = self.spi.status().bits();
         let cc = self.spi.clock_configs();
-        let sck_mhz =
-            132_000_000u64 as f64 / ((cc.sckdiv as u64 + 2) as f64) / 1e6;
+        let sck_mhz = 132_000_000u64 as f64 / ((cc.sckdiv as u64 + 2) as f64) / 1e6;
         // `info!` (not `debug!`) so the diagnostics survive release builds.
         let eff_mbit_s = (n as f64 * 32.0) / (ms * 1e6);
         let setup_us = cyc_setup as f64 / (board::ARM_FREQUENCY as f64) * 1e6;
@@ -337,7 +340,10 @@ impl DmaDisplay {
             rmc = fsr.rxcap,
         );
         if self.chan.is_error() {
-            log::error!("dma channel 0 error end-of-blit: {:?}", self.chan.error_status());
+            log::error!(
+                "dma channel 0 error end-of-blit: {:?}",
+                self.chan.error_status()
+            );
         }
         if self.chan.is_complete() {
             log::warn!("dma channel 0 still COMPLETE at end-of-blit");

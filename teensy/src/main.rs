@@ -142,6 +142,7 @@ mod app {
     use teensy4_bsp as bsp;
 
     use super::{POLLER, cycles_now, ms_since, now_millis, poll_log};
+    use cortex_m::peripheral::DWT;
     use hl2_teensy::{display, radio, shared, spectrum};
     use imxrt_log as logging;
     use rtic_monotonics::systick::ExtU64;
@@ -236,12 +237,14 @@ mod app {
         );
         // Override: the HAL clamps sckdiv to >=4 (22 MHz). Push to 33 MHz
         // (sckdiv=2: 132/(2+2)). ILI9341 max SPI is 50 MHz so this is safe.
-        spi.disabled(|d| d.set_clock_configs(bsp::hal::lpspi::ClockConfigs {
-            sckdiv: 2,
-            dbt: 0,
-            pcssck: 0,
-            sckpcs: 0,
-        }));
+        spi.disabled(|d| {
+            d.set_clock_configs(bsp::hal::lpspi::ClockConfigs {
+                sckdiv: 2,
+                dbt: 0,
+                pcssck: 0,
+                sckpcs: 0,
+            })
+        });
 
         // Construct the DMA-accelerated panel *before* the ILI9341 driver
         // moves `spi` into itself, so `DmaDisplay::new` can bitwise-copy
@@ -412,33 +415,34 @@ mod app {
         poll_log();
 
         let mut last_keepalive = cycles_now();
-        // S-meter + CPU% instrumentation.
+        // S-meter + per-stage CPU% instrumentation.
         //   * `last_row_pub` — the frame_seq at which we last republished the
         //     row. The S-level is computed from the *same* `mags()` snapshot we
         //     hand to the render task, so the meter and the waterfall agree.
-        //   * `cpu_*` — a rolling 1-second DWT window. `busy_cycles` is the
-        //     time inside the pump + feed loop (the real per-DP work: MAC
-        //     poll + EP6 parse + virtual-receiver demod + FFT commit); the
-        //     `Systick::delay(1)` between iterations is the scheduler's free
-        //     time and is *not* counted. `busy / wall × 100` is the radio
-        //     task's CPU utilisation — the honest "we are running at CPU
-        //     speed" number. Because a no-std bump heap never frees, the
-        //     demod's per-emit buffers are amortised against persistent `Vec`s
-        //     (see `hl2::receiver::AudioEngine`); if DSP grows, this climbs.
+        //   * `cpu_*` — three workloads reported against the *same* 1-second
+        //     shared denominator (the one rolling wall window, in cycles):
+        //       * `demod` — EP6 baseband parse + the virtual-USB demod DSP,
+        //                   attributed by `Rx`'s DWT taps.
+        //       * `fft`   — the 2048-commit spectrum / S-meter window, also
+        //                   attributed by `Rx`'s DWT taps.
+        //       * `lcd`   — the render task's waterfall shift + colourise,
+        //                   accumulated on `shared::LCD_CYCLES` (the render
+        //                   task appends; we read + zero it here on the same
+        //                   second boundary).
+        //     Because a single core can't run two things at once,
+        //     demod + fft + lcd cannot sum past 100 — the whole point is
+        //     seeing *which* slice ate the CPU, not three independent 100s.
         let mut last_row_pub: u32 = pipeline.frame_seq();
         let mut cpu_start: u32 = cycles_now();
-        let mut busy_cycles: u64 = 0;
-        let mut wall_cycles: u64 = 0;
+        let mut window_start: u64 = rx.demod_cycles();
+        let mut fft_start: u64 = rx.fft_cycles();
 
         loop {
-            let iter_t0 = cycles_now();
-
             handle.set_now(smoltcp::time::Instant::from_millis(now_millis()));
 
             // Drain a bounded batch from the MAC as well as the UDP socket.
             // One ingress poll per millisecond cannot keep up at 96 kSps.
             let mut dgram = [0u8; hl2::protocol::DATA_PACKET_SIZE + 64];
-            let busy_t0 = cycles_now();
             for _ in 0..64 {
                 handle.pump();
                 while let Some((n, src)) = handle.recv(&mut dgram) {
@@ -447,7 +451,6 @@ mod app {
                     }
                 }
             }
-            busy_cycles += cycles_now() as u64 - busy_t0 as u64;
 
             // Publish only completed FFT frames, coalescing to the latest row.
             let cur_seq = pipeline.frame_seq();
@@ -461,21 +464,27 @@ mod app {
                 shared::set_slevel(m.sunits, m.margin_db);
             }
 
-            // Roll the CPU% window forward every ~1 s and publish.
+            // Roll the CPU window forward every ~1 s and publish all three
+            // shares against the *same* shared wall (the one rolling window
+            // in cycles). The demod / fft deltas come from `Rx`'s DWT taps;
+            // the lcd delta is accumulated cross-task on `shared::LCD_CYCLES`.
+            // On one core they cannot overlap, so each is ≤ 100 and the sum
+            // is the honest total CPU busy fraction (≤ 100).
             let now_c = cycles_now();
-            wall_cycles += now_c as u64 - iter_t0 as u64;
             if ms_since(cpu_start, now_c) >= 1_000 {
-                let wall = wall_cycles;
-                // `busy <= wall` always (the busy window is a sub-interval), so
-                // the clamped ratio is naturally ≤ 100 and never wraps.
-                let pct = if wall == 0 {
-                    0
-                } else {
-                    (100u64.saturating_mul(busy_cycles)).min(wall) as u32
-                };
-                shared::set_cpu_pct(pct);
-                busy_cycles = 0;
-                wall_cycles = 0;
+                // Shared wall = the rolling window's total elapsed cycles
+                // (the 1-second denominator both tasks' work is measured
+                // against — *not* each task's own busy wall, which is how
+                // the three 100s happened).
+                let wall = now_c as u64 - cpu_start as u64;
+                shared::publish_cpu_stages(
+                    rx.demod_cycles() - window_start,
+                    rx.fft_cycles() - fft_start,
+                    shared::take_lcd_cycles(),
+                    wall,
+                );
+                window_start = rx.demod_cycles();
+                fft_start = rx.fft_cycles();
                 cpu_start = now_c;
             }
 
@@ -521,6 +530,7 @@ mod app {
         let mut status_label = display::driver::TextLine::<9>::new();
         let mut status_detail = display::driver::TextLine::<32>::new();
         let mut status_meter = display::driver::TextLine::<16>::new();
+        let mut status_cpu = display::driver::TextLine::<32>::new();
 
         let mut painted_seq: u32 = 0;
         let mut last_state: u32 = u32::MAX;
@@ -548,19 +558,27 @@ mod app {
                 let rows = display::WF_ROWS;
                 let total = cols * rows;
 
-                // 1. shift down in RAM (newest → top row).
+                // 1. shift down in RAM (newest → top row). The shift + the
+                //    colourise below *is* the *lcd* CPU stage for the status
+                //    readout — the DWT delta is appended to the shared
+                //    accumulator the radio task drains on its 1-second rollover
+                //    (same shared wall as demod / fft). The eDMA blit below is
+                //    offloaded to the engine and is *not* counted as CPU.
+                let c0 = DWT::cycle_count();
                 fb.copy_within(..total - cols, cols);
                 // 2. new row at the top.
                 for (i, px) in fb[..cols].iter_mut().enumerate() {
                     *px = display::palette::bin_color(row.get(i).copied().unwrap_or(0u16));
                 }
+                shared::add_lcd_cycles(DWT::cycle_count() as u64 - c0 as u64);
                 // 3. Blit the band via eDMA. This hands the pixel work over
                 //    to the eDMA engine (which drives the LPSPI TDR while
                 //    the panel clocks in the bytes), so the CPU is free to
                 //    poll the radio's MAC ring between chunks — the exact
                 //    "we're not stalling the network" win the DMA path was
                 //    meant to buy.
-                dma.draw_pixels(0, 0, (cols as u16) - 1, (rows as u16) - 1, &fb[..total]).await;
+                dma.draw_pixels(0, 0, (cols as u16) - 1, (rows as u16) - 1, &fb[..total])
+                    .await;
                 painted_seq = seq;
                 // Let the radio drain its MAC ring before further SPI work.
                 Systick::delay(1.millis()).await;
@@ -579,6 +597,7 @@ mod app {
                     &mut status_label,
                     &mut status_detail,
                     &mut status_meter,
+                    &mut status_cpu,
                 );
             }
 
@@ -586,12 +605,14 @@ mod app {
         }
     }
 
-    /// Update only changed status characters, including the live RX counter.
+    /// Update only changed status characters, including the live RX counter
+    /// and the per-stage CPU readout.
     fn status_redraw(
         panel: &mut Panel,
         status_label: &mut display::driver::TextLine<9>,
         status_detail: &mut display::driver::TextLine<32>,
         status_meter: &mut display::driver::TextLine<16>,
+        status_cpu: &mut display::driver::TextLine<32>,
     ) {
         let label = match shared::state() {
             shared::STATE_WAITING_IP => "WAIT IP",
@@ -620,24 +641,18 @@ mod app {
         let line_s = core::str::from_utf8(&w.target[..w.pos]).unwrap();
         status_detail.update(panel, 6, wf_y + 30, line_s, 0xF800, 0x0000);
 
-        // S-meter + CPU% readout. The bar is `S1..S9` (one segment per unit);
-        // below it, the raw dB margin + the DSP/network CPU% — the "we are
-        // running at CPU speed" proof. The bar sits below the state label
-        // (y = `wf_y + 14`) and the meter text one row further down
-        // (y = `wf_y + 24`), so the left-side status label at `y = wf_y + 4`
-        // and the IP / F counter at `y = wf_y + 30` stay clear.
+        // S-meter readout. The bar is `S1..S9` (one segment per unit), the
+        // raw dB-over-floor margin to its right. The bar sits below the
+        // state label / IP/F counter row; the CPU split is on its own row
+        // further down (see `status_cpu` at the end of this fn).
+        //
+        // `fill_rect(display, x, y, w, h, color)` — the last 4 args are
+        // width/height, NOT x2/y2.
         let s = shared::slevel();
         let margin = shared::smargin_db();
-        let pct = shared::cpu_pct();
-
-        // `fill_rect(display, x, y, w, h, color)` — the last 4 args are
-        // width/height, NOT x2/y2. This was the source of the "big red box":
-        // segment i=8 (x=78) had `w = x+seg_w-1 = 85` and `h = bar_y+seg_h-1 = 141`,
-        // covering the IP text at (6, 150) and the state label at (6, 124).
         let bar_y = wf_y + 14u16;
         let seg_w = 8u16;
         let seg_h = 8u16;
-        // Nine 8×8 segments spaced 1 px apart — 80 px wide, x = [6..85].
         let x0 = 6u16;
         for i in 0..9u16 {
             let x = x0 + (i as u32 * ((seg_w + 1) as u32)) as u16;
@@ -646,20 +661,51 @@ mod app {
             display::driver::fill_rect(panel, x, bar_y, seg_w, seg_h, fg);
         }
 
-        // Right of the bar: "S{n} +{N} dB {pct} C" (≤ 14 cells), same row as the
-        // bar. `TextLine<16>` is 96 px wide — more than enough for "S9 +54 dB 100 C".
+        // Right of the bar: "S{n} +{N} dB" (≤ 12 cells), same row as the bar.
+        // The `TextLine<16>` is 96 px wide — plenty for "S9 +54 dB".
         let mut meter = [0u8; 16];
         let mut w2 = radio::control::WriteBuf {
             target: &mut meter,
             pos: 0,
         };
         if s == 0 {
-            let _ = write!(w2, "S0 +{:.0} dB {pct} C", margin);
+            let _ = write!(w2, "S0 +{:.0} dB", margin);
         } else {
-            let _ = write!(w2, "S{s} +{:.0} dB {pct} C", margin);
+            let _ = write!(w2, "S{s} +{:.0} dB", margin);
         }
         let meter_s = core::str::from_utf8(&w2.target[..w2.pos]).unwrap();
         let meter_x = x0 + (9u16 * (seg_w + 1) as u16) + 2u16;
         status_meter.update(panel, meter_x, bar_y, meter_s, 0xF800, 0x0000);
+
+        // CPU split, on its own row **below the frequency line** (the "7.074 MHz…"
+        // line drawn at boot at `WF_ROWS + 76`). The three stages are the
+        // pipeline's three workloads, each reported as a percent (≤ 100) on its
+        // *own* task's rolling 1-second window:
+        //   * D — demod: EP6 baseband parse + virtual-USB demod  (radio task)
+        //   * F — fft:   the 2048-commit spectrum / S-meter window (radio task)
+        //   * L — lcd:   the waterfall shift + colourise           (render task)
+        // They run on one shared core, so the three can each read ~100 and
+        // overlap — that's the honest "what's eating the CPU" number.
+        let mut cpu = [0u8; 32];
+        let mut w3 = radio::control::WriteBuf {
+            target: &mut cpu,
+            pos: 0,
+        };
+        let _ = write!(
+            w3,
+            "CPU D:{:03} F:{:03} L:{:03} %",
+            shared::cpu_demod_pct(),
+            shared::cpu_fft_pct(),
+            shared::cpu_lcd_pct(),
+        );
+        let cpu_s = core::str::from_utf8(&w3.target[..w3.pos]).unwrap();
+        status_cpu.update(
+            panel,
+            6,
+            display::WF_ROWS as u16 + 85,
+            cpu_s,
+            0xF800,
+            0x0000,
+        );
     }
 }

@@ -10,6 +10,8 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use num_complex::Complex;
 
+use cortex_m::peripheral::DWT;
+
 use hl2::protocol::data::{
     BasebandChunk, HEADER_SIZE, parse_baseband_chunk_into, parse_data_header,
 };
@@ -33,6 +35,14 @@ pub struct Rx {
     /// field (not a per-call local) because the heap is a no_std bump arena
     /// that never frees — `clear()`, don't reallocate.
     iq_acc: Vec<Complex<f32>>,
+    /// Cumulative DWT cycles spent parsing the EP6 baseband + accumulating
+    /// the passband samples into the spectrum pipeline. The *demod* stage of
+    /// the CPU readout (see `crate::shared::set_cpu_demod_pct`).
+    demod_cycles: u64,
+    /// Cumulative DWT cycles spent committing the FFT windows (the
+    /// `mags`/S-meter compute inside `Pipeline::push` once a full
+    /// `N_FFT`-sample window arrives). The *FFT* stage of the CPU readout.
+    fft_cycles: u64,
 }
 
 impl Rx {
@@ -50,7 +60,25 @@ impl Rx {
             }),
             vrx,
             iq_acc: Vec::new(),
+            demod_cycles: 0,
+            fft_cycles: 0,
         }
+    }
+
+    /// Cumulative DWT cycles spent in the *demod* stage (EP6 baseband parse +
+    /// per-sample passband accumulate + the virtual-receiver demod). Monotonic
+    /// (u64, wraps at 2²⁶⁴); the radio task publishes the per-second delta as
+    /// a percent of the wall window (see `crate::shared::set_cpu_demod_pct`).
+    pub fn demod_cycles(&self) -> u64 {
+        self.demod_cycles
+    }
+
+    /// Cumulative DWT cycles spent committing the spectrum FFT windows
+    /// (`Pipeline::push` once a full `N_FFT`-sample window arrives — the
+    /// `mags`/S-meter compute). Monotonic; the radio task publishes the
+    /// per-second delta (see `crate::shared::set_cpu_fft_pct`).
+    pub fn fft_cycles(&self) -> u64 {
+        self.fft_cycles
     }
 
     /// Consume one 1032-byte datagram. Returns the number of complex I/Q
@@ -69,7 +97,13 @@ impl Rx {
             return 0;
         }
         // One I/Q pair per record, per chunk; 63 per chunk at n_recv = 1,
-        // 2 chunks per frame → 126 pair/frame in steady state.
+        // 2 chunks per frame → 126 pair/frame in steady state. Each `push`
+        // either just accumulates a sample into the `N_FFT`-window (cost:
+        // one vector append — the *demod* stage) or, once every `N_FFT`
+        // samples, commits the window (cost: mean/window/FFT/max-pool — the
+        // *FFT* stage). The DWT taps below attribute each call to the one
+        // that actually dominated (a new `frame_seq` appeared → FFT bucket,
+        // otherwise demod).
         let mut pushed = 0usize;
         for (bytes, chunk) in datagram[HEADER_SIZE..]
             .chunks_exact(CHUNK_SIZE)
@@ -81,8 +115,17 @@ impl Rx {
             self.iq_acc.clear();
             for rx in chunk.per_rx.iter().take(1) {
                 for c in rx.iter() {
+                    let seq_before = pipeline.frame_seq();
+                    let t0 = DWT::cycle_count();
                     // Waterfall spectrum (unchanged path).
                     pipeline.push(c.re, c.im);
+                    let t1 = DWT::cycle_count();
+                    let delta = t1 as u64 - t0 as u64;
+                    if pipeline.frame_seq() != seq_before {
+                        self.fft_cycles += delta;
+                    } else {
+                        self.demod_cycles += delta;
+                    }
                     pushed += 1;
                     // …and the virtual USB-SSB receiver (offset 0), accumulated
                     // per chunk and fed below.
@@ -91,7 +134,9 @@ impl Rx {
             }
             // Drive the virtual receiver with this chunk's I/Q (audio is muted
             // by its DropSink); the S-meter itself reads the spectrum, not this.
+            let vr0 = DWT::cycle_count();
             let _ = self.vrx.process(&self.iq_acc);
+            self.demod_cycles += DWT::cycle_count() as u64 - vr0 as u64;
         }
         pushed
     }
