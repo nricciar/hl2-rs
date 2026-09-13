@@ -1,22 +1,3 @@
-//https://github.com/PaulStoffregen/Audio/blob/master/examples/HardwareTesting/WM8731MikroSine/WM8731MikroSine.ino
-// When using AudioInputI2Sslave & AudioOutputI2Sslave with MikroE-506,
-// the sample rate will be the crystal frequency divided by 256.  The
-// MikroE-506 comes with a 12.288 MHz crystal, for 48 kHz sample rate.
-// To get 44.1 kHz (as expected by the Teensy Audio Library) the crystal
-// should be replaced with 11.2896 MHz.
-//
-// Recommended connections:
-//    MikroE    Teensy 4
-//    ------    --------
-//     SCK         21
-//     MISO         8
-//     MOSI         7
-//     ADCL        20
-//     DACL        20
-//     SDA         18
-//     SCL         19
-//     3.3V       +3.3V
-//     GND         GND
 //! WM8731 (Cirrus Logic / Wolfson) I2C control plane.
 //!
 //! The two-byte I2C control word contains a 7-bit register address followed
