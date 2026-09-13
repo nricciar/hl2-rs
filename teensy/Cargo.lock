@@ -337,6 +337,7 @@ dependencies = [
  "hl2",
  "ili9341",
  "imxrt-enet",
+ "imxrt-iomuxc",
  "imxrt-log",
  "log",
  "num-complex",

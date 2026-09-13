@@ -75,7 +75,11 @@ mod tests {
     #[test]
     fn peak_is_visible_and_floor_is_black() {
         let (floor, ceil) = (LOG_FLOOR, LOG_CEIL);
-        assert_ne!(bin_color(60000, floor, ceil), 0, "strong signal should not be black");
+        assert_ne!(
+            bin_color(60000, floor, ceil),
+            0,
+            "strong signal should not be black"
+        );
         assert_eq!(bin_color(0, floor, ceil), 0, "floor should be black");
     }
 

@@ -88,7 +88,11 @@ fn step_follower(
     if diff.abs() <= deadband {
         return false;
     }
-    let alpha = if diff > 0.0 { alpha_attack } else { alpha_release };
+    let alpha = if diff > 0.0 {
+        alpha_attack
+    } else {
+        alpha_release
+    };
     *val += diff * alpha;
     true
 }
@@ -264,7 +268,10 @@ mod tests {
         step_follower(&mut r, -70.0, 0.30, 0.05, 1.0); // fall
         let a_move = (a - -55.0).abs();
         let r_move = (-55.0 - r).abs();
-        assert!(a_move > r_move, "attack {a_move} should exceed release {r_move}");
+        assert!(
+            a_move > r_move,
+            "attack {a_move} should exceed release {r_move}"
+        );
         assert!(a < -40.0, "approach the target from below, never overshoot");
         assert!(r > -70.0, "approach the target from above, never overshoot");
     }

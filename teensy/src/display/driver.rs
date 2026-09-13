@@ -324,7 +324,7 @@ impl DmaDisplay {
         let eff_mbit_s = (n as f64 * 32.0) / (ms * 1e6);
         let setup_us = cyc_setup as f64 / (board::ARM_FREQUENCY as f64) * 1e6;
         let chunks = n / (MAX_TX_WORDS * 2);
-        log::info!(
+        /*log::info!(
             "draw_pixels {n} px: total {ms:.3} ms (setup {setup_us:.1}us); wait_us min={min_wait_us} max={max_wait_us} first=[{s0},{s1},{s2},{s3},{s4},{s5}]; irq_fires={irq_fires} (expect {chunks}); sckdiv={sd} => sck={sck_mhz:.2} MHz; eff={eff_mbit_s:.2} Mbit/s; sr=0x{sr_val:08x} tx={tx}/{tmc} rx={rx}/{rmc}",
             s0 = sample[0],
             s1 = sample[1],
@@ -338,7 +338,7 @@ impl DmaDisplay {
             tmc = fsr.txcap,
             rx = fsr.rxcount,
             rmc = fsr.rxcap,
-        );
+        );*/
         if self.chan.is_error() {
             log::error!(
                 "dma channel 0 error end-of-blit: {:?}",

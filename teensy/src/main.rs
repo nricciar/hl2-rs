@@ -143,7 +143,7 @@ mod app {
 
     use super::{POLLER, cycles_now, ms_since, now_millis, poll_log};
     use cortex_m::peripheral::DWT;
-    use hl2_teensy::{autoscale, display, radio, shared, spectrum};
+    use hl2_teensy::{autoscale, display, i2c, radio, shared, spectrum};
     use imxrt_log as logging;
     use rtic_monotonics::systick::ExtU64;
     use rtic_monotonics::systick::Systick;
@@ -192,6 +192,7 @@ mod app {
             pins,
             usb,
             lpspi4,
+            lpi2c1,
             ccm,
             ccm_analog,
             iomuxc_gpr,
@@ -260,7 +261,7 @@ mod app {
         display::driver::draw_text(&mut panel, 10, 10, 2, "HL2 TEENSY 4.1", 0x0000, 0xF800);
 
         let _ = render::spawn(panel, dma);
-        let _ = radio_task::spawn(ccm, ccm_analog, iomuxc_gpr);
+        let _ = radio_task::spawn(ccm, ccm_analog, iomuxc_gpr, lpi2c1, pins.p19, pins.p18);
 
         (Shared {}, Local {})
     }
@@ -271,9 +272,19 @@ mod app {
         mut ccm: bsp::ral::ccm::CCM,
         mut ccm_analog: bsp::ral::ccm_analog::CCM_ANALOG,
         mut iomuxc_gpr: bsp::ral::iomuxc_gpr::IOMUXC_GPR,
+        lpi2c1: bsp::ral::lpi2c::Instance<1>,
+        scl_pin: teensy4_bsp::pins::t41::P19,
+        sda_pin: teensy4_bsp::pins::t41::P18,
     ) {
         // Let USB-serial enumerate before MDIO.
         Systick::delay(2_000.millis()).await;
+        poll_log();
+
+        // I2C bus probe (LPI2C1, SDA=p18 / SCL=p19). The bus is held for
+        // the whole task; the temp sensor / audio codec will be polled
+        // here later.
+        let mut i2c_bus = i2c::init(lpi2c1, scl_pin, sda_pin);
+        i2c::scan(&mut i2c_bus);
         poll_log();
 
         shared::set_state(shared::STATE_WAITING_IP);
@@ -584,7 +595,11 @@ mod app {
                 fb.copy_within(..total - cols, cols);
                 // 2. new row at the top, ramped by the auto floor/ceil window.
                 for (i, px) in fb[..cols].iter_mut().enumerate() {
-                    *px = display::palette::bin_color(row.get(i).copied().unwrap_or(0u16), floor, ceil);
+                    *px = display::palette::bin_color(
+                        row.get(i).copied().unwrap_or(0u16),
+                        floor,
+                        ceil,
+                    );
                 }
                 shared::add_lcd_cycles(DWT::cycle_count() as u64 - c0 as u64);
                 // 3. Blit the band via eDMA. This hands the pixel work over

@@ -20,6 +20,7 @@ extern crate alloc;
 pub mod autoscale;
 pub mod display;
 pub mod ethernet;
+pub mod i2c;
 pub mod radio;
 pub mod shared;
 pub mod smeter;
