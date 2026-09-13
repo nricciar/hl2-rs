@@ -286,7 +286,7 @@ impl DmaDisplay {
                 .spi
                 .dma_write(&mut self.chan, &self.stage[..pairs])
                 .expect("dma_write setup");
-            let setup = cortex_m::peripheral::DWT::cycle_count() - a;
+            let setup = cortex_m::peripheral::DWT::cycle_count().wrapping_sub(a);
             let result = w.await;
             let b = cortex_m::peripheral::DWT::cycle_count();
             let wait_us = ((b.wrapping_sub(a)) as u64 * 1_000_000) / (board::ARM_FREQUENCY as u64);

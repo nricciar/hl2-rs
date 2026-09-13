@@ -224,20 +224,47 @@ The path is split across the two RTIC tasks by a single cross-task ring:
 | Piece | Location | Notes |
 |-------|----------|-------|
 | 10× upsampler (2-tap linear) | `teensy/src/audio/upsample.rs` | 4.8 kHz → 48 kHz; `RATE_RATIO = 10`. Cheapest resampler with acceptable HF roll-off for narrowband SSB/AM; deterministic, allocation-free |
-| Cross-task sample FIFO | `teensy/src/audio/ring.rs` | SPSC `i16` ring (`CAP = 2^13 ≈ 170 ms`), atomic head/len; single producer (radio-task `Sink`) + single consumer (audio-task `process_chunk`); overflow drops oldest, underrun zero-fills (silence, no clicks) |
+| Cross-task sample FIFO | `teensy/src/audio/ring.rs` | `i16` ring (`CAP = 2^13 ≈ 170 ms`); bounded interrupt critical sections protect samples and head/length together against task preemption; overflow drops oldest, underrun zero-fills |
 | `AudioSink` impl (producer) | `teensy/src/audio/sink.rs` | `Sink::write` upsamples, pushes to the ring; owned by the radio task, handed to `VirtualReceiver` (replaces the muted `DropSink` in `radio/rx.rs::Rx::new`) |
-| 1 ms audio tick (consumer) | `teensy/src/main.rs::audio_task` | Every 1 ms calls `sink::process_chunk`: pop ≤ 960 samples (20 ms @ 48 kHz), fold each mono into its `[L=R]` TDR pair into a `'static` `STAGE` (`[u32; 1920]`), then one eDMA transfer → SAI1.TDR[0] (spin-on-completion, ~200 µs) |
-| SAI1 slave-TX bring-up | `teensy/src/audio/sai1.rs` | `Mode::Slave`, 16-bit, `frame_size = 2`, `Packing::None` (each 16-bit half = one 32-bit TDR entry → `TDR_WORDS_PER_SAMPLE = 2`); the WM8731 is the I2S **master** and drives BCLK/FSYNC, so the SAI only shifts data out |
-| WM8731 I2C control plane | `teensy/src/audio/wm8731.rs` | I2C address `0x1A`; register writes over the existing `Lpi2c`. Sequence: reset → power-down (mic + global) → line-in unity → headphone max → analog/digital path → **I2S / 16-bit / slave** → 48 kHz / 256× → `active` last (until then the codec holds BCLK/FSYNC Low = hardware mute) |
+| DMA-paced consumer | `teensy/src/main.rs::audio_task` | `sink::process_chunk` pops up to 960 samples (20 ms @ 48 kHz), zero-fills shortfalls, duplicates each mono sample into L/R slots in `STAGE` (`[u32; 1920]`), then awaits eDMA to SAI1.TDR[0]. A 100 ms timeout cancels stalled transfers, logs SAI state, and backs off 1 s |
+| SAI1 slave-TX bring-up | `teensy/src/audio/sai1.rs` | Two **32-bit slots** with 16-bit samples left-aligned, `Packing::None`; TX follows the enabled RX clock section because P20/P21 are RX clock pins. Explicit RAL setup handles HAL 0.6 ignoring slave-mode `SYNC`; local DMA destination uses watermark `FRDE` rather than empty-FIFO `FWDE`, including cancellation cleanup. `FCONT` allows continuation after FIFO starvation |
+| WM8731 I2C control plane | `teensy/src/audio/wm8731.rs` | Address `0x1A`, two data bytes `[(reg << 1) \| ((value >> 8) & 1), value & 0xff]`; propagate write errors. Reset, temporarily power down mic/outputs (not global power or oscillator), line input unity, headphones 0 dB, select DAC, soft-mute, **I2S / 16-bit / master** (`R7=0x42`), normal 48 kHz / 256x (`R8=0`), settle 100 ms, activate, power outputs, wait 5 ms, unmute |
 | Pin mux (RT1060 Alt3) | `teensy/src/main.rs::init` | `imxrt_iomuxc::sai::prepare`: `P7` = SAI1_TX_DATA00 (out), `P20` = SAI1_RX_SYNC (FSYNC in), `P21` = SAI1_RX_BCLK (bit clock in) |
-| eDMA channel | `teensy/src/main.rs::init` | channel **1** (channel 0 is the ILI9341 blit); `prepare_write` programs the DMAMUX slot for SAI1-TX (mapping `[20,22,84]` → index 0 = SAI1) + the linear `STAGE` source before arming |
+| eDMA channel | `teensy/src/main.rs::init`, `audio_dma_irq` | Channel **1**, DMAMUX source **20**, completion vector **DMA1_DMA17**; channel 0/display uses the separate DMA0_DMA16 vector |
 
 Clocking: the SAI1 clock root (audio PLL / PLL4) + its clock gate are set by
 `teensy4-bsp::clock_power::setup_sai1_clk`; in slave mode the SAI clocks off
 the WM8731's BCLK + FSYNC (its 12.288 MHz / 256 = 48 kHz sample clock), so the
-SAI's own BCLK divider is irrelevant. Mono is folded to **both** L and R
-(`pack(n) = (n<<16)|n`) because the WM8731 has no mono mode and its headphone
-outputs come from the L/R DACs.
+SAI's own BCLK divider is irrelevant. In normal master mode the codec's
+BCLK is 64 times the 48 kHz base frequency: **3.072 MHz**, even with a 16-bit
+payload. Each mono sample is left-aligned (`(sample as u16 as u32) << 16`)
+and written twice to TDR[0], once per stereo slot. The reference example's
+`AudioOutputI2Sslave` means **Teensy slave**, paired with
+`AudioControlWM8731master`, not codec slave.
+
+Diagnostics: sink writes are always counted, with logs for the first 30 and
+every 200 thereafter. Completed chunks log the first three and every 50
+(roughly once per second), including audio-only IRQ count and queued samples.
+The SAI snapshots are taken at startup, completion, and failure; they are
+not live register reads. `unfinished = entered - completed` includes cancelled
+and failed attempts. TCSR status flags occupy bits 16-20; bit 31 is TX enable.
+Successful DMA results taking at least 100 ms also log and back off: a lost
+IRQ can leave DONE set until the timeout timer wakes and polls DMA first.
+`sink::fill_stage` keeps its 960-sample scratch array in a synchronous call,
+not in the DMA future. RTIC keeps executors on the main stack; retaining this
+array inside nested timeout futures previously exhausted the 16 KiB startup
+stack before render/USB polling. A host test limits the DMA future's size.
+Hardware acceptance: expect 48 kHz LRCLK on P20, 3.072 MHz BCLK on P21,
+I2S data on P7, and about 50 completed chunks per second independently of
+display activity. Removing BCLK should produce timeout diagnostics rather
+than silently parking audio. Chunk rearming can still underrun if scheduling
+latency exceeds the FIFO margin; glitch-free continuous DMA is not guaranteed.
+In particular, audio and render share priority 1, so blocking LCD status
+redraws can delay rearming even after the audio DMA interrupt wakes the task.
+
+References: [WM8731 datasheet, Master and Slave Mode Operation (p.35)](https://cdn.sparkfun.com/datasheets/Dev/Arduino/Shields/WolfsonWM8731.pdf),
+[PJRC WM8731 example](https://github.com/PaulStoffregen/Audio/blob/master/examples/HardwareTesting/WM8731MikroSine/WM8731MikroSine.ino),
+[PJRC slave I2S setup](https://github.com/PaulStoffregen/Audio/blob/master/output_i2s.cpp).
 
 > **[full spec]** See openHPSDR for the original protocol 1 `Command`/`C&C`
 > semantics that Start/Stop sit on top of.

@@ -1,66 +1,115 @@
-//! SAI1 → WM8731 I2S transmitter (slave, 16-bit stereo, TX over eDMA).
+//! SAI1 slave transmitter for the crystal-clocked WM8731.
 //!
-//! SAI1 is the **I2S slave**: the WM8731 is the master and drives BCLK
-//! (P21) + LRCLK/FSYNC (P20) from its 12.288 MHz on-shield crystal
-//! (12.288 MHz / 256 = 48 kHz sample rate, I2S 16-bit × 2 channels).
-//! SAI1 only shifts *audio data* out on P7 (SAI1_TX_DATA00 = TDR[0]).
-//!
-//! The WM8731 has its own MCLK source (the on-shield 12.288 MHz crystal),
-//! so the SAI does not need to drive MCLK. No P23, P36, or P37 mux.
-//!
-//! The wire is one 16-bit word per channel per frame; a frame therefore carries
-//! two 16-bit words (L on TDR[0] word 0, R on word 1, MSB-first). Our demod is
-//! mono, so one audio sample is folded into **both** L and R (L = R) — the
-//! codec has no mono mode and its headphone outputs come from the L/R DACs.
-//!
-//! Transmit is DMA-driven: the SAI's `FWDE` bit (enabled below + re-asserted by
-//! the `Sink` before each chunk) makes the eDMA pull a TDR `u32` out of a
-//! `'static` linear buffer whenever the TX FIFO drops below its watermark. See
-//! [`crate::audio::Sink`] for the chunked eDMA + spin-on-completion loop.
-//!
-//! The clock root + `SAI1` clock gate are already configured by `teensy4-bsp`
-//! (audio-PLL derived); in slave mode the SAI's own MCLK division is irrelevant
-//! (it clocks off the codec's BCLK/FSYNC), so no further clock work is needed.
+//! P21/P20 are RX_BCLK/RX_SYNC, so TX must follow the enabled RX clock
+//! section even though we only send data (P7 = TX_DATA00). No MCLK pin is
+//! needed. WM8731 normal-mode master timing is 64fs: two 32-bit slots at
+//! 48 kHz, with each 16-bit sample left-aligned in its slot.
 
-use teensy4_bsp::hal::sai::{self, Mode, Packing, Sai, SaiConfig};
+use teensy4_bsp::hal::dma::peripheral::Destination;
+use teensy4_bsp::hal::sai::{self, Mode, Packing, Sai, SaiConfig, SyncMode};
+use teensy4_bsp::ral;
 
-/// DMAMUX source signal for SAI1 DMA transmit (RT1060: SAI DMA TX mapping
-/// `[20, 22, 84]`, index 0 = SAI1). Mirrors `imxrt-hal`'s
-/// `SAI_DMA_TX_MAPPING`.
+/// RT1060 DMAMUX source for SAI1 TX (reference manual DMA request mapping).
 pub const SAI1_DMA_TX_SRC: u32 = 20;
+/// One FIFO word per stereo slot, with mono duplicated into L and R.
+pub const TDR_WORDS_PER_SAMPLE: usize = 2;
+// TCSR status flags cleared by writing one; mask them during control updates.
+const TCSR_W1C: u32 =
+    ral::sai::TCSR::FEF::mask | ral::sai::TCSR::SEF::mask | ral::sai::TCSR::WSF::mask;
 
-/// Build the SAI1 TX half as an I2S slave.
-///
-/// # Errors
-///
-/// [`sai::InvalidPackingError`] if 16-bit + `Packing::None` were ever made
-/// inconsistent (they aren't today, but the HAL models the case).
-pub fn init_tx(
-    sai1: teensy4_bsp::ral::sai::Instance<1>,
-) -> Result<sai::Tx, sai::InvalidPackingError> {
-    // tx channel mask = 0b01 → channel 0 (TDR[0]) = SAI1_TX_DATA00 (P7).
-    let sai = Sai::without_pins(sai1, 1, 0);
-
-    // Start from the I2S defaults (MSB, standard polarity, sync_early) and
-    // override the bits that matter for a slave with no RX half.
-    let cfg = SaiConfig {
-        mode: Mode::Slave,
-        tx_fifo_wm: 8, // FIFO low-watermark that triggers the eDMA request (FWDE).
-        ..SaiConfig::i2s(2)
-    };
-
-    let (tx, _rx) = sai.split(16, 2, Packing::None, &cfg)?;
-    let mut tx = tx.expect("tx chan mask was 1, so split must return a Tx half");
-
-    // Enable the SAI's DMA-request-on-FIFO-warning (FWDE) so the eDMA
-    // refills the TX FIFO. The `Sink` re-asserts `enable_dma_transmit` before
-    // each chunk (it's a no-op if already set) and owns the eDMA + linear
-    // buffer wiring.
-    tx.enable_dma_transmit();
-    tx.set_enable(true);
-
-    Ok(tx)
+/// Owns SAI1 TX and its RX clock section; no other SAI1 user may reconfigure it.
+pub struct Tx {
+    inner: sai::Tx,
 }
 
-/// TDR `u32` words the SAI consumes per **one** mono audio sample (L + R fold).
-pub const TDR_WORDS_PER_SAMPLE: usize = 2;
+impl Tx {
+    fn regs(&self) -> &ral::sai::RegisterBlock {
+        // SAFETY: init_tx consumes SAI1. The inner HAL handle never escapes;
+        // all accesses, including DMA request enable/disable, use this owner.
+        unsafe { &*ral::sai::SAI1 }
+    }
+
+    /// TCR1..5, TCSR, RCR2, RCR4, RCSR, including raw control/status bits.
+    pub fn reg_dump(&mut self) -> [u32; 9] {
+        let tx = self.inner.reg_dump();
+        let regs = self.regs();
+        [
+            tx[0],
+            tx[1],
+            tx[2],
+            tx[3],
+            tx[4],
+            tx[5],
+            ral::read_reg!(ral::sai, regs, RCR2),
+            ral::read_reg!(ral::sai, regs, RCR4),
+            ral::read_reg!(ral::sai, regs, RCSR),
+        ]
+    }
+
+    pub fn fifo_position(&mut self) -> (u32, u32) {
+        self.inner.fifo_position(0)
+    }
+}
+
+// SAFETY: the fixed SAI1 TX request writes one u32 to the owned TDR[0].
+// Unlike imxrt-hal 0.6's FWDE implementation, FRDE services the watermark
+// rather than waiting for an empty FIFO. Cancellation must clear FRDE too.
+unsafe impl Destination<u32> for Tx {
+    fn destination_signal(&self) -> u32 {
+        SAI1_DMA_TX_SRC
+    }
+    fn destination_address(&self) -> *const u32 {
+        self.inner.tdr(0)
+    }
+    fn enable_destination(&mut self) {
+        let regs = self.regs();
+        ral::modify_reg!(ral::sai, regs, TCSR, |v| {
+            (v & !TCSR_W1C) | ral::sai::TCSR::FRDE::mask
+        });
+    }
+    fn disable_destination(&mut self) {
+        let regs = self.regs();
+        ral::modify_reg!(ral::sai, regs, TCSR, |v| {
+            v & !(TCSR_W1C | ral::sai::TCSR::FRDE::mask)
+        });
+    }
+}
+
+/// Configure while disabled, then enable RX clock synchronization and TX.
+pub fn init_tx(sai1: ral::sai::Instance<1>) -> Result<Tx, sai::InvalidPackingError> {
+    // without_pins does not reset the peripheral, unlike Sai::new.
+    ral::write_reg!(ral::sai, sai1, TCSR, SR: 1);
+    ral::write_reg!(ral::sai, sai1, RCSR, SR: 1);
+    ral::write_reg!(ral::sai, sai1, TCSR, 0);
+    ral::write_reg!(ral::sai, sai1, RCSR, 0);
+    ral::write_reg!(ral::sai, sai1, TCSR, FR: 1);
+    ral::write_reg!(ral::sai, sai1, RCSR, FR: 1);
+    ral::write_reg!(ral::sai, sai1, TMR, 0);
+    ral::write_reg!(ral::sai, sai1, RMR, 0);
+
+    let sai = Sai::without_pins(sai1, 1, 1);
+    let cfg = SaiConfig {
+        mode: Mode::Slave,
+        sync_mode: SyncMode::TxFollowRx,
+        tx_fifo_wm: 16,
+        ..SaiConfig::i2s(2)
+    };
+    let (tx, _rx) = sai.split(32, 2, Packing::None, &cfg)?;
+    let mut tx = Tx {
+        inner: tx.expect("TX channel 0 enabled"),
+    };
+    let regs = tx.regs();
+
+    // HAL 0.6 ignores SYNC in slave mode. Match AudioOutputI2Sslave's
+    // RT1062 setup explicitly: RX receives clocks, TX follows RX. TX FSD
+    // selects the internal synchronized frame sync, not the external RX pin.
+    ral::write_reg!(ral::sai, regs, TCR2, SYNC: 1, BCP: 1, BCD: 0);
+    ral::write_reg!(ral::sai, regs, RCR2, SYNC: 0, BCP: 1, BCD: 0);
+    // Continue after FIFO starvation at startup or a delayed chunk rearm.
+    ral::modify_reg!(ral::sai, regs, TCR4, FSD: 1, FCONT: 1);
+    // Only the RX clock section is needed; do not capture unused P8 data.
+    ral::write_reg!(ral::sai, regs, RCR3, RCE: 0);
+    ral::write_reg!(ral::sai, regs, RCSR, RE: 1, BCE: 1);
+    tx.inner.set_enable(true);
+    Ok(tx)
+}

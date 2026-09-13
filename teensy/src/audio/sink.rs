@@ -13,16 +13,16 @@
 //!                                                     cross-task FIFO
 //!                                                           │
 //!                                                           ▼
-//!   audio_task  ◄────  periodic 1 ms Systick delay  ◄─────┘
+//!   audio_task  ◄────  DMA-completion paced  ◄──────────┘
 //!      pop up to 960 samples (20 ms of audio at 48 kHz)
 //!        → repack into 1920 SAI TDR `u32` words (L = R, interleaved)
-//!        → eDMA ch1 → SAI1.TDR[0]   (spin-on-completion, ~200 µs)
+//!        → eDMA ch1 → SAI1.TDR[0]   (await completion, ~20 ms)
 //!        → SAI slave clocks them out to the WM8731 on the I2S bus
 //!
 //! The [`Sink`] is task-local to the *radio* task (the `AudioSink` impl
 //! the `VirtualReceiver` drives). The *audio* task owns the eDMA `Channel`
-//! + SAI `Tx` and runs [`process_chunk`] on a 1 ms tick. The two tasks
-//! coordinate only through the atomics on [`crate::audio::ring::RING`).
+//! + SAI `Tx` and runs [`process_chunk`] as each DMA transfer completes.
+//! The two tasks coordinate through a critical-section-protected ring.
 //!
 //! SAI + eDMA bring-up (the pin muxing, `init_tx`, and the `Channel
 //! reset`) happens once in `main.rs` at init; the audio task just hands
@@ -38,22 +38,19 @@ use crate::audio::upsample::{RATE_RATIO, Upsampler};
 use hl2::receiver::sink::{AudioSink, SinkError};
 
 /// Pack one mono `i16` sample into the SAI TDR `u32` required by the
-/// 16-bit / 2-words-per-frame / MSB-first / `Packing::None` config.
-///
-/// The WM8731 is stereo (no mono mode), so L = R = the sample: one `i16`
-/// becomes two 16-bit words `[s, s]`; each half lands in both words (upper
-/// 16 = L, lower 16 = R).
+/// 32-bit slot / MSB-first / `Packing::None` config. The codec consumes
+/// the upper 16 bits; process_chunk writes this word twice for L = R.
 #[inline]
 fn pack(sample: i16) -> u32 {
     let w = sample as u16;
-    (w as u32) << 16 | (w as u32)
+    (w as u32) << 16
 }
 
 /// Upsample local capacity. The demod caps `sink.write` blocks at
 /// 1024 samples (see `hl2::receiver::demod::AudioEngine`'s `out_buf`),
 /// so `1024 * RATE_RATIO` upsampled `i16`s covers the maximum block the
 /// virtual receiver can hand us.
-const UP_OUT_CAP: usize = 1024 * RATE_RATIO; // 10 240 samples = 20 ms at 48 kHz.
+const UP_OUT_CAP: usize = 1024 * RATE_RATIO;
 
 /// The `AudioSink` impl the radio task hands to its `VirtualReceiver`.
 ///
@@ -96,10 +93,10 @@ impl AudioSink for Sink {
         // single 0/1/2 value on every write means the AGC hasn't locked or
         // the demod output is ~zero. A healthy USB receiver sees `max`
         // climbing to thousands within a few hundred blocks as AGC engages.
-        // Gated to the first 30 writes — the ring has no lock, so a log
-        // call from here cannot deadlock, but we keep the log cadence low.
-        if crate::shared::audio_writes() < 30 {
-            crate::shared::audio_writes_bump();
+        // Count every write; retain a sparse heartbeat beyond startup.
+        crate::shared::audio_writes_bump();
+        let writes = crate::shared::audio_writes();
+        if writes <= 30 || writes % 200 == 0 {
             let peak = samples
                 .iter()
                 .map(|s| *s as i32)
@@ -132,7 +129,7 @@ pub const STAGE_MAX_SAMPLES: usize = 960;
 
 /// The `'static` eDMA source buffer: `STAGE_MAX_SAMPLES` ×
 /// `TDR_WORDS_PER_SAMPLE` `u32`s, so the source address is stable for the
-/// channel's lifetime (the eDMA reads it while the audio task spins).
+/// channel's lifetime (the eDMA reads it while the audio task awaits).
 ///
 /// `ConstStaticCell::take()` is a one-shot, so the *audio task* calls it
 /// exactly once at startup (see `main.rs::audio_task`) and threads the
@@ -146,21 +143,18 @@ pub static STAGE: static_cell::ConstStaticCell<[u32; STAGE_MAX_SAMPLES * TDR_WOR
 /// eDMA as one linear transfer to SAI1.TDR[0].
 ///
 /// On underrun the ring zero-fills the tail (silence); the eDMA always
-/// emits a full `STAGE_MAX_SAMPLES` words, so the WM8731 sample clock is
-/// constant even when the radio task briefly stalls (a normal demod gap
-/// must not cause clicks).
+/// emits `STAGE_MAX_SAMPLES * TDR_WORDS_PER_SAMPLE` words. The codec's
+/// sample clock is independent of DMA; late rearming can still underrun
+/// the SAI FIFO, and transitions to silence can click.
 ///
 /// # Errors
 ///
-/// Returns the imxrt-dma `Error` on source/destination address or
-/// master/slave error; the caller logs it and keeps ticking.
+/// DMA errors are returned; the caller bounds the wait with a timeout.
 /// Diagnostic counters for the audio path. `CHUNKS_ENTERED` increments
 /// once per `process_chunk` call (before the DMA). `CHUNKS_COMPLETED`
 /// increments once per successful completion. The difference (entered -
-/// completed) is the number of transfers that were started but never
-/// completed — that is, either currently in flight (normal, ≤ 1 at a
-/// time in single-channel DMA) or permanently parked (fault, or the
-/// SAI FIFO never drains so eDMA stalls mid-transfer).
+/// completed) includes failed/cancelled attempts as well as the current
+/// transfer. It is not an in-flight count after a failure.
 ///
 /// `AtomicUsize` (not `AtomicU32`) so the values fit naturally on 32-bit
 /// `thumbv7`; used from the audio task (the writer) and read from
@@ -186,56 +180,48 @@ pub fn chunks_completed() -> usize {
     CHUNKS_COMPLETED.load(core::sync::atomic::Ordering::Acquire)
 }
 
-pub async fn process_chunk(
-    chan: &mut Channel,
-    tx: &mut teensy4_bsp::hal::sai::Tx,
-    stage: &mut [u32],
-) -> Result<(), teensy4_bsp::hal::dma::Error> {
-    const N: usize = STAGE_MAX_SAMPLES;
-    CHUNKS_ENTERED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-
-    // 1. Pull up to N upsampled samples (FIFO order); shortfalls zero-filled.
-    let mut local = [0i16; N];
+// Keep the scratch buffer out of the async future. RTIC stores futures on
+// the main stack, and timeout wrappers can multiply their storage overhead.
+#[inline(never)]
+fn fill_stage(stage: &mut [u32]) {
+    let mut local = [0i16; STAGE_MAX_SAMPLES];
     r::pop_into(&mut local);
-
-    // 2. Fold each mono sample into its `[L, R]` TDR pair (L = R).
-    for (i, s) in local.iter().enumerate() {
-        let packed = pack(*s);
+    for (i, sample) in local.iter().enumerate() {
+        let packed = pack(*sample);
         stage[2 * i] = packed;
         stage[2 * i + 1] = packed;
     }
+}
+
+pub async fn process_chunk(
+    chan: &mut Channel,
+    tx: &mut crate::audio::sai1::Tx,
+    stage: &mut [u32],
+) -> Result<(), teensy4_bsp::hal::dma::Error> {
+    CHUNKS_ENTERED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+    fill_stage(stage);
 
     // 3. One linear eDMA transfer of `N * TDR_WORDS_PER_SAMPLE` × 32-bit
     //    words from `stage` to the SAI TDR[0]. `peripheral::write` programs
     //    the TCD (incl. the DMAMUX slot + linear-buffer source) and enables
-    //    the SAI's DMA request (FWDE); the future's `.await` parks the
-    //    audio task on the DMA waker — the `dma_irq` ISR in `main` fires
+    //    the SAI's DMA request (FRDE); the future's `.await` parks the
+    //    audio task on the DMA waker — the `audio_dma_irq` ISR in `main` fires
     //    `DMA.on_interrupt(1)` on completion, which wakes us. This is the
     //    same interrupt-driven pattern the display `DmaDisplay` uses; the
     //    core goes on running `radio_task` + `render` while the eDMA
     //    moves the 1920 words, instead of holding the CPU in a spin loop.
-    //    `Drop` on the future clears FWDE when done.
+    //    `Drop` on the future clears FRDE on completion or cancellation.
     let t0 = cortex_m::peripheral::DWT::cycle_count();
     let res = peripheral::write(chan, stage, tx).await;
     let now_c = cortex_m::peripheral::DWT::cycle_count();
-    let ms = (now_c as u64 - t0 as u64) * 1_000 / (teensy4_bsp::board::ARM_FREQUENCY as u64);
+    let ms = u64::from(now_c.wrapping_sub(t0)) * 1_000 / (teensy4_bsp::board::ARM_FREQUENCY as u64);
     if res.is_ok() {
         CHUNKS_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        // Diagnostic publish: read the SAI TCSR + TFR after the DMA
-        // completes. TCSR bits we care about
-        //   * WORD_START (bit 12)     — last word started (should be set
-        //                               in steady state)
-        //   * SYNC_ERROR (bit 11)     — externally-generated FSYNC mismatch
-        //   * FIFO_ERROR (bit 10)     — TX FIFO underrun
-        //   * FIFO_WARNING (bit 9)    — TX FIFO at its watermark
-        //   * FIFO_REQUEST (bit 8)    — DMA request currently active
-        // and TFR FIFO positions (WFP = write pos, RFP = read pos).
-        // A SAI that is shifting will have WFP ≈ RFP in flight (draining).
-        // A SAI that is *not* clocking will have WFP = 32 (full), RFP = 0.
-        let _st = tx.status();
-        let tcsr = _st.bits();
-        // `fifo_position` returns `(WFP, RFP)`.
-        let (wfp, rfp) = tx.fifo_position(0);
+        // Raw TCSR: request/warning/error/sync/word-start flags are bits
+        // 16..20; TE is bit 31. FIFO positions wrap, so compare over time.
+        let tcsr = tx.reg_dump()[5];
+        let (wfp, rfp) = tx.fifo_position();
         crate::shared::set_sai_status(tcsr, (wfp as u32) << 16 | (rfp as u32), ms as u32);
     }
     res
@@ -246,29 +232,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pack_lr_is_l_and_r_identical() {
-        assert_eq!(pack(1i16), 0x0001_0001);
-        assert_eq!(pack(-1i16), 0xFFFF_FFFF);
-        assert_eq!(pack(i16::MIN), 0x8000_8000);
-        assert_eq!(pack(i16::MAX), 0x7FFF_7FFF);
+    fn dma_future_does_not_hold_sample_scratch_buffer() {
+        // Measure the returned type without constructing hardware handles.
+        fn future_size<'a, F: core::future::Future>(
+            _: impl FnOnce(&'a mut Channel, &'a mut crate::audio::sai1::Tx, &'a mut [u32]) -> F,
+        ) -> usize {
+            core::mem::size_of::<F>()
+        }
+        let size = future_size(process_chunk);
+        assert!(size < 256, "DMA future unexpectedly holds {size} bytes");
+    }
+
+    #[test]
+    fn pack_left_aligns_sample_in_32_bit_slot() {
+        assert_eq!(pack(1i16), 0x0001_0000);
+        assert_eq!(pack(-1i16), 0xFFFF_0000);
+        assert_eq!(pack(i16::MIN), 0x8000_0000);
+        assert_eq!(pack(i16::MAX), 0x7FFF_0000);
     }
 
     #[test]
     fn sink_writable_and_send_bound() {
-        fn takes_send<T: AudioSink + Send>(s: &mut T) -> usize {
-            s.write(&[1, 2, 3]).unwrap()
-        }
+        fn takes_send<T: AudioSink + Send>(_: &mut T) {}
         let mut s = Sink::new();
-        assert_eq!(takes_send(&mut s), 3);
+        takes_send(&mut s);
         s.flush().unwrap();
     }
 
     #[test]
-    fn sink_write_feeds_ring() {
+    fn sink_upsampler_starts_from_silence() {
         let mut s = Sink::new();
-        s.write(&[7; 240]).unwrap(); // one demod block
-        let mut out = [0i16; 20];
-        r::pop_into(&mut out);
-        assert!(out.iter().all(|&x| x == 7));
+        assert_eq!(s.up.upsample(&[7; 240], &mut s.up_out), 2400);
+        assert_eq!(&s.up_out[..RATE_RATIO], &[0; RATE_RATIO]);
+        assert!(s.up_out[RATE_RATIO..2400].iter().all(|&x| x == 7));
     }
 }

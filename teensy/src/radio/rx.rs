@@ -122,7 +122,7 @@ impl Rx {
                     // Waterfall spectrum (unchanged path).
                     pipeline.push(c.re, c.im);
                     let t1 = DWT::cycle_count();
-                    let delta = t1 as u64 - t0 as u64;
+                    let delta = u64::from(t1.wrapping_sub(t0));
                     if pipeline.frame_seq() != seq_before {
                         self.fft_cycles += delta;
                     } else {
@@ -139,7 +139,7 @@ impl Rx {
             // not this demod output).
             let vr0 = DWT::cycle_count();
             let _ = self.vrx.process(&self.iq_acc);
-            self.demod_cycles += DWT::cycle_count() as u64 - vr0 as u64;
+            self.demod_cycles += u64::from(DWT::cycle_count().wrapping_sub(vr0));
         }
         pushed
     }

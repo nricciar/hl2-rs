@@ -52,6 +52,7 @@ impl Upsampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
 
     #[test]
     fn ramp_is_linear_over_full_ratio() {

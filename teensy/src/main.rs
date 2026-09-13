@@ -148,43 +148,23 @@ mod app {
     use rtic_monotonics::systick::ExtU64;
     use rtic_monotonics::systick::Systick;
 
-    /// DMA0-15 completion IRQ. Channels 0..=15 all share this vector on the
-    /// RT1060; the `dma_irq` ISR is what each parked task was told to
-    /// expect on completion.
-    ///
-    /// - **channel 0** — display blit. `DmaDisplay` (owned by `render`)
-    ///   arms `set_interrupt_on_completion(true)` on that channel; the
-    ///   handler here calls `DMA.on_interrupt(0)`, which clears DONE + INT
-    ///   and wakes `render`.
-    ///
-    /// - **channel 1** — SAI1 audio. `audio_task` arms it once at startup;
-    ///   each `process_chunk` `.await`s the eDMA-to-TDR transfer and parks
-    ///   on that channel's waker. The completion sets DONE + INT, fires
-    ///   this same DMA0-16 vector, and we route it through
-    ///   `DMA.on_interrupt(1)` to wake the parked `audio_task`.
-    ///
-    /// Both are exclusive — one task owns channel 0, the other owns
-    /// channel 1 — so `on_interrupt`'s waker-slot contract (`"associated
-    /// DMA channel is exclusively referenced"`) is satisfied per channel.
-    /// The handler just fans in one shared vector.
-    ///
-    /// The `shared::irq_fires_inc()` counter is incremented once per IRQ
-    /// (used by `DmaDisplay.draw_pixels` to report "how many IRQs did we
-    /// actually get?" across a 150-chunk blit; the audio path doesn't
-    /// check this counter, so it's a rough total that over-counts if both
-    /// channels complete at similar times).
+    /// RT1062 pairs channel n with n+16, not all channels in one vector.
+    /// Channel 0 belongs to the display; channel 16 is unused.
     #[task(binds = DMA0_DMA16, priority = 3)]
     fn dma_irq(_cx: dma_irq::Context) {
         shared::irq_fires_inc();
-        // Safety: `channel(0)` (display) and `channel(1)` (audio) are each
-        // exclusively owned by a single task — `render` and `audio_task`
-        // respectively. `on_interrupt` calls the *channel's* stored waker
-        // if that channel has INT + DONE set, and is a no-op otherwise
-        // (see `imxrt-dma` `Dma::on_interrupt`). Two calls into the same
-        // static `Dma<32>` is safe because they touch disjoint channels
-        // and their waker slots (`SharedWaker` is a `Mutex<RefCell<..>>`).
+        // SAFETY: render exclusively owns channel 0 and its DMA future.
         unsafe {
             bsp::hal::dma::DMA.on_interrupt(0);
+        }
+    }
+
+    /// Channel 1 belongs to audio; channel 17 is unused.
+    #[task(binds = DMA1_DMA17, priority = 3)]
+    fn audio_dma_irq(_cx: audio_dma_irq::Context) {
+        shared::audio_irq_fires_inc();
+        // SAFETY: audio_task exclusively owns channel 1 and its DMA future.
+        unsafe {
             bsp::hal::dma::DMA.on_interrupt(1);
         }
     }
@@ -232,11 +212,8 @@ mod app {
         // SAI1 pin mux (RT1060, Alt3):  P7 = TX_DATA00 (the one wire the
         // SAI needs to shift our L = R mono out to the WM8731),  P20 =
         // RX_SYNC (FSYNC in, driven by the WM8731 since it's the I2S
-        // master),  P21 = RX_BCLK (the WM8731's bit clock in).  All three
-        // are plain alt-3 multiplex (the RxSync / RxBclk "daisies" in the
-        // `imxrt-iomuxc` map exist but we are the *only* SAI1 user, so we
-        // don't need to set the daisy bits explicitly — `prepare()` just
-        // writes the `MUX` field in `SW_MUXR`).
+        // master), P21 = RX_BCLK. prepare() sets mux, input enable and
+        // input daisies. init_tx routes these RX clocks internally to TX.
         let mut p7 = pins.p7;
         let mut p20 = pins.p20;
         let mut p21 = pins.p21;
@@ -244,19 +221,9 @@ mod app {
         imxrt_iomuxc::sai::prepare(&mut p20);
         imxrt_iomuxc::sai::prepare(&mut p21);
 
-        // Bring up SAI1 as **slave-TX** (I2S 16-bit, frame_size = 2 with
-        // `Packing::None` so each 16-bit half lands in its own 32-bit TDR
-        // entry — the exact "2 TDR words per mono sample" the `Sink`
-        // repacks). The SAI's own clock plumbing (PLL4 → SAI1) and its
-        // gate are already enabled in `teensy4-bsp::clock_power::setup_sai1_clk`
-        // (see the BSP `prepare_clocks_and_power`); in slave mode we clock
-        // off the WM8731's BCLK + FSYNC, so the SAI1's own BCLK divider is
-        // irrelevant.
-        //
-        // The `i2c_bus` lives in the radio task (which owns LPI2C1), so
-        // the WM8731 itself is configured there at startup before the first
-        // audio sample is pushed. Until then the SAI has no clock, no
-        // BCLK-driven eDMA requests, and it sits idle in the TX FIFO.
+        // WM8731 supplies 64fs clocks: two 32-bit slots carrying 16-bit
+        // samples. BSP enables the SAI gate; the codec is configured below
+        // in radio_task before audio_task starts its first DMA transfer.
         let sai_tx = hl2_teensy::audio::sai1::init_tx(sai1).expect("sai1 tx");
 
         let poller = logging::log::usbd(usb, logging::Interrupts::Disabled).unwrap();
@@ -319,39 +286,14 @@ mod app {
         (Shared {}, Local {})
     }
 
-    /// Drive the SAI1 → WM8731 audio path on a fixed 1 ms tick.
-    ///
-    /// [`hl2_teensy::audio::sink::process_chunk`] pulls up to 960 upsampled
-    /// samples (20 ms of 48 kHz audio) from the cross-task ring, folds each
-    /// into its `[L = R]` TDR pair, and drives one eDMA transfer from the
-    /// `'static` `STAGE` buffer to SAI1.TDR[0]. The WM8731 (I2S master,
-    /// driven by its own 12.288 MHz / 256 sample clock) pulls those words
-    /// out of the SAI's TX FIFO on the wire.
-    ///
-    /// The tick deliberately runs at 1 ms (not at the radio's 1 ms poll):
-    /// with 960 samples per tick the audio task only needs to touch the
-    /// DMA channel ~ 50 times per 100 ms — a negligible fraction of the
-    /// single-core budget, and *enough* to keep the SAI's TX FIFO above
-    /// its low-watermark (8 words) without ever needing to spin for more
-    /// than ~ 200 µs per transfer.
-    /// Priority 1: above `radio_task`'s default 0, so the completion IRQ
-    /// (routed to a priority-3 ISR that calls `DMA.on_interrupt(1)`) wins
-    /// the preemption race as soon as the eDMA sets DONE.
-    ///
-    /// The audio task itself **yields** while the DMA runs (it `await`s
-    /// the `peripheral::write` future, which parks on the channel waker).
-    /// Only the ~few µs of `pop_into` + `pack` + TCD programming holds the
-    /// CPU per 20 ms of 48 kHz audio (960 samples / 48 kHz). `radio_task`
-    /// (priority 0) still gets its long network / I2C / DHCP slices
-    /// freely. `render` (priority 1) can also preempt back in here to
-    /// paint, because we're parked on a waker — the RTIC executor will
-    /// resume the *highest-priority* task with a woken continuation
-    /// whenever it gets to poll again.
+    /// Send 960-sample chunks (~20 ms), yielding while DMA runs. A 100 ms
+    /// timeout prevents missing clocks/completions from silently parking
+    /// audio forever. Radio and render continue while audio is waiting.
     #[task(priority = 1)]
     async fn audio_task(
         _cx: audio_task::Context,
         mut chan: bsp::hal::dma::channel::Channel,
-        mut tx: bsp::hal::sai::Tx,
+        mut tx: hl2_teensy::audio::sai1::Tx,
     ) {
         // Yield until `radio_task` finishes configuring the WM8731 and
         // publishes `shared::AUDIO_READY = true`. Until that flag flips,
@@ -364,12 +306,15 @@ mod app {
             Systick::delay(5.millis()).await;
         }
         log::info!("audio task: codec ready, first chunk starting");
+        log::info!("SAI1 TCR1..5,TCSR,RCR2,RCR4,RCSR={:08x?}", tx.reg_dump());
+        let (wfp, rfp) = tx.fifo_position();
+        shared::set_sai_status(tx.reg_dump()[5], wfp << 16 | rfp, 0);
         poll_log();
         // `ConstStaticCell::take()` is a one-shot, so acquire the stable
         // SAI source buffer *here, once*; the eDMA's TCD references this
         // address for the channel's lifetime. Same pattern as the display.
         let stage = hl2_teensy::audio::sink::STAGE.take();
-        // Arm interrupt-on-completion once. The `dma_irq` ISR fires
+        // Arm interrupt-on-completion once. The `audio_dma_irq` ISR fires
         // `DMA.on_interrupt(1)` when the channel's DONE + INT bits are
         // set, which wakes our registered waker (imxrt-dma stores it in
         // `Channel::waker` and calls `waker.wake()` from `on_interrupt`).
@@ -377,34 +322,59 @@ mod app {
         let mut chunk_idx: u32 = 0;
         loop {
             let t0 = cycles_now();
-            // On any DMA fault `process_chunk` returns `Ready(Err)` *immediately*
-            // (imxrt-dma's `Transfer::poll` returns `Ready` as soon as `is_error`
-            // is set — it does not park). Without yielding here, `audio_task`
-            // (priority 1) just re-enters `process_chunk` in a tight loop while
-            // its `await` returns `Ready` again and again; RTIC's run wrapper
-            // then `pend(KPP)`s after every slice, re-firing the KPP interrupt
-            // that preempts the *priority-0* `radio_task` dispatcher's endless
-            // loop (see `target/rtic-expansion.rs` — `radio_task` runs in
-            // `__rtic_internal_async_0_prio_dispatcher`, the main-thread `loop`,
-            // while `audio_task` + `render` run inside the KPP handler). The
-            // priority-1 task therefore starves priority-0 forever and the
-            // `Pipeline::new` line the radio task prints *after* its
-            // `build_iface_and_sockets` slice never reaches USB.
-            //
-            // Yielding one SysTick tick on every fault guarantees the
-            // priority-0 dispatcher a slice. The fault itself is the real
-            // cause (logged as `info!` below — `debug!` is compiled out in
-            // release), so the next log line tells us *what* the DMA is
-            // complaining about.
-            match hl2_teensy::audio::sink::process_chunk(&mut chan, &mut tx, stage).await {
-                Ok(()) => {}
-                Err(e) => {
-                    log::info!("audio dma fault {e} (chunk #{chunk_idx}); yielding to dispatcher");
+            let started_ms = now_millis();
+            let result = Systick::timeout_after(
+                100.millis(),
+                hl2_teensy::audio::sink::process_chunk(&mut chan, &mut tx, stage),
+            )
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                failure => {
+                    if let Ok(Err(e)) = failure {
+                        log::error!("audio DMA fault: {e}");
+                    } else {
+                        log::error!(
+                            "audio DMA timeout after 100 ms; check BCLK/LRCLK and DMA1 IRQ"
+                        );
+                    }
+                    let regs = tx.reg_dump();
+                    let (wfp, rfp) = tx.fifo_position();
+                    shared::set_sai_status(
+                        regs[5],
+                        wfp << 16 | rfp,
+                        ms_since(t0, cycles_now()) as u32,
+                    );
+                    // The DMA future has been dropped here: requests are
+                    // disabled, but SAI flags/FIFO positions remain useful.
+                    log::error!(
+                        "audio DMA after cleanup: irq={} wfp={} rfp={} SAI={:08x?}",
+                        shared::audio_irq_fires(),
+                        wfp,
+                        rfp,
+                        regs
+                    );
                     poll_log();
-                    Systick::delay(2.millis()).await;
+                    // Back off even for immediately-ready hardware faults.
+                    Systick::delay(1_000.millis()).await;
+                    continue;
                 }
             }
-            chunk_idx += 1;
+            chunk_idx = chunk_idx.wrapping_add(1);
+            // timeout_after polls DMA before its timer. A lost completion
+            // IRQ can therefore look successful when the timer finally
+            // wakes us; check elapsed time independently of the result.
+            let elapsed_ms = now_millis().wrapping_sub(started_ms);
+            if elapsed_ms >= 100 {
+                log::error!(
+                    "audio DMA completed late: {} ms, audio_irqs={}; check DMA1 IRQ delivery",
+                    elapsed_ms,
+                    shared::audio_irq_fires()
+                );
+                poll_log();
+                Systick::delay(1_000.millis()).await;
+                continue;
+            }
             // Diagnostic: per-chunk wall time + how many total DMA IRQs
             // have fired by now. If each chunk takes ~20 ms (960 samples
             // @ 48 kHz) and `irq_fires` is incrementing, the SAI + eDMA
@@ -415,10 +385,12 @@ mod app {
             if chunk_idx <= 3 || (chunk_idx % 50) == 0 {
                 let ms = ms_since(t0, cycles_now());
                 log::info!(
-                    "audio chunk #{} done in {} ms; total dma_irqs={}",
+                    "audio chunk #{} done in {} ms; audio_irqs={} sink_writes={} queued={}",
                     chunk_idx,
                     ms,
-                    shared::irq_fires(),
+                    shared::audio_irq_fires(),
+                    shared::audio_writes(),
+                    hl2_teensy::audio::ring::len(),
                 );
             }
         }
@@ -445,19 +417,16 @@ mod app {
         i2c::scan(&mut i2c_bus);
         poll_log();
 
-        // Configure the WM8731 *before* the Sink starts pushing samples so
-        // that by the time the first `audio_task` tick runs, the codec is
-        // awake, driving BCLK + FSYNC, and our SAI1 slave TX has a clock to
-        // latch data against. Without this call the SAI1's FIFO drains by
-        // its low-watermark-driven eDMA request (FWDE) but the wire is
-        // silent because the WM8731 isn't clocking.
+        // Only release audio_task after every codec register write succeeds.
         if let Err(()) = hl2_teensy::audio::wm8731::init(&mut i2c_bus) {
             log::error!(
                 "wm8731 init failed on 0x{:02X}",
                 hl2_teensy::audio::wm8731::WM8731_ADDR
             );
         } else {
-            log::info!("WM8731 audio codec configured (I2S master, 48 kHz, 16-bit)");
+            log::info!(
+                "WM8731 configured (codec master, Teensy slave, 48 kHz, 16-bit in 32-bit slots)"
+            );
             // Now (and only now) is the codec driving BCLK/FSYNC, so the SAI
             // slave-TX has a clock and the eDMA to the SAI can actually
             // complete. Release the audio task from its pre-activation yield
@@ -689,7 +658,7 @@ mod app {
                 let in_c = hl2_teensy::audio::sink::chunks_entered() as u32;
                 let done_c = hl2_teensy::audio::sink::chunks_completed() as u32;
                 log::info!(
-                    "disc iter={} sent={} rec={} rtk={} | aud={} in={} done={} inflight={} | sai_tcsr={:x} wfp={} rfp={} ms={}",
+                    "disc iter={} sent={} rec={} rtk={} | aud={} in={} done={} unfinished={} | sai_tcsr={:x} wfp={} rfp={} ms={}",
                     disc_iter,
                     disc_sent,
                     disc_recv,
@@ -801,7 +770,7 @@ mod app {
                 // (the 1-second denominator both tasks' work is measured
                 // against — *not* each task's own busy wall, which is how
                 // the three 100s happened).
-                let wall = now_c as u64 - cpu_start as u64;
+                let wall = u64::from(now_c.wrapping_sub(cpu_start));
                 shared::publish_cpu_stages(
                     rx.demod_cycles() - window_start,
                     rx.fft_cycles() - fft_start,
@@ -941,7 +910,7 @@ mod app {
                         ceil,
                     );
                 }
-                shared::add_lcd_cycles(DWT::cycle_count() as u64 - c0 as u64);
+                shared::add_lcd_cycles(u64::from(DWT::cycle_count().wrapping_sub(c0)));
                 // 3. Blit the band via eDMA. This hands the pixel work over
                 //    to the eDMA engine (which drives the LPSPI TDR while
                 //    the panel clocks in the bytes), so the CPU is free to

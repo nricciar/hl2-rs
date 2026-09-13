@@ -240,17 +240,8 @@ pub fn peer() -> Option<core::net::Ipv4Addr> {
     ))
 }
 
-/// The WM8731 codec is up and clocking I2S BCLK/FSYNC, so the SAI's slave-TX
-/// path has a clock to shift against and the eDMA to the SAI can actually
-/// complete. Set once by `radio_task` after `wm8731::init` returns; read by
-/// `audio_task` to decide whether to drive a chunk or to *yield* (await
-/// `Systick::delay`) before calling `process_chunk`.
-///
-/// Without this gate the very first audio chunk runs into `spin_on` while
-/// the codec is still in power-down — the SAI's FIFO takes 16 words and then
-/// holds, the eDMA sits blocked on a DMA-request that never fires, and
-/// `spin_on` busy-spins holding the core at radio_task's own priority,
-/// starving the task that is the one supposed to bring the codec up.
+/// Codec configuration writes succeeded. This is not proof of clocks on
+/// the pins; audio_task verifies progress using bounded DMA waits.
 static AUDIO_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// `radio_task` calls this once, after `wm8731::init` has ACK'd across I2C.
@@ -279,12 +270,8 @@ pub fn render_ticks() -> u32 {
     RENDER_TICKS.load(Ordering::Relaxed)
 }
 
-/// Audio-path liveness probe: sample of the SAI TCSR status register +
-/// TFR FIFO positions, captured once per completed eDMA chunk. The radio
-/// task echoes these in its discovery heartbeat so we can tell:
-///   * TCSR FIFO_WARNING/FIFO_ERROR/SYNC_ERROR = SAI clocking problem
-///   * TFR.WFP high, TFR.RFP low          = SAI is NOT shifting data out
-///   * TFR.WFP low, TFR.RFP rising         = SAI IS shifting — chain is good
+/// Last raw SAI TCSR and FIFO positions, sampled at audio startup, successful
+/// DMA completion, or failure. These are snapshots, not live registers.
 static SAI_TCSR: AtomicU32 = AtomicU32::new(0);
 static SAI_TFR: AtomicU32 = AtomicU32::new(0); // (WFP << 16) | RFP
 static SAI_CHUNK_MS: AtomicU32 = AtomicU32::new(0);
@@ -314,4 +301,14 @@ pub fn audio_writes_bump() {
 }
 pub fn audio_writes() -> u32 {
     AUDIO_WRITES.load(Ordering::Relaxed)
+}
+
+static AUDIO_IRQ_FIRES: AtomicU32 = AtomicU32::new(0);
+
+pub fn audio_irq_fires_inc() {
+    AUDIO_IRQ_FIRES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn audio_irq_fires() -> u32 {
+    AUDIO_IRQ_FIRES.load(Ordering::Relaxed)
 }
