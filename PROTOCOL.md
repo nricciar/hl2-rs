@@ -216,6 +216,29 @@ Discovery uses the UDP reply's source IP rather than its stored EEPROM IP.
 Its receive path (`teensy/src/radio/rx.rs::Rx`) retains two chunk buffers,
 including across invalid sync prefixes, for its non-reclaiming allocator.
 
+**Audio output (Teensy → WM8731 I2S over SAI1, implemented):** the virtual
+receiver (§16.3a) drives an [`AudioSink`] that upsamples the 4.8 kHz demod
+audio 10× into a 48 kHz I2S stream played through a WM8731 codec.
+The path is split across the two RTIC tasks by a single cross-task ring:
+
+| Piece | Location | Notes |
+|-------|----------|-------|
+| 10× upsampler (2-tap linear) | `teensy/src/audio/upsample.rs` | 4.8 kHz → 48 kHz; `RATE_RATIO = 10`. Cheapest resampler with acceptable HF roll-off for narrowband SSB/AM; deterministic, allocation-free |
+| Cross-task sample FIFO | `teensy/src/audio/ring.rs` | SPSC `i16` ring (`CAP = 2^13 ≈ 170 ms`), atomic head/len; single producer (radio-task `Sink`) + single consumer (audio-task `process_chunk`); overflow drops oldest, underrun zero-fills (silence, no clicks) |
+| `AudioSink` impl (producer) | `teensy/src/audio/sink.rs` | `Sink::write` upsamples, pushes to the ring; owned by the radio task, handed to `VirtualReceiver` (replaces the muted `DropSink` in `radio/rx.rs::Rx::new`) |
+| 1 ms audio tick (consumer) | `teensy/src/main.rs::audio_task` | Every 1 ms calls `sink::process_chunk`: pop ≤ 960 samples (20 ms @ 48 kHz), fold each mono into its `[L=R]` TDR pair into a `'static` `STAGE` (`[u32; 1920]`), then one eDMA transfer → SAI1.TDR[0] (spin-on-completion, ~200 µs) |
+| SAI1 slave-TX bring-up | `teensy/src/audio/sai1.rs` | `Mode::Slave`, 16-bit, `frame_size = 2`, `Packing::None` (each 16-bit half = one 32-bit TDR entry → `TDR_WORDS_PER_SAMPLE = 2`); the WM8731 is the I2S **master** and drives BCLK/FSYNC, so the SAI only shifts data out |
+| WM8731 I2C control plane | `teensy/src/audio/wm8731.rs` | I2C address `0x1A`; register writes over the existing `Lpi2c`. Sequence: reset → power-down (mic + global) → line-in unity → headphone max → analog/digital path → **I2S / 16-bit / slave** → 48 kHz / 256× → `active` last (until then the codec holds BCLK/FSYNC Low = hardware mute) |
+| Pin mux (RT1060 Alt3) | `teensy/src/main.rs::init` | `imxrt_iomuxc::sai::prepare`: `P7` = SAI1_TX_DATA00 (out), `P20` = SAI1_RX_SYNC (FSYNC in), `P21` = SAI1_RX_BCLK (bit clock in) |
+| eDMA channel | `teensy/src/main.rs::init` | channel **1** (channel 0 is the ILI9341 blit); `prepare_write` programs the DMAMUX slot for SAI1-TX (mapping `[20,22,84]` → index 0 = SAI1) + the linear `STAGE` source before arming |
+
+Clocking: the SAI1 clock root (audio PLL / PLL4) + its clock gate are set by
+`teensy4-bsp::clock_power::setup_sai1_clk`; in slave mode the SAI clocks off
+the WM8731's BCLK + FSYNC (its 12.288 MHz / 256 = 48 kHz sample clock), so the
+SAI's own BCLK divider is irrelevant. Mono is folded to **both** L and R
+(`pack(n) = (n<<16)|n`) because the WM8731 has no mono mode and its headphone
+outputs come from the L/R DACs.
+
 > **[full spec]** See openHPSDR for the original protocol 1 `Command`/`C&C`
 > semantics that Start/Stop sit on top of.
 

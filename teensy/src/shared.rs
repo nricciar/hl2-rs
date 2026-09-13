@@ -239,3 +239,79 @@ pub fn peer() -> Option<core::net::Ipv4Addr> {
         p as u8,
     ))
 }
+
+/// The WM8731 codec is up and clocking I2S BCLK/FSYNC, so the SAI's slave-TX
+/// path has a clock to shift against and the eDMA to the SAI can actually
+/// complete. Set once by `radio_task` after `wm8731::init` returns; read by
+/// `audio_task` to decide whether to drive a chunk or to *yield* (await
+/// `Systick::delay`) before calling `process_chunk`.
+///
+/// Without this gate the very first audio chunk runs into `spin_on` while
+/// the codec is still in power-down — the SAI's FIFO takes 16 words and then
+/// holds, the eDMA sits blocked on a DMA-request that never fires, and
+/// `spin_on` busy-spins holding the core at radio_task's own priority,
+/// starving the task that is the one supposed to bring the codec up.
+static AUDIO_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// `radio_task` calls this once, after `wm8731::init` has ACK'd across I2C.
+pub fn set_audio_ready(ready: bool) {
+    AUDIO_READY.store(ready, Ordering::Release);
+}
+
+/// `audio_task` reads this before `process_chunk`; `false` → yield first.
+pub fn audio_ready() -> bool {
+    AUDIO_READY.load(Ordering::Acquire)
+}
+
+/// Cross-task liveness counter: the `render` task bumps this once per loop
+/// iteration. Other tasks echo it in their own logs, so a *frozen* value
+/// while another task is still logging proves the scheduler/render task has
+/// stopped running (versus "everything is alive, just waiting on the wire").
+static RENDER_TICKS: AtomicU32 = AtomicU32::new(0);
+
+/// `render` calls this once per loop iteration.
+pub fn render_tick() {
+    RENDER_TICKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The current render-task loop count.
+pub fn render_ticks() -> u32 {
+    RENDER_TICKS.load(Ordering::Relaxed)
+}
+
+/// Audio-path liveness probe: sample of the SAI TCSR status register +
+/// TFR FIFO positions, captured once per completed eDMA chunk. The radio
+/// task echoes these in its discovery heartbeat so we can tell:
+///   * TCSR FIFO_WARNING/FIFO_ERROR/SYNC_ERROR = SAI clocking problem
+///   * TFR.WFP high, TFR.RFP low          = SAI is NOT shifting data out
+///   * TFR.WFP low, TFR.RFP rising         = SAI IS shifting — chain is good
+static SAI_TCSR: AtomicU32 = AtomicU32::new(0);
+static SAI_TFR: AtomicU32 = AtomicU32::new(0); // (WFP << 16) | RFP
+static SAI_CHUNK_MS: AtomicU32 = AtomicU32::new(0);
+
+pub fn set_sai_status(tcsr: u32, tfr: u32, chunk_ms: u32) {
+    SAI_TCSR.store(tcsr, Ordering::Relaxed);
+    SAI_TFR.store(tfr, Ordering::Relaxed);
+    SAI_CHUNK_MS.store(chunk_ms, Ordering::Relaxed);
+}
+pub fn sai_tcsr() -> u32 {
+    SAI_TCSR.load(Ordering::Relaxed)
+}
+pub fn sai_tfr() -> u32 {
+    SAI_TFR.load(Ordering::Relaxed)
+}
+pub fn sai_chunk_ms() -> u32 {
+    SAI_CHUNK_MS.load(Ordering::Relaxed)
+}
+
+/// Radio task (demod): count of `AudioSink::write` calls so far. Diagnostic
+/// only — proves the virtual receiver is actively producing audio (versus
+/// silent — e.g. an AGC stuck at 0).
+static AUDIO_WRITES: AtomicU32 = AtomicU32::new(0);
+
+pub fn audio_writes_bump() {
+    AUDIO_WRITES.fetch_add(1, Ordering::Relaxed);
+}
+pub fn audio_writes() -> u32 {
+    AUDIO_WRITES.load(Ordering::Relaxed)
+}

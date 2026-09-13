@@ -15,6 +15,7 @@ extern crate alloc;
 use alloc::{vec, vec::Vec};
 
 use core::f32;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use num_traits::float::Float;
 
 use crate::spectrum::fft::Fft;
@@ -23,6 +24,31 @@ use crate::spectrum::fft::Fft;
 pub const N_FFT: usize = 2048;
 /// Display bins — one bin per LCD pixel column (ILI9341 is 320 wide).
 pub const BINS: usize = 320;
+
+/// Diagnostic: current step inside `Pipeline::new()`. Read by the render
+/// task (which keeps running as long as the RTIC scheduler preempts the
+/// blocked *radio* task) so we can find out *which* step of `new` is
+/// hung. Steps, in order:
+///
+///   0 — entered, before `Fft::new` (1024 cos/sin — software
+///       `num-traits/libm` trig).
+///   1 — `Fft::new` returned.
+///   2 — Hann window computed (2048 `Float::cos`, then `to_vec`).
+///   3 — heap `buf_re` / `buf_im` (16 KB total) allocated + zeroed.
+///   4 — heap `mags` allocated.
+///   5 — `acc_re` / `acc_im` created (`Vec::with_capacity(N_FFT)`).
+///   6 — `Ok(Self { .. })` returned.
+///
+/// Any step that stays constant across render-heartbeat polls is the
+/// step the hang is stuck on.
+/// Initial value is 6 (= "not currently building / already done"), so the
+/// render-task heartbeat stays quiet at boot.
+pub static PIPELINE_NEW_STEP: AtomicUsize = AtomicUsize::new(6);
+
+/// Render task / panic handler sample this to find the stuck step.
+pub fn pipeline_new_step() -> usize {
+    PIPELINE_NEW_STEP.load(Ordering::Acquire)
+}
 
 /// Accumulator state.
 pub struct Pipeline {
@@ -41,21 +67,41 @@ pub struct Pipeline {
 
 impl Pipeline {
     /// Build the pipeline. The 1024 complex twiddles occupy 8 KiB.
+    ///
+    /// The Hann-window table is allocated on the heap directly (as
+    /// a [`Vec<f32>`]) so the caller's stack never has to hold a
+    /// full 8 KB local — under RTIC 2.x all tasks share the 16 KB
+    /// main stack, and a synchronous function that peaks at ~8 KB
+    /// stack *on top of* three pre-allocated task-future frames is
+    /// already close to the stack limit. A 1-2 KB overrun here is
+    /// silent (no guard pages on `thumbv7em-none`) and would
+    /// corrupt a neighbouring frame and hang the core with no
+    /// panic blink.
     pub fn new() -> Result<Self, &'static str> {
+        PIPELINE_NEW_STEP.store(0, Ordering::Relaxed); // entered, before Fft::new
         let fft = Fft::new(N_FFT)?;
-        let mut win = [0.0f32; N_FFT];
+        PIPELINE_NEW_STEP.store(1, Ordering::Relaxed); // Fft::new done
+        // Build the Hann window into a pre-sized heap buffer — zero
+        // stack beyond this single `Vec` (24 bytes).
+        let mut win = vec![0f32; N_FFT];
         for (i, v) in win.iter_mut().enumerate() {
             *v = 0.5 * (1.0 - Float::cos(2.0 * f32::consts::PI * (i as f32 / N_FFT as f32)));
         }
-        let win = win.to_vec();
+        PIPELINE_NEW_STEP.store(2, Ordering::Relaxed); // window done
         let buf_re = vec![0f32; N_FFT];
         let buf_im = vec![0f32; N_FFT];
+        PIPELINE_NEW_STEP.store(3, Ordering::Relaxed); // buf_re/im done
         let mags = vec![0u16; BINS];
+        PIPELINE_NEW_STEP.store(4, Ordering::Relaxed); // mags done
+        let acc_re = Vec::with_capacity(N_FFT);
+        let acc_im = Vec::with_capacity(N_FFT);
+        PIPELINE_NEW_STEP.store(5, Ordering::Relaxed); // acc done; about to return
+        PIPELINE_NEW_STEP.store(6, Ordering::Relaxed); // returned
         Ok(Self {
             fft,
             win,
-            acc_re: Vec::with_capacity(N_FFT),
-            acc_im: Vec::with_capacity(N_FFT),
+            acc_re,
+            acc_im,
             buf_re,
             buf_im,
             mags,

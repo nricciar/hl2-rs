@@ -16,7 +16,7 @@ use hl2::protocol::data::{
     BasebandChunk, HEADER_SIZE, parse_baseband_chunk_into, parse_data_header,
 };
 use hl2::protocol::{CHUNK_SIZE, DATA_PACKET_SIZE, ENDPOINT_DATA_TX};
-use hl2::receiver::{DropSink, VirtualReceiver};
+use hl2::receiver::VirtualReceiver;
 
 use crate::spectrum::Pipeline;
 
@@ -29,7 +29,8 @@ pub struct Rx {
     /// audio). Built on [`hl2::ReceiverConfig::default()`] so it mirrors the
     /// UI receiver exactly. It runs so the demod is exercised at CPU speed and
     /// its cost is surfaced (see the radio task's CPU% readout); its audio is
-    /// **muted** (a [`DropSink`]) — the I2S out for real audio is a later step.
+    /// routed through the I2S path (`crate::audio::sink::Sink`) → SAI1 → WM8731
+    /// (see `crate::audio` and the "Audio output" note in PROTOCOL.md §2 / §16).
     vrx: VirtualReceiver,
     /// Reused I/Q block handed to the virtual receiver each frame. Held as a
     /// field (not a per-call local) because the heap is a no_std bump arena
@@ -49,9 +50,10 @@ impl Rx {
     pub fn new() -> Self {
         // USB-SSB, offset 0, 96 kSps, 2.6 kHz, 4.8 kHz audio — the `hl2`
         // crate's default receiver config, so the Teensy's virtual receiver is
-        // byte-for-byte the same DSP the UI drives. Audio goes to a DropSink
-        // (muted); the S-meter is a spectrum consumer (see `crate::smeter`).
-        let sink = Box::new(DropSink);
+        // byte-for-byte the same DSP the UI drives. Audio is routed through
+        // the I2S path (`audio::sink::Sink`) → WM8731; the S-meter is a
+        // spectrum consumer (see `crate::smeter`).
+        let sink = Box::new(crate::audio::sink::Sink::new());
         let vrx = VirtualReceiver::new(Default::default(), sink)
             .expect("virtual USB receiver at offset 0");
         Self {
@@ -132,8 +134,9 @@ impl Rx {
                     self.iq_acc.push(*c);
                 }
             }
-            // Drive the virtual receiver with this chunk's I/Q (audio is muted
-            // by its DropSink); the S-meter itself reads the spectrum, not this.
+            // Drive the virtual receiver with this chunk's I/Q (its audio is
+            // pushed to the I2S sink; the S-meter itself reads the spectrum,
+            // not this demod output).
             let vr0 = DWT::cycle_count();
             let _ = self.vrx.process(&self.iq_acc);
             self.demod_cycles += DWT::cycle_count() as u64 - vr0 as u64;
