@@ -1,0 +1,60 @@
+[INFO hl2_teensy::i2c]: i2c: begin scan
+[INFO hl2_teensy::i2c]: i2c: wm8731 (audio) at 0x1A
+[INFO hl2_teensy::i2c]: i2c: 1 device(s) found
+[INFO hl2_teensy::app]: WM8731 audio codec configured (I2S master, 48 kHz, 16-bit)
+[INFO hl2_teensy::app]: audio task: codec ready, first chunk starting
+[INFO hl2_teensy::ethernet]: Ethernet: PLL6 locked, PHY released from reset; initializing MAC
+[INFO hl2_teensy::ethernet]: DP83825 PHY IDs: 0x2000 0xa140
+[INFO hl2_teensy::ethernet]: Ethernet: RMII MAC ready; waiting for 100 Mbps full-duplex link
+[INFO hl2_teensy::app]: radio: Ethernet OK, now building smoltcp iface
+[INFO hl2_teensy::app]: radio: iface + sockets OK
+[INFO hl2_teensy::app]: radio: now building spectrum pipeline
+[INFO hl2_teensy::app]: Pipeline::new done in 8ms, heap +48KB, in 1->1 done 0->0
+[INFO hl2_teensy::app]: radio: now building Rx (VirtualReceiver + Sink)
+[INFO hl2_teensy::app]: radio: Rx + Sink built; entering wait-for-IP loop
+[INFO hl2_teensy::app]: wait-ip iter #1
+[INFO hl2_teensy::app]: wait-ip iter #2
+[INFO hl2_teensy::app]: wait-ip iter #3
+[INFO hl2_teensy::app]: link_up() = down
+[INFO hl2_teensy::app]: link_up() = down
+[INFO hl2_teensy::app]: wait-ip iter #100
+[INFO hl2_teensy::app]: link_up() = down
+[INFO hl2_teensy::app]: link_up() = up
+[INFO hl2_teensy::app]: link is up, proceeding to DHCP...
+[INFO hl2_teensy::radio::control]: DHCP: waiting for lease
+[INFO hl2_teensy::app]: wait-ip iter #200
+[INFO hl2_teensy::radio::control]: DHCP: 192.168.1.228/24
+[INFO hl2_teensy::app]: IP acquired: 192.168.1.228
+[INFO hl2_teensy::app]: disc iter=85 sent=1 rec=0 rtk=1870 | aud=0 in=1 done=0 inflight=1 | sai_tcsr=0 wfp=0 rfp=0 ms=0
+[INFO hl2_teensy::app]: HL2 FOUND ip=192.168.1.67 mac=[00, 1c, c0, a2, 13, dd] rx=4 16bit=true sending=false
+[INFO hl2_teensy::app]: EP6 streaming at 96 kSps, NCO 7.074 MHz (RX1)
+[INFO hl2_teensy::audio::sink]: audio sink #1: in_242 peak=829 non_zero=237/242
+[INFO hl2_teensy::audio::sink]: audio sink #2: in_243 peak=1220 non_zero=243/243
+[INFO hl2_teensy::audio::sink]: audio sink #3: in_242 peak=2160 non_zero=242/242
+[INFO hl2_teensy::audio::sink]: audio sink #4: in_240 peak=2052 non_zero=240/240
+[INFO hl2_teensy::audio::sink]: audio sink #5: in_242 peak=2248 non_zero=242/242
+[INFO hl2_teensy::audio::sink]: audio sink #6: in_240 peak=2316 non_zero=240/240
+[INFO hl2_teensy::audio::sink]: audio sink #7: in_242 peak=2300 non_zero=242/242
+[INFO hl2_teensy::audio::sink]: audio sink #8: in_243 peak=2340 non_zero=243/243
+[INFO hl2_teensy::audio::sink]: audio sink #9: in_242 peak=2365 non_zero=242/242
+[INFO hl2_teensy::audio::sink]: audio sink #10: in_240 peak=2348 non_zero=240/240
+[INFO hl2_teensy::audio::sink]: audio sink #11: in_242 peak=2415 non_zero=242/242
+[INFO hl2_teensy::audio::sink]: audio sink #12: in_240 peak=2318 non_zero=240/240
+[INFO hl2_teensy::audio::sink]: audio sink #13: in_242 peak=2463 non_zero=242/242
+[INFO hl2_teensy::audio::sink]: audio sink #14: in_243 peak=2239 non_zero=243/243
+[INFO hl2_teensy::audio::sink]: audio sink #15: in_242 peak=2159 non_zero=242/242
+[INFO hl2_teensy::audio::sink]: audio sink #16: in_240 peak=2140 non_zero=240/240
+[INFO hl2_teensy::audio::sink]: audio sink #17: in_242 peak=1988 non_zero=242/242
+[INFO hl2_teensy::audio::sink]: audio sink #18: in_240 peak=1967 non_zero=240/240
+[INFO hl2_teensy::audio::sink]: audio sink #19: in_242 peak=1703 non_zero=242/242
+[INFO hl2_teensy::audio::sink]: audio sink #20: in_243 peak=1628 non_zero=242/243
+[INFO hl2_teensy::audio::sink]: audio sink #21: in_242 peak=1577 non_zero=242/242
+[INFO hl2_teensy::audio::sink]: audio sink #22: in_240 peak=1472 non_zero=240/240
+[INFO hl2_teensy::audio::sink]: audio sink #23: in_242 peak=1358 non_zero=242/242
+[INFO hl2_teensy::audio::sink]: audio sink #24: in_240 peak=1502 non_zero=240/240
+[INFO hl2_teensy::audio::sink]: audio sink #25: in_242 peak=1471 non_zero=242/242
+[INFO hl2_teensy::audio::sink]: audio sink #26: in_243 peak=1385 non_zero=243/243
+[INFO hl2_teensy::audio::sink]: audio sink #27: in_242 peak=1431 non_zero=242/242
+[INFO hl2_teensy::audio::sink]: audio sink #28: in_240 peak=1318 non_zero=239/240
+[INFO hl2_teensy::audio::sink]: audio sink #29: in_242 peak=1421 non_zero=242/242
+[INFO hl2_teensy::audio::sink]: audio sink #30: in_240 peak=1466 non_zero=240/240
