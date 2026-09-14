@@ -52,7 +52,7 @@ use core::f64::consts;
 use num_complex::Complex;
 
 use super::core::DemodCore;
-use super::dsp::{F32Fir, F32FirState, KAISER_BETA, Nco, PolyphaseDecimator};
+use super::dsp::{F32Fir, F32FirState, KAISER_BETA, Nco, PolyphaseDecimator, fir_taps};
 use crate::receiver::AudioConfig;
 use crate::receiver::Sideband;
 
@@ -70,13 +70,29 @@ pub struct SsbCore {
     /// NCO (phase-recurrence oscillator). Identity when `source_center_hz`
     /// is 0 (i.e. the input is already baseband).
     nco: Nco,
-    /// Quadrature (90° / Hilbert) phase-shifter. Applied to the post-NCO Q arm
-    /// it produces `H{Q}` (90°-shifted Q) for the phasing combine. See
-    /// `F32Fir::hilbert`. Used for **both** `Usb` and `Lsb` (the sideband is
-    /// chosen by the add/subtract below, not by which arm we keep).
+    /// Full-rate **pre-decimation** stage: a polyphase anti-alias low-pass
+    /// (wide passband, ≈ ±15 kHz) + decimator at factor `p`, run on **both**
+    /// complex arms in lockstep (same `fm.rs` pattern) — so only ≈ 1/p of the
+    /// anti-alias taps touch each full-rate sample, and it collapses the 96/192
+    /// kHz stream down to a 24 kW intermediate rate. The anti-alias passband is
+    /// chosen wide enough to pass the *phasing* band (the two-sideband voice
+    /// band around the NCO) with margin, so it introduces negligible
+    /// quadrature error of its own. Runs at full rate — this is the expensive
+    /// part moved *out* of the 24 kW Hilbert pass.
+    pre_re: PolyphaseDecimator,
+    pre_im: PolyphaseDecimator,
+    /// Decimation factor of [`Self::pre_re`]/[`Self::pre_im`]
+    /// (`intermediate_rate = source_rate / p`).
+    pre_p: usize,
+    /// Quadrature (90° / Hilbert) phase-shifter at the **intermediate** rate.
+    /// Applied to the post-NCO Q arm it produces `H{Q}` (90°-shifted Q) for
+    /// the phasing combine. See `F32Fir::hilbert`. Sized to a ±6 kHz
+    /// transition at 24 kW (≈ 65 taps — an order of magnitude cheaper than a
+    /// full-rate 257-tap Hilbert). Used for **both** `Usb` and `Lsb` (the
+    /// sideband is chosen by the add/subtract below, not by which arm we keep).
     hilb: F32FirState,
-    /// Polyphase anti-alias + decimation stage (channel-select FIR's taps are
-    /// its full-rate impulse response).
+    /// Final channel-select polyphase anti-alias + decimator (≈ BW, the
+    /// requested voice bandwidth) at factor `s = 24 kW / audio_rate`.
     lp: PolyphaseDecimator,
     /// Delay line matching the Hilbert FIR's group delay (its symmetric
     /// impulse is centred at `(len−1)/2`, so delay = `(len−1)/2` samples).
@@ -92,9 +108,20 @@ impl SsbCore {
     /// Build an SSB voice demodulator **core** from a full set of receiver
     /// parameters.
     ///
-    /// The `audio` argument is used only to (a) set the decimation factor
-    /// (`m = source_rate_hz / audio.rate_hz`, with the ≥4 sanity bound) and
+    /// The `audio` argument is used only to (a) set the decimation factors
+    /// (pre-dec `p = source/24k`, channel-select `s = 24k/audio`) and
     /// (b) let [`DemodCore::demodulator`] build the audio tail at that rate.
+    ///
+    /// ## Pre-decimation
+    ///
+    /// Rather than running the phasing Hilbert and channel-select FIR *at the
+    /// full 96/192 kHz source rate* (≈ 257-tap Hilbert + 257-tap channel-select,
+    /// both per full-rate sample), a **polyphase pre-decimator** at
+    /// `source/24k` runs first on both complex arms (wide ≈ ±15 kHz passband,
+    /// ≈ 33 taps/arm at 192 k, 17 taps/arm at 96 k). The expensive FIR work is
+    /// thus spread ≈ 4–8× thinner per input sample, and the Hilbert +
+    /// channel-select operate at the 24 kW intermediate rate where their taps
+    /// are an order of magnitude smaller. Total decimation `p·s` is unchanged.
     pub fn new(
         sideband: Sideband,
         source_rate_hz: u32,
@@ -102,30 +129,54 @@ impl SsbCore {
         bandwidth_hz: u32,
         audio: AudioConfig,
     ) -> Self {
-        let m = source_rate_hz as usize / audio.rate_hz as usize;
-        // Anti-alias LPF: pass the requested bandwidth (default ≈ voice). The
-        // same taps double as the channel-select filter *and* the decimator's
-        // anti-alias — as `F32Fir::lowpass` they are a unit-gain, windowed-sinc
-        // low-pass at exactly that bandwidth, split into `M` polyphase branches
-        // by [`PolyphaseDecimator::new`] so only ≈ 1/M of the taps run per input
-        // sample.
-        let bw_ratio = (bandwidth_hz as f64 / source_rate_hz as f64).clamp(1e-3, 0.4);
-        let taps = if bandwidth_hz <= 4_000 { 257 } else { 129 };
-        let h = F32Fir::lowpass(taps, bw_ratio, KAISER_BETA).taps().to_vec();
-        let lp = PolyphaseDecimator::new(&h, m);
-        // Quadrature (Hilbert) 90° phase shifter on the Q arm. 257 taps is
-        // well within the voice band — a wider window is pure overhead.
-        let hilb_fir = F32Fir::hilbert(taps.max(257), KAISER_BETA);
+        let audio_rate_hz = audio.rate_hz;
+        let audio_rate = audio_rate_hz as usize;
+        // --- 1. Pre-decimation anti-alias (full rate → 24 kW intermediate) ---
+        // Fixed 24 kW intermediate (the phasing band lives around it for both
+        // 96 k and 192 k sources). The pre-anti-alias must pass ±15 kHz of
+        // two-sideband baseband (margin around any voice band) while killing
+        // everything above the intermediate Nyquist (12 kHz). Its transition
+        // width is the gap between the 15 kHz pass edge and the *source*
+        // Nyquist (`source_rate/2`): 33 kHz at 96 k, 81 kHz at 192 k.
+        let pass_edge = 15_000u32;
+        let source_nyquist_hz = (source_rate_hz / 2).max(pass_edge + 1);
+        let pre_transition = (source_nyquist_hz - pass_edge).max(1_000);
+        let pre_taps = fir_taps(source_rate_hz, pre_transition, KAISER_BETA);
+        // Passband 15 kHz expressed as a fraction of the source Nyquist.
+        let pre_ratio = (pass_edge as f64 / source_rate_hz as f64).clamp(1e-3, 0.49);
+        let pre_h = F32Fir::lowpass(pre_taps, pre_ratio, KAISER_BETA);
+        let pre_h = pre_h.taps().to_vec();
+        let intermediate_rate = 24_000usize;
+        let p = (source_rate_hz as usize / intermediate_rate).max(1);
+        let pre_re = PolyphaseDecimator::new(&pre_h, p);
+        let pre_im = PolyphaseDecimator::new(&pre_h, p);
+        // --- 2. Quadrature (Hilbert) phase-shifter at the intermediate rate ---
+        // The phasing selection only needs to be accurate to ≈ ±BW. Give it a
+        // ±BW transition at 24 kW → ≈ 65 taps at BW = 2.6 kHz (vs 257 at full
+        // rate — an order of magnitude cheaper per step).
+        let hilb_transition = bandwidth_hz.max(1_000);
+        let hilb_taps = fir_taps(intermediate_rate as u32, hilb_transition, KAISER_BETA);
+        let hilb_fir = F32Fir::hilbert(hilb_taps, KAISER_BETA);
         let hilb = F32FirState::new(&hilb_fir);
-        // The I arm must be delayed by the Hilbert FIR's group delay so its
-        // samples stay in phase with `H{Q}[n]` across the voice band. `hilb_fir`
-        // has a symmetric impulse centred on sample `(len−1)/2`, so the group
-        // delay is exactly `(len−1)/2` full-rate samples.
         let i_delay_samples = (hilb_fir.len() - 1) / 2;
+        // --- 3. Final channel-select + decimate (24 kW → audio) ---
+        // Narrow ±BW anti-alias at the intermediate rate; total decimation
+        // `p·s == source/audio` is preserved so the audio rate is unchanged.
+        let s = (intermediate_rate / audio_rate).max(1);
+        let cs_transition = bandwidth_hz.max(1_500);
+        let cs_taps = fir_taps(intermediate_rate as u32, cs_transition, KAISER_BETA);
+        let cs_ratio = (bandwidth_hz as f64) / 48_000.0; // ±BW out of 24 kW Nyquist
+        let cs_h = F32Fir::lowpass(cs_taps, cs_ratio.clamp(1e-3, 0.49), KAISER_BETA);
+        let cs_h = cs_h.taps().to_vec();
+        let lp = PolyphaseDecimator::new(&cs_h, s);
+        // --- 4. NCO ---
         let nco = Nco::new(2.0 * consts::PI * source_center_hz / source_rate_hz as f64);
         Self {
             sideband,
             nco,
+            pre_re,
+            pre_im,
+            pre_p: p,
             hilb,
             lp,
             i_delay: vec![0.0f32; i_delay_samples.max(1)],
@@ -146,50 +197,53 @@ impl SsbCore {
 
 impl DemodCore for SsbCore {
     fn process(&mut self, x: Complex<f32>) -> Option<f32> {
-        // 1. NCO to the channel centre — the user's `--offset` shift; with
-        //    `offset=0` it is identity (no NCO) so the voice is already at
-        //    [0, +BW] (USB) / [−BW, 0] (LSB).
+        // 1. NCO to the channel centre (identity at `source_center_hz = 0`).
         let post = self.nco.step(x);
 
-        // 2. Phase-shift the **Q arm** by 90° (Hilbert) for both sidebands, so
-        //    below we combine it with the delayed I arm to pick a sideband.
-        //    (The old code collapsed to `post.re`, discarding Q entirely,
-        //    which is why image rejection was 0 dB: `Re{e^{±jωt}}` are
-        //    identical.)
-        let q_h = self.hilb.convolve(post.im);
+        // 2. Pre-decimate: band-limit both complex arms (polyphase anti-alias
+        //    low-pass at ±15 kHz) and collapse the 96/192 kHz stream to the
+        //    fixed 24 kW intermediate. Both decimators share the same taps
+        //    and the same factor, so they emit in lockstep — `(i_dec, q_dec)`
+        //    is a true complex sample at the intermediate rate. `None` on
+        //    `p−1` of every `p` inputs: the Hilbert below runs only at the
+        //    intermediate rate.
+        let i_dec = self.pre_re.push(post.re);
+        let q_dec = self.pre_im.push(post.im);
+        if let (Some(i), Some(q)) = (i_dec, q_dec) {
+            // 3. Hilbert (quadrature) phase-shift of the **Q arm** at the
+            //    intermediate rate — the phasing element.
+            let q_h = self.hilb.convolve(q);
 
-        // 3. Delay the **I arm** by the Hilbert FIR's group delay (`D`
-        //    samples) so the two terms stay in phase across the voice band.
-        let i_delayed = self.i_delay[self.i_idx];
-        self.i_delay[self.i_idx] = post.re;
-        self.i_idx += 1;
-        if self.i_idx == self.i_delay.len() {
-            self.i_idx = 0;
-        }
+            // 4. Ring-delayed **I arm** — the oldest sample in the ring (of
+            //    size `D` = the Hilbert FIR's group delay) is exactly the
+            //    I sample that is in phase with `q_h` across the voice band.
+            let i_delayed = self.i_delay[self.i_idx];
+            self.i_delay[self.i_idx] = i;
+            self.i_idx += 1;
+            if self.i_idx == self.i_delay.len() {
+                self.i_idx = 0;
+            }
 
-        // 4. **Phasing combine** (single-sideband selection).
-        //
-        // Phasing-method identities (with `H{cos}=sin`, `H{sin}=−cos`
-        // — `F32Fir::hilbert`):
-        //    I − H{Q} → passes +f, cancels −f
-        //    I + H{Q} → passes −f, cancels +f
-        //
-        // This DDC is **frequency-inverted** (an above-NCO signal lands at a
-        // *negative* complex frequency — measured live: signal at +14 kHz
-        // above NCO sits at −14 kHz in baseband, 9 dB above the +14 kHz
-        // image; see `hl2 ft8 --probe`, hub.rs:1631-1633). So:
-        //    real USB (above NCO) = complex −f  → pass −f → I + H{Q}
-        //    real LSB (below NCO) = complex +f  → pass +f → I − H{Q}
-        let r0 = if self.sideband == Sideband::Usb {
-            i_delayed + q_h
+            // 5. **Phasing combine** (single-sideband selection).
+            //
+            // The DDC is **frequency-inverted**: an above-NCO signal lands
+            // at a *negative* complex frequency — measured live (see
+            // `hl2 ft8 --probe`, hub.rs:1631-1633). So:
+            //    real USB (above NCO) = complex −f  → I + H{Q}
+            //    real LSB (below NCO) = complex +f  → I − H{Q}
+            let r0 = if self.sideband == Sideband::Usb {
+                i_delayed + q_h
+            } else {
+                i_delayed - q_h
+            };
+
+            // 6. Final channel-select + decimate (24 kW → audio). `None` on
+            //    `s−1` of every `s` intermediate samples — the audio tail is
+            //    fed once per `s` intermediate samples.
+            self.lp.push(r0)
         } else {
-            i_delayed - q_h
-        };
-
-        // 5. Polyphase anti-alias + decimate (≈1/M the taps of a full-rate
-        //    step). Returns `None` on `M−1` of every `M` inputs; `Some` on the
-        //    group boundary.
-        self.lp.push(r0)
+            None
+        }
     }
 
     fn kind(&self) -> &'static str {

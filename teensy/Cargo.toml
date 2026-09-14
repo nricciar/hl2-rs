@@ -12,6 +12,7 @@ crate-type = ["lib"]
 [dependencies]
 hl2 = { path = "../hl2", default-features = false, features = ["dsp"] }
 num-traits = { version = "0.2", default-features = false, features = ["libm"] }
+num-complex = { version = "0.4", default-features = false }
 rtic = { version = "2", features = ["thumbv7-backend"] }
 rtic-monotonics = { version = "1", default-features = false, features = ["cortex-m-systick", "systick-64bit"] }
 ili9341 = "0.6.0"
@@ -25,6 +26,10 @@ teensy4-panic = { version = "0.3", default-features = false }
 imxrt-enet = "=0.1.0"
 smoltcp = { version = "0.13.0", default-features = false, features = ["proto-ipv4", "proto-dhcpv4", "socket-raw", "socket-udp", "socket-dhcpv4", "multicast"] }
 static_cell = "2.1.1"
+wm8731 = "0.1.0"
+# Pad configuration for I2C SDA/SCL pull-ups (version matches the transitive
+# copy through `teensy4-bsp` so we share a single compiled instance).
+imxrt-iomuxc = "0.3"
 
 [dependencies.teensy4-bsp]
 version = "0.6"

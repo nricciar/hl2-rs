@@ -142,10 +142,32 @@ mod app {
     use teensy4_bsp as bsp;
 
     use super::{POLLER, cycles_now, ms_since, now_millis, poll_log};
-    use hl2_teensy::{display, radio, shared, spectrum};
+    use cortex_m::peripheral::DWT;
+    use hl2_teensy::{autoscale, display, i2c, radio, shared, spectrum};
     use imxrt_log as logging;
     use rtic_monotonics::systick::ExtU64;
     use rtic_monotonics::systick::Systick;
+
+    /// RT1062 pairs channel n with n+16, not all channels in one vector.
+    /// Channel 0 belongs to the display; channel 16 is unused.
+    #[task(binds = DMA0_DMA16, priority = 3)]
+    fn dma_irq(_cx: dma_irq::Context) {
+        shared::irq_fires_inc();
+        // SAFETY: render exclusively owns channel 0 and its DMA future.
+        unsafe {
+            bsp::hal::dma::DMA.on_interrupt(0);
+        }
+    }
+
+    /// Channel 1 belongs to audio; channel 17 is unused.
+    #[task(binds = DMA1_DMA17, priority = 3)]
+    fn audio_dma_irq(_cx: audio_dma_irq::Context) {
+        shared::audio_irq_fires_inc();
+        // SAFETY: audio_task exclusively owns channel 1 and its DMA future.
+        unsafe {
+            bsp::hal::dma::DMA.on_interrupt(1);
+        }
+    }
 
     /// Task-local type alias for the ILI9341 panel.
     type Panel = display::driver::Display;
@@ -167,11 +189,42 @@ mod app {
             pins,
             usb,
             lpspi4,
+            lpi2c1,
             ccm,
             ccm_analog,
             iomuxc_gpr,
+            mut dma,
+            sai1,
             ..
         } = board::t41(cx.device);
+
+        // eDMA channel for the ILI9341 pixel blit. USB (imxrt-usbd) on this
+        // chip is CPU-polled by the logger, so all 32 channels are free;
+        // channel 0 is the smallest index the RT1060's eDMA can address on
+        // any bus domain that can reach both OCRAM (source) and LPSPI4 TDR
+        // (destination).
+        let display_dma = dma[0].take().expect("dma channel 0 available");
+
+        // eDMA channel 1: the SAI1 → WM8731 I2S audio path. Same bus-domain
+        // argument as channel 0 (OCRAM source → SAI1 TDR[0] destination).
+        let audio_dma = dma[1].take().expect("dma channel 1 available");
+
+        // SAI1 pin mux (RT1060, Alt3):  P7 = TX_DATA00 (the one wire the
+        // SAI needs to shift our L = R mono out to the WM8731),  P20 =
+        // RX_SYNC (FSYNC in, driven by the WM8731 since it's the I2S
+        // master), P21 = RX_BCLK. prepare() sets mux, input enable and
+        // input daisies. init_tx routes these RX clocks internally to TX.
+        let mut p7 = pins.p7;
+        let mut p20 = pins.p20;
+        let mut p21 = pins.p21;
+        imxrt_iomuxc::sai::prepare(&mut p7);
+        imxrt_iomuxc::sai::prepare(&mut p20);
+        imxrt_iomuxc::sai::prepare(&mut p21);
+
+        // WM8731 supplies 64fs clocks: two 32-bit slots carrying 16-bit
+        // samples. BSP enables the SAI gate; the codec is configured below
+        // in radio_task before audio_task starts its first DMA transfer.
+        let sai_tx = hl2_teensy::audio::sai1::init_tx(sai1).expect("sai1 tx");
 
         let poller = logging::log::usbd(usb, logging::Interrupts::Disabled).unwrap();
         cortex_m::interrupt::free(|cs| POLLER.borrow(cs).replace(Some(poller)));
@@ -193,7 +246,7 @@ mod app {
         // Keep SPI fast enough that full-band blits fit within the watchdog.
         let cs = gpio2.output(pins.p10).expect("p10 is GPIO2");
         let dc = gpio2.output(pins.p9).expect("p9 is GPIO2");
-        let spi: board::Lpspi = board::lpspi(
+        let mut spi: board::Lpspi = board::lpspi(
             lpspi4,
             board::LpspiPins {
                 sdo: pins.p11,
@@ -202,17 +255,145 @@ mod app {
             },
             33_000_000,
         );
+        // Override: the HAL clamps sckdiv to >=4 (22 MHz). Push to 33 MHz
+        // (sckdiv=2: 132/(2+2)). ILI9341 max SPI is 50 MHz so this is safe.
+        spi.disabled(|d| {
+            d.set_clock_configs(bsp::hal::lpspi::ClockConfigs {
+                sckdiv: 2,
+                dbt: 0,
+                pcssck: 0,
+                sckpcs: 0,
+            })
+        });
 
-        // ILI9341 + red background so the operator knows the display is
-        // alive before the radio comes up.
+        // Construct the DMA-accelerated panel *before* the ILI9341 driver
+        // moves `spi` into itself, so `DmaDisplay::new` can bitwise-copy
+        // the `board::Lpspi` + CS pin out of a temporary `DisplaySpi`
+        // (which then keeps its own copy for the boot splash + status text).
+        // Build the DMA handle first: it bitwise-copies the LPSPI + CS + DC
+        // pins from their `&` references. The originals are then moved into
+        // the blocking `Display` (which owns them for the boot splash +
+        // status text).
+        let dma = display::driver::DmaDisplay::new(&spi, &cs, &dc, display_dma);
         let mut panel = display::driver::new_display(spi, cs, dc).expect("ILI9341 init");
         display::driver::fill_rect(&mut panel, 0, 0, 320, 240, 0xF800);
         display::driver::draw_text(&mut panel, 10, 10, 2, "HL2 TEENSY 4.1", 0x0000, 0xF800);
 
-        let _ = render::spawn(panel);
-        let _ = radio_task::spawn(ccm, ccm_analog, iomuxc_gpr);
+        let _ = render::spawn(panel, dma);
+        let _ = radio_task::spawn(ccm, ccm_analog, iomuxc_gpr, lpi2c1, pins.p19, pins.p18);
+        let _ = audio_task::spawn(audio_dma, sai_tx);
 
         (Shared {}, Local {})
+    }
+
+    /// Send 960-sample chunks (~20 ms), yielding while DMA runs. A 100 ms
+    /// timeout prevents missing clocks/completions from silently parking
+    /// audio forever. Radio and render continue while audio is waiting.
+    #[task(priority = 1)]
+    async fn audio_task(
+        _cx: audio_task::Context,
+        mut chan: bsp::hal::dma::channel::Channel,
+        mut tx: hl2_teensy::audio::sai1::Tx,
+    ) {
+        // Yield until `radio_task` finishes configuring the WM8731 and
+        // publishes `shared::AUDIO_READY = true`. Until that flag flips,
+        // the SAI (slave) has no BCLK/FSYNC to shift against and the
+        // eDMA-to-TDR transfer cannot complete — so the first chunk would
+        // `.await` indefinitely. Yielding here (not spinning at this
+        // task's priority, which would starve `radio_task`) lets the
+        // radio task run, bring up the codec, and only then flip the flag.
+        while !shared::audio_ready() {
+            Systick::delay(5.millis()).await;
+        }
+        log::info!("audio task: codec ready, first chunk starting");
+        log::info!("SAI1 TCR1..5,TCSR,RCR2,RCR4,RCSR={:08x?}", tx.reg_dump());
+        let (wfp, rfp) = tx.fifo_position();
+        shared::set_sai_status(tx.reg_dump()[5], wfp << 16 | rfp, 0);
+        poll_log();
+        // `ConstStaticCell::take()` is a one-shot, so acquire the stable
+        // SAI source buffer *here, once*; the eDMA's TCD references this
+        // address for the channel's lifetime. Same pattern as the display.
+        let stage = hl2_teensy::audio::sink::STAGE.take();
+        // Arm interrupt-on-completion once. The `audio_dma_irq` ISR fires
+        // `DMA.on_interrupt(1)` when the channel's DONE + INT bits are
+        // set, which wakes our registered waker (imxrt-dma stores it in
+        // `Channel::waker` and calls `waker.wake()` from `on_interrupt`).
+        chan.set_interrupt_on_completion(true);
+        let mut chunk_idx: u32 = 0;
+        loop {
+            let t0 = cycles_now();
+            let started_ms = now_millis();
+            let result = Systick::timeout_after(
+                100.millis(),
+                hl2_teensy::audio::sink::process_chunk(&mut chan, &mut tx, stage),
+            )
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                failure => {
+                    if let Ok(Err(e)) = failure {
+                        log::error!("audio DMA fault: {e}");
+                    } else {
+                        log::error!(
+                            "audio DMA timeout after 100 ms; check BCLK/LRCLK and DMA1 IRQ"
+                        );
+                    }
+                    let regs = tx.reg_dump();
+                    let (wfp, rfp) = tx.fifo_position();
+                    shared::set_sai_status(
+                        regs[5],
+                        wfp << 16 | rfp,
+                        ms_since(t0, cycles_now()) as u32,
+                    );
+                    // The DMA future has been dropped here: requests are
+                    // disabled, but SAI flags/FIFO positions remain useful.
+                    log::error!(
+                        "audio DMA after cleanup: irq={} wfp={} rfp={} SAI={:08x?}",
+                        shared::audio_irq_fires(),
+                        wfp,
+                        rfp,
+                        regs
+                    );
+                    poll_log();
+                    // Back off even for immediately-ready hardware faults.
+                    Systick::delay(1_000.millis()).await;
+                    continue;
+                }
+            }
+            chunk_idx = chunk_idx.wrapping_add(1);
+            // timeout_after polls DMA before its timer. A lost completion
+            // IRQ can therefore look successful when the timer finally
+            // wakes us; check elapsed time independently of the result.
+            let elapsed_ms = now_millis().wrapping_sub(started_ms);
+            if elapsed_ms >= 100 {
+                log::error!(
+                    "audio DMA completed late: {} ms, audio_irqs={}; check DMA1 IRQ delivery",
+                    elapsed_ms,
+                    shared::audio_irq_fires()
+                );
+                poll_log();
+                Systick::delay(1_000.millis()).await;
+                continue;
+            }
+            // Diagnostic: per-chunk wall time + how many total DMA IRQs
+            // have fired by now. If each chunk takes ~20 ms (960 samples
+            // @ 48 kHz) and `irq_fires` is incrementing, the SAI + eDMA
+            // are clocking and draining. If chunks take much longer than
+            // 20 ms, the SAI FIFO is backing up (likely the codec is
+            // *not* actually driving BCLK/FSYNC, or a config mismatch
+            // between the SAI frame and the codec's expected format).
+            if chunk_idx <= 3 || (chunk_idx % 50) == 0 {
+                let ms = ms_since(t0, cycles_now());
+                log::info!(
+                    "audio chunk #{} done in {} ms; audio_irqs={} sink_writes={} queued={}",
+                    chunk_idx,
+                    ms,
+                    shared::audio_irq_fires(),
+                    shared::audio_writes(),
+                    hl2_teensy::audio::ring::len(),
+                );
+            }
+        }
     }
 
     #[task]
@@ -221,9 +402,38 @@ mod app {
         mut ccm: bsp::ral::ccm::CCM,
         mut ccm_analog: bsp::ral::ccm_analog::CCM_ANALOG,
         mut iomuxc_gpr: bsp::ral::iomuxc_gpr::IOMUXC_GPR,
+        lpi2c1: bsp::ral::lpi2c::Instance<1>,
+        scl_pin: teensy4_bsp::pins::t41::P19,
+        sda_pin: teensy4_bsp::pins::t41::P18,
     ) {
         // Let USB-serial enumerate before MDIO.
         Systick::delay(2_000.millis()).await;
+        poll_log();
+
+        // I2C bus probe (LPI2C1, SDA=p18 / SCL=p19). The bus is held for
+        // the whole task; the temp sensor / audio codec will be polled
+        // here later.
+        let mut i2c_bus = i2c::init(lpi2c1, scl_pin, sda_pin);
+        i2c::scan(&mut i2c_bus);
+        poll_log();
+
+        // Only release audio_task after every codec register write succeeds.
+        if let Err(()) = hl2_teensy::audio::wm8731::init(&mut i2c_bus) {
+            log::error!(
+                "wm8731 init failed on 0x{:02X}",
+                hl2_teensy::audio::wm8731::WM8731_ADDR
+            );
+        } else {
+            log::info!(
+                "WM8731 configured (codec master, Teensy slave, 48 kHz, 16-bit in 32-bit slots)"
+            );
+            // Now (and only now) is the codec driving BCLK/FSYNC, so the SAI
+            // slave-TX has a clock and the eDMA to the SAI can actually
+            // complete. Release the audio task from its pre-activation yield
+            // gate *after* publishing the log line so the first chunk is
+            // guaranteed to come after this `poll_log` has flushed.
+            shared::set_audio_ready(true);
+        }
         poll_log();
 
         shared::set_state(shared::STATE_WAITING_IP);
@@ -246,22 +456,66 @@ mod app {
         };
 
         // 2. Build smoltcp Interface + SocketSet + socket handles.
+        log::info!("radio: Ethernet OK, now building smoltcp iface");
+        poll_log();
         let (mut iface, mut sockets, handles) = radio::control::build_iface_and_sockets(
             &mut device,
             radio::control::MAC,
             smoltcp::time::Instant::from_millis(now_millis()),
         );
+        log::info!("radio: iface + sockets OK");
+        poll_log();
 
         // 3. Pipeline.
+        log::info!("radio: now building spectrum pipeline");
+        poll_log();
+        // Diagnostic: bracket `Pipeline::new` with a wall-time + heap + audio
+        // counter snapshot. `Pipeline::new` is synchronous (no `.await`), so
+        // if it ever fails to return the *immediate* next log line
+        // ("now building Rx") never appears — the symptom we are chasing.
+        // The numbers below let us separate three possible causes:
+        //   * "took 40 ms"          → a trig/allocation cost (fine, not stuck)
+        //   * "heap grew 48 KB"     → normal (twiddles + win + buf_re/im + acc)
+        //   * "audio in=1 done=0"   → audio task parked on its 1st DMA (normal
+        //                            before BCLK) — *not* a busy loop
+        //   * "audio in=42 done=42" → audio is churning; if radio still stalls,
+        //                            it's a priority/preemption race, not a
+        //                            stack/allocation issue
+        let t_n0 = cycles_now();
+        let heap_n0 = crate::BUMP_OFF.load(core::sync::atomic::Ordering::Acquire);
+        let a_in_n0 = hl2_teensy::audio::sink::chunks_entered();
+        let a_done_n0 = hl2_teensy::audio::sink::chunks_completed();
         let mut pipeline = match spectrum::Pipeline::new() {
             Ok(p) => p,
             Err(e) => {
-                log::error!("pipeline init: {e}");
+                let ms = ms_since(t_n0, cycles_now());
+                log::error!("pipeline init: {e} after {ms} ms");
                 shared::set_state(shared::STATE_ERROR);
                 return;
             }
         };
+        {
+            // Keep the log line short (the imxrt-log ring buffer is 1024 B and
+            // silently drops writes that don't fit); use pure ASCII.
+            let ms = ms_since(t_n0, cycles_now());
+            let heap_kb =
+                (crate::BUMP_OFF.load(core::sync::atomic::Ordering::Acquire) - heap_n0) / 1024;
+            log::info!(
+                "Pipeline::new done in {}ms, heap +{}KB, in {}->{} done {}->{}",
+                ms,
+                heap_kb,
+                a_in_n0,
+                hl2_teensy::audio::sink::chunks_entered(),
+                a_done_n0,
+                hl2_teensy::audio::sink::chunks_completed(),
+            );
+        }
+        poll_log();
+        log::info!("radio: now building Rx (VirtualReceiver + Sink)");
+        poll_log();
         let mut rx = radio::Rx::new();
+        log::info!("radio: Rx + Sink built; entering wait-for-IP loop");
+        poll_log();
 
         // 4. Wait for IP. Poll every ~500 ms; also link-check.
         let mut link_up = false;
@@ -278,15 +532,28 @@ mod app {
             &handles,
         );
 
+        let mut wait_iter: u32 = 0;
         loop {
+            wait_iter += 1;
+            // Diagnostic: count the loop iterations so we can tell "loop
+            // isn't running" from "loop is running but link_up() keeps
+            // returning false". If wait_iter increments forever, the
+            // radio task has a slice every ~10 ms and the PHY is just
+            // never reporting link.
+            if wait_iter <= 3 || wait_iter % 100 == 0 {
+                log::info!("wait-ip iter #{}", wait_iter);
+            }
             let now_c = cycles_now();
             if !link_up && ms_since(last_link, now_c) >= 500 {
                 last_link = now_c;
                 match handle.dev.link_up() {
                     Ok(up) => {
+                        log::info!("link_up() = {}", if up { "up" } else { "down" });
                         if up != link_up {
                             link_up = up;
-                            log::info!("link: {}", if up { "up" } else { "down" });
+                            if up {
+                                log::info!("link is up, proceeding to DHCP...");
+                            }
                         }
                     }
                     Err(e) => log::error!("link check: {e}"),
@@ -311,12 +578,29 @@ mod app {
         // 5. Discovery (500 ms cadence until a valid reply).
         shared::set_state(shared::STATE_DISCOVERING);
         let mut last_disc = cycles_now();
+        // Liveness diagnostics: the discovery loop is silent by design (it
+        // only logs when it *receives* a reply), so "broadcasting forever"
+        // looks identical to "hung in a sync call" from the USB log alone.
+        // These counters + the render-task tick echo a heartbeat at ~2 Hz
+        // that tells us which:
+        //   * iter grows, sent grows, rc flat, rtk grows  → alive, waiting
+        //                                                       for HL2 reply
+        //   * iter grows, sent flat                        → 500 ms gate not
+        //                                                     firing (clock?)
+        //   * iter flat / rtk flat                         → scheduler or
+        //                                                     render starved
+        let mut disc_iter: u32 = 0;
+        let mut disc_sent: u32 = 0;
+        let mut disc_recv: u32 = 0;
+        let mut disc_last_hb = cycles_now();
         'discovery: loop {
+            disc_iter += 1;
             handle.set_now(smoltcp::time::Instant::from_millis(now_millis()));
             handle.pump();
             let mut dgram = [0u8; hl2::protocol::DISCOVERY_RESPONSE_SIZE + 16];
             // Drain until empty; a valid reply ends the loop.
             while let Some((n, src)) = handle.recv(&mut dgram) {
+                disc_recv += 1;
                 if n >= hl2::protocol::DISCOVERY_RESPONSE_SIZE {
                     if let Some(info) = handle.try_discovery(&dgram[..n]) {
                         // Discovery's stored IP can differ from its current DHCP lease.
@@ -339,7 +623,55 @@ mod app {
             let now_c = cycles_now();
             if ms_since(last_disc, now_c) >= 500 {
                 last_disc = now_c;
+                disc_sent += 1;
                 handle.send_discovery();
+            }
+            // ~2 Hz liveness heartbeat (see the counters declared above).
+            // Also carries the audio path state:
+            //   aud_wr = demod `Sink::write` calls so far (0 → no demod
+            //            output; > 0 → virtual receiver is producing)
+            //   in     = `process_chunk` calls = eDMA transfers attempted
+            //   done   = `process_chunk` calls that *completed* (the eDMA
+            //            IRQ fired and imxrt-dma reported success)
+            //   in-flight = in - done (should be ≤ 1: one single in-flight
+            //             in the single-channel DMA; > 1 = eDMA hung)
+            //   tcsr   = SAI TCSR status after the last DMA (bits: 0x800
+            //            = FIFO_REQUEST, 0x1000 = FIFO_WARNING, 0x2000
+            //            = FIFO_ERROR,   0x4000 = SYNC_ERROR,  0x8000 =
+            //            WORD_START). A slave SAI that is clocking should
+            //            show FIFO_REQUEST or FIFO_WARNING. A slave SAI
+            //            that is not clocking can show all-clear (FIFO
+            //            never filled enough to warn) or FIFO_ERROR
+            //            (underrun — the SAI tried to shift with an empty
+            //            FIFO).
+            //   wfp/rfp = SAI TX FIFO write / read positions at the instant
+            //            of the last DMA completion (32=full). wfp=32 rfp=0
+            //            = data is *in* the FIFO but not shifting; wfp≈rfp
+            //            = steady drain (chain is healthy end-to-end).
+            //   chunk_ms = wall milliseconds for the last completed eDMA
+            //            transfer (~20 ms = 1920 TDR words ÷ 48 kHz wire
+            //            rate; > 20 ms = SAI isn't shifting fast enough,
+            //            < 20 ms = it IS clocking and the eDMA just runs
+            //            at source rate).
+            if ms_since(disc_last_hb, cycles_now()) >= 500 {
+                disc_last_hb = cycles_now();
+                let in_c = hl2_teensy::audio::sink::chunks_entered() as u32;
+                let done_c = hl2_teensy::audio::sink::chunks_completed() as u32;
+                log::info!(
+                    "disc iter={} sent={} rec={} rtk={} | aud={} in={} done={} unfinished={} | sai_tcsr={:x} wfp={} rfp={} ms={}",
+                    disc_iter,
+                    disc_sent,
+                    disc_recv,
+                    shared::render_ticks(),
+                    shared::audio_writes(),
+                    in_c,
+                    done_c,
+                    in_c.saturating_sub(done_c),
+                    shared::sai_tcsr(),
+                    (shared::sai_tfr() >> 16) as u32,
+                    (shared::sai_tfr() & 0xFFFF) as u32,
+                    shared::sai_chunk_ms(),
+                );
             }
             Systick::delay(5.millis()).await;
             poll_log();
@@ -365,7 +697,33 @@ mod app {
         poll_log();
 
         let mut last_keepalive = cycles_now();
-        let mut seen_frame_seq: u32 = pipeline.frame_seq();
+        // S-meter + per-stage CPU% instrumentation.
+        //   * `last_row_pub` — the frame_seq at which we last republished the
+        //     row. The S-level is computed from the *same* `mags()` snapshot we
+        //     hand to the render task, so the meter and the waterfall agree.
+        //   * `cpu_*` — three workloads reported against the *same* 1-second
+        //     shared denominator (the one rolling wall window, in cycles):
+        //       * `demod` — EP6 baseband parse + the virtual-USB demod DSP,
+        //                   attributed by `Rx`'s DWT taps.
+        //       * `fft`   — the 2048-commit spectrum / S-meter window, also
+        //                   attributed by `Rx`'s DWT taps.
+        //       * `lcd`   — the render task's waterfall shift + colourise,
+        //                   accumulated on `shared::LCD_CYCLES` (the render
+        //                   task appends; we read + zero it here on the same
+        //                   second boundary).
+        //     Because a single core can't run two things at once,
+        //     demod + fft + lcd cannot sum past 100 — the whole point is
+        //     seeing *which* slice ate the CPU, not three independent 100s.
+        let mut last_row_pub: u32 = pipeline.frame_seq();
+        // Auto floor/ceil for the waterfall (UI `Shared::update_auto_scale`).
+        // Seeded to the UI's initial auto window; `recenter` snaps it to the
+        // first real frame's band instead of blending up from the seed.
+        let mut scale = autoscale::AutoScale::new();
+        scale.recenter();
+        let mut cpu_start: u32 = cycles_now();
+        let mut window_start: u64 = rx.demod_cycles();
+        let mut fft_start: u64 = rx.fft_cycles();
+
         loop {
             handle.set_now(smoltcp::time::Instant::from_millis(now_millis()));
 
@@ -383,12 +741,47 @@ mod app {
 
             // Publish only completed FFT frames, coalescing to the latest row.
             let cur_seq = pipeline.frame_seq();
-            if cur_seq != seen_frame_seq {
-                seen_frame_seq = cur_seq;
+            if cur_seq != last_row_pub {
+                last_row_pub = cur_seq;
                 shared::publish(pipeline.mags());
+                // The S-meter is a spectrum consumer (PROTOCOL.md §16.3e) — the
+                // same 320-bin row the render task blits. Compute it here, off
+                // the render path, so the render task just paints.
+                let m = hl2_teensy::smeter::compute(pipeline.mags());
+                shared::set_slevel(m.sunits, m.margin_db);
+                // Auto floor/ceil: advance the window from the *same* row and
+                // publish it so the render task's `bin_color` ramps the live
+                // band (only the top row repaints; prior rows keep their ramp).
+                if scale.step(pipeline.mags()) {
+                    let (f, c) = scale.scale();
+                    shared::set_scale(f, c);
+                }
             }
 
+            // Roll the CPU window forward every ~1 s and publish all three
+            // shares against the *same* shared wall (the one rolling window
+            // in cycles). The demod / fft deltas come from `Rx`'s DWT taps;
+            // the lcd delta is accumulated cross-task on `shared::LCD_CYCLES`.
+            // On one core they cannot overlap, so each is ≤ 100 and the sum
+            // is the honest total CPU busy fraction (≤ 100).
             let now_c = cycles_now();
+            if ms_since(cpu_start, now_c) >= 1_000 {
+                // Shared wall = the rolling window's total elapsed cycles
+                // (the 1-second denominator both tasks' work is measured
+                // against — *not* each task's own busy wall, which is how
+                // the three 100s happened).
+                let wall = u64::from(now_c.wrapping_sub(cpu_start));
+                shared::publish_cpu_stages(
+                    rx.demod_cycles() - window_start,
+                    rx.fft_cycles() - fft_start,
+                    shared::take_lcd_cycles(),
+                    wall,
+                );
+                window_start = rx.demod_cycles();
+                fft_start = rx.fft_cycles();
+                cpu_start = now_c;
+            }
+
             if ms_since(last_keepalive, now_c) >= radio::control::KEEPALIVE_INTERVAL_MS_CONST {
                 last_keepalive = now_c;
                 handle.send_keepalive();
@@ -399,8 +792,21 @@ mod app {
         }
     }
 
-    #[task]
-    async fn render(_cx: render::Context, mut panel: Panel) {
+    /// DMA-accelerated waterfall blit, task-local (owned by the `render`
+    /// task). See `display::driver::DmaDisplay` for the bitwise-copy
+    /// safety argument behind sharing the LPSPI + GPIO bits with the
+    /// blocking `Display` (which owns the original handles).
+    type Dma = display::driver::DmaDisplay;
+
+    /// Priority 1 (> the default 0 used by `radio_task`), so that when a
+    /// DMA chunk's completion IRQ wakes a suspended `render` continuation
+    /// the RTIC scheduler is allowed to **preempt** `radio_task` — letting
+    /// the ~150 × 125 µs blit chunks run back-to-back without queueing
+    /// behind `radio_task`'s ~200 ms blocking FFT/demod/AGC slices.
+    /// Without this inversion fix, every render `.await` that landed
+    /// inside one of those blocking slices stalled ~200 ms.
+    #[task(priority = 1)]
+    async fn render(_cx: render::Context, mut panel: Panel, mut dma: Dma) {
         let fb = WF.take();
 
         // Boot: fill black (covers the red "HL2 TEENSY" splash), draw the
@@ -417,14 +823,54 @@ mod app {
         );
         let mut status_label = display::driver::TextLine::<9>::new();
         let mut status_detail = display::driver::TextLine::<32>::new();
+        let mut status_meter = display::driver::TextLine::<16>::new();
+        let mut status_cpu = display::driver::TextLine::<32>::new();
 
         let mut painted_seq: u32 = 0;
         let mut last_state: u32 = u32::MAX;
         let mut last_peer: u32 = u32::MAX;
         let mut last_status_ms: i64 = now_millis();
+        let mut last_heartbeat_ms: i64 = 0;
+        let mut heartbeat_count: u32 = 0;
 
         loop {
             poll_log();
+            // Liveness: bump the cross-task render counter *first thing* each
+            // iteration so the radio task's discovery heartbeat can echo it.
+            // A flat value while the radio task is still logging proves the
+            // render task (and possibly the scheduler) has stopped running.
+            shared::render_tick();
+
+            // Out-of-band heartbeat (100 ms cadence). This runs *while* the
+            // radio task is blocked in a synchronous section (e.g. inside
+            // `Pipeline::new`), so it tells us *which* step of that section
+            // the main thread is currently executing. Also samples the
+            // audio counters, so we learn — from a different task's vantage
+            // point — whether the audio task is churning (enter == done
+            // and both growing) or parked (enter == 1, done == 0).
+            // Only log while the radio task is mid-build (step 0..=5) or during
+            // the first few beats; once `Pipeline::new` has returned (step == 6)
+            // and the first beats have elapsed, the heartbeat goes quiet so it
+            // doesn't flood the log in steady state. Its job is to reveal, from
+            // a *running* priority-1 task, exactly which step the priority-0
+            // `radio_task` is stuck on in `Pipeline::new` — a frozen
+            // `pipeline_new_step` value is the smoking gun.
+            let hb_now = now_millis();
+            let pstep = hl2_teensy::spectrum::pipeline_new_step();
+            if (hb_now - last_heartbeat_ms) >= 100 {
+                last_heartbeat_ms = hb_now;
+                heartbeat_count += 1;
+                if heartbeat_count <= 3 || pstep != 6 {
+                    log::info!(
+                        "render hb #{}: pipeline_new_step={} audio enter={} done={} dma_irqs={}",
+                        heartbeat_count,
+                        pstep,
+                        hl2_teensy::audio::sink::chunks_entered(),
+                        hl2_teensy::audio::sink::chunks_completed(),
+                        shared::irq_fires(),
+                    );
+                }
+            }
 
             let (seq, row) = shared::latest();
             let st = shared::state();
@@ -444,15 +890,35 @@ mod app {
                 let rows = display::WF_ROWS;
                 let total = cols * rows;
 
-                // 1. shift down in RAM (newest → top row).
+                // The auto floor/ceil window for the ramp (the radio task
+                // publishes it each frame; the seed before the first frame).
+                let (floor, ceil) = shared::scale();
+
+                // 1. shift down in RAM (newest → top row). The shift + the
+                //    colourise below *is* the *lcd* CPU stage for the status
+                //    readout — the DWT delta is appended to the shared
+                //    accumulator the radio task drains on its 1-second rollover
+                //    (same shared wall as demod / fft). The eDMA blit below is
+                //    offloaded to the engine and is *not* counted as CPU.
+                let c0 = DWT::cycle_count();
                 fb.copy_within(..total - cols, cols);
-                // 2. new row at the top.
+                // 2. new row at the top, ramped by the auto floor/ceil window.
                 for (i, px) in fb[..cols].iter_mut().enumerate() {
-                    *px = display::palette::bin_color(row.get(i).copied().unwrap_or(0u16));
+                    *px = display::palette::bin_color(
+                        row.get(i).copied().unwrap_or(0u16),
+                        floor,
+                        ceil,
+                    );
                 }
-                panel
-                    .draw_raw_slice(0, 0, (cols as u16) - 1, (rows as u16) - 1, &fb[..total])
-                    .expect("waterfall draw");
+                shared::add_lcd_cycles(u64::from(DWT::cycle_count().wrapping_sub(c0)));
+                // 3. Blit the band via eDMA. This hands the pixel work over
+                //    to the eDMA engine (which drives the LPSPI TDR while
+                //    the panel clocks in the bytes), so the CPU is free to
+                //    poll the radio's MAC ring between chunks — the exact
+                //    "we're not stalling the network" win the DMA path was
+                //    meant to buy.
+                dma.draw_pixels(0, 0, (cols as u16) - 1, (rows as u16) - 1, &fb[..total])
+                    .await;
                 painted_seq = seq;
                 // Let the radio drain its MAC ring before further SPI work.
                 Systick::delay(1.millis()).await;
@@ -466,18 +932,27 @@ mod app {
                 last_state = st;
                 last_peer = peer_u32;
                 last_status_ms = now_ms;
-                status_redraw(&mut panel, &mut status_label, &mut status_detail);
+                status_redraw(
+                    &mut panel,
+                    &mut status_label,
+                    &mut status_detail,
+                    &mut status_meter,
+                    &mut status_cpu,
+                );
             }
 
             Systick::delay(2.millis()).await;
         }
     }
 
-    /// Update only changed status characters, including the live RX counter.
+    /// Update only changed status characters, including the live RX counter
+    /// and the per-stage CPU readout.
     fn status_redraw(
         panel: &mut Panel,
         status_label: &mut display::driver::TextLine<9>,
         status_detail: &mut display::driver::TextLine<32>,
+        status_meter: &mut display::driver::TextLine<16>,
+        status_cpu: &mut display::driver::TextLine<32>,
     ) {
         let label = match shared::state() {
             shared::STATE_WAITING_IP => "WAIT IP",
@@ -505,5 +980,72 @@ mod app {
         write!(w, " F {}", shared::frames()).unwrap();
         let line_s = core::str::from_utf8(&w.target[..w.pos]).unwrap();
         status_detail.update(panel, 6, wf_y + 30, line_s, 0xF800, 0x0000);
+
+        // S-meter readout. The bar is `S1..S9` (one segment per unit), the
+        // raw dB-over-floor margin to its right. The bar sits below the
+        // state label / IP/F counter row; the CPU split is on its own row
+        // further down (see `status_cpu` at the end of this fn).
+        //
+        // `fill_rect(display, x, y, w, h, color)` — the last 4 args are
+        // width/height, NOT x2/y2.
+        let s = shared::slevel();
+        let margin = shared::smargin_db();
+        let bar_y = wf_y + 14u16;
+        let seg_w = 8u16;
+        let seg_h = 8u16;
+        let x0 = 6u16;
+        for i in 0..9u16 {
+            let x = x0 + (i as u32 * ((seg_w + 1) as u32)) as u16;
+            let on = (i as u8 + 1) <= s;
+            let fg: u16 = if on { 0xFFFF } else { 0x4020 };
+            display::driver::fill_rect(panel, x, bar_y, seg_w, seg_h, fg);
+        }
+
+        // Right of the bar: "S{n} +{N} dB" (≤ 12 cells), same row as the bar.
+        // The `TextLine<16>` is 96 px wide — plenty for "S9 +54 dB".
+        let mut meter = [0u8; 16];
+        let mut w2 = radio::control::WriteBuf {
+            target: &mut meter,
+            pos: 0,
+        };
+        if s == 0 {
+            let _ = write!(w2, "S0 +{:.0} dB", margin);
+        } else {
+            let _ = write!(w2, "S{s} +{:.0} dB", margin);
+        }
+        let meter_s = core::str::from_utf8(&w2.target[..w2.pos]).unwrap();
+        let meter_x = x0 + (9u16 * (seg_w + 1) as u16) + 2u16;
+        status_meter.update(panel, meter_x, bar_y, meter_s, 0xF800, 0x0000);
+
+        // CPU split, on its own row **below the frequency line** (the "7.074 MHz…"
+        // line drawn at boot at `WF_ROWS + 76`). The three stages are the
+        // pipeline's three workloads, each reported as a percent (≤ 100) on its
+        // *own* task's rolling 1-second window:
+        //   * D — demod: EP6 baseband parse + virtual-USB demod  (radio task)
+        //   * F — fft:   the 2048-commit spectrum / S-meter window (radio task)
+        //   * L — lcd:   the waterfall shift + colourise           (render task)
+        // They run on one shared core, so the three can each read ~100 and
+        // overlap — that's the honest "what's eating the CPU" number.
+        let mut cpu = [0u8; 32];
+        let mut w3 = radio::control::WriteBuf {
+            target: &mut cpu,
+            pos: 0,
+        };
+        let _ = write!(
+            w3,
+            "CPU D:{:03} F:{:03} L:{:03} %",
+            shared::cpu_demod_pct(),
+            shared::cpu_fft_pct(),
+            shared::cpu_lcd_pct(),
+        );
+        let cpu_s = core::str::from_utf8(&w3.target[..w3.pos]).unwrap();
+        status_cpu.update(
+            panel,
+            6,
+            display::WF_ROWS as u16 + 85,
+            cpu_s,
+            0xF800,
+            0x0000,
+        );
     }
 }

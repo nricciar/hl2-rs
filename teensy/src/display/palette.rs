@@ -52,10 +52,19 @@ pub fn frac_to_rgb565(frac: f32) -> u16 {
     }
 }
 
-/// A u16 magnitude → RGB565 (using the floor/ceil above).
+/// A u16 magnitude → RGB565 for an *explicit* dB window `[floor, ceil]`.
+/// Everything below `floor` is black, everything at/above `ceil` is red, and
+/// the band in between spreads across the black/blue/green/yellow/red ramp.
+///
+/// The window is normally the auto-scale's current `(floor, ceil)` (see
+/// `crate::autoscale`), seeded at (−85, −15) before the first frame lands.
+/// [`LOG_FLOOR`]/[`LOG_CEIL`] are the clamps `lin_to_db` uses for the
+/// magnitude→dB mapping — *not* the render window.
+/// `db_to_frac` (and `frac_to_rgb565`) clamp to 0..1, so a degenerate window
+/// (`ceil ≤ floor`) just yields black/red — never a panic or NaN.
 #[inline]
-pub fn bin_color(mag: u16) -> u16 {
-    frac_to_rgb565(db_to_frac(lin_to_db(mag), LOG_FLOOR, LOG_CEIL))
+pub fn bin_color(mag: u16, floor: f32, ceil: f32) -> u16 {
+    frac_to_rgb565(db_to_frac(lin_to_db(mag), floor, ceil))
 }
 
 #[cfg(test)]
@@ -65,8 +74,32 @@ mod tests {
     /// A strong carrier maps to a non-black colour; the floor is black.
     #[test]
     fn peak_is_visible_and_floor_is_black() {
-        assert_ne!(bin_color(60000), 0, "strong signal should not be black");
-        assert_eq!(bin_color(0), 0, "floor should be black");
+        let (floor, ceil) = (LOG_FLOOR, LOG_CEIL);
+        assert_ne!(
+            bin_color(60000, floor, ceil),
+            0,
+            "strong signal should not be black"
+        );
+        assert_eq!(bin_color(0, floor, ceil), 0, "floor should be black");
+    }
+
+    /// Centering the window on a carrier's own level lifts it off the floor:
+    /// the same magnitude is black in a window whose floor sits on it, but
+    /// mid-ramp in a window centred on it — the whole point of auto floor/ceil
+    /// is to spread the *live* band across the ramp.
+    #[test]
+    fn window_centering_lifts_a_carrier() {
+        let mag = 60_000u16;
+        let db = lin_to_db(mag); // the carrier's own level
+        // A wide window whose floor sits on the carrier → it is black.
+        let black = bin_color(mag, db, db + 80.0);
+        // A window centred on the carrier's level → it is mid-ramp.
+        let lifted = bin_color(mag, db - 5.0, db + 5.0);
+        assert_eq!(black, 0, "a carrier on the window floor should be black");
+        assert!(
+            u32::from(lifted) > u32::from(black),
+            "centering should lift the carrier: {black:#06x} → {lifted:#06x}"
+        );
     }
 
     #[test]

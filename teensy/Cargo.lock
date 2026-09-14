@@ -337,8 +337,10 @@ dependencies = [
  "hl2",
  "ili9341",
  "imxrt-enet",
+ "imxrt-iomuxc",
  "imxrt-log",
  "log",
+ "num-complex",
  "num-traits",
  "rtic",
  "rtic-monotonics",
@@ -346,6 +348,7 @@ dependencies = [
  "static_cell",
  "teensy4-bsp",
  "teensy4-panic",
+ "wm8731",
 ]
 
 [[package]]
@@ -790,3 +793,9 @@ checksum = "de437e2a6208b014ab52972a27e59b33fa2920d3e00fe05026167a1c509d19cc"
 dependencies = [
  "vcell",
 ]
+
+[[package]]
+name = "wm8731"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d8e680c4702213927ba011466a00af42a6f09272bf45f8571f3552e94ad62a8"

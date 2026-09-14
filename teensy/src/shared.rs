@@ -45,6 +45,158 @@ pub fn frames() -> u32 {
     FRAMES.load(Ordering::Relaxed)
 }
 
+/// The virtual receiver's S-meter reading, an S1..S9 index (0 = below S1).
+/// Set by the radio task from the spectrum passband-over-floor margin; read
+/// by the render task to paint the S1-S9 bar. See `crate::smeter`.
+static SLEVEL: AtomicU32 = AtomicU32::new(0);
+
+/// The raw signal-over-noise margin (dB) behind the S-unit reading
+/// (`level - floor`, scale-independent). Stored as `f32` bits so the render
+/// task can show "+N dB" next to the bar.
+static SMARGIN: AtomicU32 = AtomicU32::new(0.0f32.to_bits());
+
+/// The auto floor/ceil (dB) window for the waterfall colour ramp.
+///
+/// The `radio` task advances `crate::autoscale::AutoScale` once per spectrum
+/// frame and publishes the resulting window here; the `render` task feeds it to
+/// `display::palette::bin_color` so the ramp tracks the live band. Stored as
+/// two `f32` bit patterns (`AtomicU32` — `f32::to_bits()`/`from_bits()`, the
+/// same trick as [`SMARGIN`]) so the read is lock-free across tasks. Seeded at
+/// the `AutoScale` seed (−85/−15) so the very first render before a frame has
+/// landed uses the full UI default window.
+static SCALE_FLOOR: AtomicU32 = AtomicU32::new((-85.0f32).to_bits());
+static SCALE_CEIL: AtomicU32 = AtomicU32::new((-15.0f32).to_bits());
+
+/// Publish the current auto floor/ceil (dB) window for the render task.
+pub fn set_scale(floor_db: f32, ceil_db: f32) {
+    SCALE_FLOOR.store(floor_db.to_bits(), Ordering::Relaxed);
+    SCALE_CEIL.store(ceil_db.to_bits(), Ordering::Release);
+}
+
+/// The current auto floor/ceil (dB) window; initially (−85, −15).
+pub fn scale() -> (f32, f32) {
+    (
+        f32::from_bits(SCALE_FLOOR.load(Ordering::Acquire)),
+        f32::from_bits(SCALE_CEIL.load(Ordering::Acquire)),
+    )
+}
+
+/// Published per-stage CPU shares, each 0..=100, for the status line.
+///
+/// The pipeline's three workloads are reported as a fraction of the shared
+/// rolling 1-second window on **the one core the whole system runs on**:
+///   * demod — EP6 baseband parse + the virtual-USB receiver's DSP (radio task)
+///   * fft   — the 2048-commit spectrum window (radio task)
+///   * lcd   — the waterfall RAM shift + colourise (render task)
+///
+/// On a single core, demod + fft + lcd + idle = 1 second, so the three
+/// percentages should sum to ≈ the total CPU busy fraction (≤ 100). This is
+/// why all three are measured against the same denominator (1 s in cycles),
+/// not against each task's own busy wall.
+static CPU_DEMOD_PCT: AtomicU32 = AtomicU32::new(0);
+static CPU_FFT_PCT: AtomicU32 = AtomicU32::new(0);
+static CPU_LCD_PCT: AtomicU32 = AtomicU32::new(0);
+
+/// Cross-task DWT accumulator for the *lcd* stage (waterfall shift + colourise).
+/// The render task appends its per-iteration cycle delta; the radio task
+/// takes the accumulated value on each 1-second rollover and publishes it.
+/// Uses `Mutex<RefCell<u64>>` (matching `SNAPSHOT`'s pattern) rather than
+/// `AtomicU64` (not guaranteed on 32-bit thumbv7).
+static LCD_CYCLES: Mutex<RefCell<u64>> = Mutex::new(RefCell::new(0));
+
+/// Add `delta` cycles to the shared *lcd* accumulator.
+pub fn add_lcd_cycles(delta: u64) {
+    interrupt::free(|cs| *LCD_CYCLES.borrow(cs).borrow_mut() += delta);
+}
+
+/// Take-and-zero the shared *lcd* accumulator. The radio task calls this on
+/// each 1-second rollover so the three published shares share the same wall.
+pub fn take_lcd_cycles() -> u64 {
+    interrupt::free(|cs| {
+        let mut acc = LCD_CYCLES.borrow(cs).borrow_mut();
+        let v = *acc;
+        *acc = 0;
+        v
+    })
+}
+
+/// Publish the S1..S9 index + the raw dB margin the render task displays.
+pub fn set_slevel(sunits: u8, margin_db: f32) {
+    SLEVEL.store(u32::from(sunits), Ordering::Release);
+    SMARGIN.store(margin_db.to_bits(), Ordering::Release);
+}
+
+/// The current S1..S9 index (or 0).
+pub fn slevel() -> u8 {
+    SLEVEL.load(Ordering::Acquire) as u8
+}
+
+/// The raw dB-over-floor margin (0.0 until the first reading).
+pub fn smargin_db() -> f32 {
+    f32::from_bits(SMARGIN.load(Ordering::Acquire))
+}
+
+pub fn set_cpu_demod_pct(pct: u32) {
+    CPU_DEMOD_PCT.store(pct.min(100), Ordering::Release);
+}
+
+pub fn set_cpu_fft_pct(pct: u32) {
+    CPU_FFT_PCT.store(pct.min(100), Ordering::Release);
+}
+
+pub fn set_cpu_lcd_pct(pct: u32) {
+    CPU_LCD_PCT.store(pct.min(100), Ordering::Release);
+}
+
+/// One shot: publish all three shares as a fraction of `wall` cycles (the
+/// rolling 1-second window on the shared core). Called by the radio task at
+/// rollover — `lcd_cycles` is the accumulated render-task work (shift +
+/// colourise) that has happened so far this window.
+pub fn publish_cpu_stages(demod_cycles: u64, fft_cycles: u64, lcd_cycles: u64, wall: u64) {
+    if wall == 0 {
+        set_cpu_demod_pct(0);
+        set_cpu_fft_pct(0);
+        set_cpu_lcd_pct(0);
+        return;
+    }
+    // `busy / wall * 100`, integer math. `busy` is always ≤ `wall` (a
+    // sub-interval), so `100 * busy` ≤ `100 * wall` and the .min(100) is a
+    // safety clamp for integer-truncation edge cases.
+    let pct = |busy: u64| -> u32 { (((100u64 * busy) / wall).min(100)) as u32 };
+    set_cpu_demod_pct(pct(demod_cycles));
+    set_cpu_fft_pct(pct(fft_cycles));
+    set_cpu_lcd_pct(pct(lcd_cycles));
+}
+
+/// Diagnostic: increment the counter for each DMA completion interrupt.
+/// The `dma_irq` ISR in `main.rs` bumps this on every DMA0_DMA16 vector
+/// entry. `draw_pixels` samples the delta across a blit to see how many
+/// chunks actually completed and raised their IRQ.
+///
+/// Uses `AtomicUsize` (not `AtomicU32`) to survive both `#[no_std]`
+/// cortex-m and 32-bit pointer arithmetic without an extra import.
+static IRQ_FIRES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+pub fn irq_fires() -> usize {
+    IRQ_FIRES.load(core::sync::atomic::Ordering::Acquire)
+}
+
+pub fn irq_fires_inc() {
+    IRQ_FIRES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn cpu_demod_pct() -> u32 {
+    CPU_DEMOD_PCT.load(Ordering::Acquire)
+}
+
+pub fn cpu_fft_pct() -> u32 {
+    CPU_FFT_PCT.load(Ordering::Acquire)
+}
+
+pub fn cpu_lcd_pct() -> u32 {
+    CPU_LCD_PCT.load(Ordering::Acquire)
+}
+
 /// Publish one complete waterfall row and advance the wrapping sequence.
 pub fn publish(row: &[u16]) {
     assert_eq!(row.len(), BINS, "publish requires a complete row");
@@ -86,4 +238,77 @@ pub fn peer() -> Option<core::net::Ipv4Addr> {
         (p >> 8) as u8,
         p as u8,
     ))
+}
+
+/// Codec configuration writes succeeded. This is not proof of clocks on
+/// the pins; audio_task verifies progress using bounded DMA waits.
+static AUDIO_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// `radio_task` calls this once, after `wm8731::init` has ACK'd across I2C.
+pub fn set_audio_ready(ready: bool) {
+    AUDIO_READY.store(ready, Ordering::Release);
+}
+
+/// `audio_task` reads this before `process_chunk`; `false` → yield first.
+pub fn audio_ready() -> bool {
+    AUDIO_READY.load(Ordering::Acquire)
+}
+
+/// Cross-task liveness counter: the `render` task bumps this once per loop
+/// iteration. Other tasks echo it in their own logs, so a *frozen* value
+/// while another task is still logging proves the scheduler/render task has
+/// stopped running (versus "everything is alive, just waiting on the wire").
+static RENDER_TICKS: AtomicU32 = AtomicU32::new(0);
+
+/// `render` calls this once per loop iteration.
+pub fn render_tick() {
+    RENDER_TICKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The current render-task loop count.
+pub fn render_ticks() -> u32 {
+    RENDER_TICKS.load(Ordering::Relaxed)
+}
+
+/// Last raw SAI TCSR and FIFO positions, sampled at audio startup, successful
+/// DMA completion, or failure. These are snapshots, not live registers.
+static SAI_TCSR: AtomicU32 = AtomicU32::new(0);
+static SAI_TFR: AtomicU32 = AtomicU32::new(0); // (WFP << 16) | RFP
+static SAI_CHUNK_MS: AtomicU32 = AtomicU32::new(0);
+
+pub fn set_sai_status(tcsr: u32, tfr: u32, chunk_ms: u32) {
+    SAI_TCSR.store(tcsr, Ordering::Relaxed);
+    SAI_TFR.store(tfr, Ordering::Relaxed);
+    SAI_CHUNK_MS.store(chunk_ms, Ordering::Relaxed);
+}
+pub fn sai_tcsr() -> u32 {
+    SAI_TCSR.load(Ordering::Relaxed)
+}
+pub fn sai_tfr() -> u32 {
+    SAI_TFR.load(Ordering::Relaxed)
+}
+pub fn sai_chunk_ms() -> u32 {
+    SAI_CHUNK_MS.load(Ordering::Relaxed)
+}
+
+/// Radio task (demod): count of `AudioSink::write` calls so far. Diagnostic
+/// only — proves the virtual receiver is actively producing audio (versus
+/// silent — e.g. an AGC stuck at 0).
+static AUDIO_WRITES: AtomicU32 = AtomicU32::new(0);
+
+pub fn audio_writes_bump() {
+    AUDIO_WRITES.fetch_add(1, Ordering::Relaxed);
+}
+pub fn audio_writes() -> u32 {
+    AUDIO_WRITES.load(Ordering::Relaxed)
+}
+
+static AUDIO_IRQ_FIRES: AtomicU32 = AtomicU32::new(0);
+
+pub fn audio_irq_fires_inc() {
+    AUDIO_IRQ_FIRES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn audio_irq_fires() -> u32 {
+    AUDIO_IRQ_FIRES.load(Ordering::Relaxed)
 }

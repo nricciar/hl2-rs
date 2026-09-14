@@ -49,8 +49,11 @@ pub use hl2::{
 };
 pub use protocol::data::{BasebandChunk, IQBlock};
 pub use protocol::discovery::DiscoveryInfo;
+pub use protocol::session::{DatagramKind, Session};
 /// Per-slot EP6 baseband fan-out (one [`BasebandRing`] per active slot).
-#[cfg(all(feature = "std", feature = "dsp"))]
+/// `std`-flavoured multi-reader `Arc` API or a `no_std` single-owner `&mut` API,
+/// depending on whether `std` is on; either way it's `dsp`-available.
+#[cfg(feature = "dsp")]
 pub use receiver::fanout::BasebandFanout;
 
 /// RX LNA gain register + default (dB). See PROTOCOL.md §11.3.

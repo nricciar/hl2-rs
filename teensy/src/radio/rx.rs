@@ -6,10 +6,17 @@
 //! pipeline directly. Parser buffers allocate on the first valid chunk
 //! and are retained even across malformed EP6 packets.
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use num_complex::Complex;
+
+use cortex_m::peripheral::DWT;
+
 use hl2::protocol::data::{
     BasebandChunk, HEADER_SIZE, parse_baseband_chunk_into, parse_data_header,
 };
 use hl2::protocol::{CHUNK_SIZE, DATA_PACKET_SIZE, ENDPOINT_DATA_TX};
+use hl2::receiver::VirtualReceiver;
 
 use crate::spectrum::Pipeline;
 
@@ -17,15 +24,63 @@ use crate::spectrum::Pipeline;
 pub struct Rx {
     /// Fixed slots prevent malformed frames from dropping bump-allocated buffers.
     baseband: [BasebandChunk; 2],
+    /// The virtual USB-SSB receiver (offset 0) — the *same* demod pipeline as
+    /// the UI (`Mode::Ssb(Usb)`, 96 kSps → 2.6 kHz channel select → 4.8 kHz
+    /// audio). Built on [`hl2::ReceiverConfig::default()`] so it mirrors the
+    /// UI receiver exactly. It runs so the demod is exercised at CPU speed and
+    /// its cost is surfaced (see the radio task's CPU% readout); its audio is
+    /// routed through the I2S path (`crate::audio::sink::Sink`) → SAI1 → WM8731
+    /// (see `crate::audio` and the "Audio output" note in PROTOCOL.md §2 / §16).
+    vrx: VirtualReceiver,
+    /// Reused I/Q block handed to the virtual receiver each frame. Held as a
+    /// field (not a per-call local) because the heap is a no_std bump arena
+    /// that never frees — `clear()`, don't reallocate.
+    iq_acc: Vec<Complex<f32>>,
+    /// Cumulative DWT cycles spent parsing the EP6 baseband + accumulating
+    /// the passband samples into the spectrum pipeline. The *demod* stage of
+    /// the CPU readout (see `crate::shared::set_cpu_demod_pct`).
+    demod_cycles: u64,
+    /// Cumulative DWT cycles spent committing the FFT windows (the
+    /// `mags`/S-meter compute inside `Pipeline::push` once a full
+    /// `N_FFT`-sample window arrives). The *FFT* stage of the CPU readout.
+    fft_cycles: u64,
 }
 
 impl Rx {
     pub fn new() -> Self {
+        // USB-SSB, offset 0, 96 kSps, 2.6 kHz, 4.8 kHz audio — the `hl2`
+        // crate's default receiver config, so the Teensy's virtual receiver is
+        // byte-for-byte the same DSP the UI drives. Audio is routed through
+        // the I2S path (`audio::sink::Sink`) → WM8731; the S-meter is a
+        // spectrum consumer (see `crate::smeter`).
+        let sink = Box::new(crate::audio::sink::Sink::new());
+        let vrx = VirtualReceiver::new(Default::default(), sink)
+            .expect("virtual USB receiver at offset 0");
         Self {
             baseband: core::array::from_fn(|_| BasebandChunk {
                 per_rx: alloc::vec::Vec::new(),
             }),
+            vrx,
+            iq_acc: Vec::new(),
+            demod_cycles: 0,
+            fft_cycles: 0,
         }
+    }
+
+    /// Cumulative DWT cycles spent in the *demod* stage (EP6 baseband parse +
+    /// per-sample passband accumulate + the virtual-receiver demod). Monotonic
+    /// (u64, wraps at 2²⁶⁴); the radio task publishes the per-second delta as
+    /// a percent of the wall window (see `crate::shared::set_cpu_demod_pct`).
+    pub fn demod_cycles(&self) -> u64 {
+        self.demod_cycles
+    }
+
+    /// Cumulative DWT cycles spent committing the spectrum FFT windows
+    /// (`Pipeline::push` once a full `N_FFT`-sample window arrives — the
+    /// `mags`/S-meter compute). Monotonic; the radio task publishes the
+    /// per-second delta (see `crate::shared::set_cpu_fft_pct`).
+    pub fn fft_cycles(&self) -> u64 {
+        self.fft_cycles
     }
 
     /// Consume one 1032-byte datagram. Returns the number of complex I/Q
@@ -44,7 +99,13 @@ impl Rx {
             return 0;
         }
         // One I/Q pair per record, per chunk; 63 per chunk at n_recv = 1,
-        // 2 chunks per frame → 126 pair/frame in steady state.
+        // 2 chunks per frame → 126 pair/frame in steady state. Each `push`
+        // either just accumulates a sample into the `N_FFT`-window (cost:
+        // one vector append — the *demod* stage) or, once every `N_FFT`
+        // samples, commits the window (cost: mean/window/FFT/max-pool — the
+        // *FFT* stage). The DWT taps below attribute each call to the one
+        // that actually dominated (a new `frame_seq` appeared → FFT bucket,
+        // otherwise demod).
         let mut pushed = 0usize;
         for (bytes, chunk) in datagram[HEADER_SIZE..]
             .chunks_exact(CHUNK_SIZE)
@@ -53,12 +114,32 @@ impl Rx {
             if !parse_baseband_chunk_into(bytes.try_into().expect("chunk size"), 1, chunk) {
                 continue;
             }
+            self.iq_acc.clear();
             for rx in chunk.per_rx.iter().take(1) {
                 for c in rx.iter() {
+                    let seq_before = pipeline.frame_seq();
+                    let t0 = DWT::cycle_count();
+                    // Waterfall spectrum (unchanged path).
                     pipeline.push(c.re, c.im);
+                    let t1 = DWT::cycle_count();
+                    let delta = u64::from(t1.wrapping_sub(t0));
+                    if pipeline.frame_seq() != seq_before {
+                        self.fft_cycles += delta;
+                    } else {
+                        self.demod_cycles += delta;
+                    }
                     pushed += 1;
+                    // …and the virtual USB-SSB receiver (offset 0), accumulated
+                    // per chunk and fed below.
+                    self.iq_acc.push(*c);
                 }
             }
+            // Drive the virtual receiver with this chunk's I/Q (its audio is
+            // pushed to the I2S sink; the S-meter itself reads the spectrum,
+            // not this demod output).
+            let vr0 = DWT::cycle_count();
+            let _ = self.vrx.process(&self.iq_acc);
+            self.demod_cycles += u64::from(DWT::cycle_count().wrapping_sub(vr0));
         }
         pushed
     }

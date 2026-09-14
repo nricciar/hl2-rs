@@ -31,13 +31,10 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpAddress, IpEndpoint, IpListenEndpoint};
 use static_cell::ConstStaticCell;
 
-use hl2::protocol::data::{
-    build_keepalive_packet, build_lna_gain_frame, build_nco_packet, build_start_stop_frame,
-};
-use hl2::protocol::discovery::{DiscoveryInfo, discovery_request, parse_discovery_response};
+use hl2::protocol::discovery::{DiscoveryInfo, discovery_request};
+use hl2::protocol::session::Session;
 use hl2::protocol::{
-    C1_SPEED_96K, DATA_PACKET_SIZE, DEFAULT_LNA_GAIN_DB, DISCOVERY_RESPONSE_SIZE, HL2_PORT,
-    OC_MASK_RX, START_REQUEST_SIZE,
+    C1_SPEED_96K, DATA_PACKET_SIZE, DEFAULT_LNA_GAIN_DB, HL2_PORT, OC_MASK_RX, START_REQUEST_SIZE,
 };
 
 /// OC filter bank relay mask.
@@ -58,7 +55,7 @@ const N_RECV: u8 = 1;
 pub const SAMPLE_RATE_KHZ: u32 = 96;
 
 /// Default LNA gain (dB), re-exported for the status text.
-pub const LNA_GAIN_DB: i8 = DEFAULT_LNA_GAIN_DB;
+pub const LNA_GAIN_DB: i8 = 30; //DEFAULT_LNA_GAIN_DB;
 
 /// Target keep-alive cadence in ms. Blocking work can delay actual sends;
 /// the caller must keep gaps below the approximately 168 ms watchdog limit.
@@ -102,63 +99,52 @@ pub fn make_udp_socket() -> udp::Socket<'static> {
 }
 
 /// The radio-side state the `radio` task owns.
+///
+/// The send-sequence counter + the persistent C&C config (SPEED / OC relay /
+/// receiver count) live in [`Session`] (`hl2::protocol::session`), so this
+/// module only sequences frames through smoltcp and does no wire-encoding of
+/// its own (the layering rule: protocol bytes stay in `hl2`).
 pub struct Radio {
     peer: Ipv4Addr,
-    /// Monotonically-increasing send sequence. The HL2 does not
-    /// strictly enforce monotonicity; wrap-around is allowed.
-    seq: u32,
+    session: Session,
 }
 
 impl Radio {
     pub fn new() -> Self {
         Self {
             peer: Ipv4Addr::UNSPECIFIED,
-            seq: 0,
+            session: Session::new(C1_SPEED_96K, OC_RELAY),
         }
-    }
-
-    fn next_seq(&mut self) -> u32 {
-        let s = self.seq;
-        self.seq = s.wrapping_add(1);
-        s
     }
 
     /// Build a stop frame (64 B).
     pub fn build_stop(&mut self) -> [u8; START_REQUEST_SIZE] {
-        build_start_stop_frame(self.next_seq(), false)
+        self.session.stop_frame()
     }
 
     /// Build a start frame (64 B).
     pub fn build_start(&mut self) -> [u8; START_REQUEST_SIZE] {
-        build_start_stop_frame(self.next_seq(), true)
+        self.session.start_frame()
     }
 
     /// Build an LNA-gain frame (1032 B).
     pub fn build_lna(&mut self, gain_db: i8) -> [u8; DATA_PACKET_SIZE] {
-        build_lna_gain_frame(self.next_seq(), gain_db, C1_SPEED_96K, OC_RELAY, N_RECV)
+        self.session.lna_frame(gain_db, N_RECV)
     }
 
     /// Build an RX1 NCO frame (1032 B) at `hz`.
     pub fn build_tune(&mut self, hz: u32) -> [u8; DATA_PACKET_SIZE] {
-        build_nco_packet(
-            self.next_seq(),
-            RX1_SLOT,
-            hz,
-            C1_SPEED_96K,
-            OC_RELAY,
-            N_RECV,
-        )
+        self.session.tune_frame(RX1_SLOT, hz, N_RECV)
     }
 
     /// Build a keep-alive frame (1032 B).
     pub fn build_keepalive(&mut self) -> [u8; DATA_PACKET_SIZE] {
-        build_keepalive_packet(self.next_seq(), C1_SPEED_96K, OC_RELAY, N_RECV)
+        self.session.keepalive_frame(N_RECV)
     }
 
     /// Attempt to parse `dgram` as an HL2 discovery reply.
     pub fn try_discovery(dgram: &[u8]) -> Option<DiscoveryInfo> {
-        let slice = dgram.get(..DISCOVERY_RESPONSE_SIZE)?.try_into().ok()?;
-        parse_discovery_response(&slice)
+        Session::try_parse_discovery(dgram)
     }
 }
 

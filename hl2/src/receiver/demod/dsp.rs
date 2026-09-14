@@ -52,6 +52,33 @@ fn bessel_i0(x: f64) -> f64 {
     sum
 }
 
+/// Choose a Kaiser-windowed-sinc tap count so the **transition width** is
+/// ≈ `transition_hz` at sample rate `rate_hz`, for stopband attenuation
+/// `A ≈ 10·beta − 18` dB (the standard Kaiser rule). Returns an odd length
+/// ≥ 17 (so the impulse response stays centred on a whole sample — linear
+/// phase).
+///
+/// This is the design companion to [`F32Fir`]: give it the anti-alias /
+/// quadrature headroom you actually have (the transition you can afford) and
+/// it returns the tap count that achieves it at `10·beta − 18` dB. Used by
+/// [`super::ssb::SsbCore`] to size the pre-decimation anti-alias, the
+/// intermediate-rate Hilbert and the final channel-select with *different*
+/// transitions (each serves a different anti-alias / quadrature goal).
+pub fn fir_taps(rate_hz: u32, transition_hz: u32, beta: f64) -> usize {
+    let a = (10.0 * beta - 18.0).max(20.0);
+    let dw = if rate_hz > 0 && transition_hz > 0 {
+        2.0 * consts::PI * (transition_hz as f64) / (rate_hz as f64)
+    } else {
+        f64::INFINITY
+    };
+    let n = if dw.is_finite() && dw > 0.0 {
+        (((a - 7.95) / (14.36 * dw)).ceil() as usize).max(17)
+    } else {
+        63
+    };
+    if n % 2 == 0 { n + 1 } else { n }
+}
+
 /// A complex oscillator (`× e^(−j·φ)`) advanced by phase recurrence — no
 /// `cos`/`sin` in the loop. The state `(c, s)` holds `(cos φ, sin φ)` in
 /// `f64` and each step is the 2-D rotation
@@ -293,18 +320,29 @@ impl F32FirState {
         self.processed += 1;
         // Number of usable past+present samples (bounded by the ring).
         let m = self.processed.min(t);
-        // Walk newest→oldest: x[n], x[n−1], ... x[n−(m−1)], reading the ring
-        // backwards from `pos` (wrapping at 0) and the just-written `x`.
-        // Walk taps newest→oldest: the k-th tap (0-indexed) multiplies x[n−k].
-        // k=0 is the freshly written sample; k>=1 reads the ring backwards
-        // from `pos` (wrapping at 0). Bounded by `m` for the zero-pad onset.
+        // `taps[0]` multiplies the just-written `x`; `taps[1..m]` walk the
+        // ring backwards from `pos` (wrapping to `t−1`). Split into at most
+        // two *straight* loops over contiguous slices — no per-element branch
+        // in the ring walk — so on `-C eabihf` the compiler emits contiguous
+        // loads and folds each term into an `fma`. This is the hot path the
+        // SSB Hilbert (`super::ssb`) and the polyphase channel-select both
+        // hit per full-rate sample.
+        let need = (m - 1).min(t - 1);
+        let taps = &self.taps[1..];
+        let h = self.hist.as_ptr();
         let mut acc = self.taps[0] * x;
-        let mut k = 1usize;
-        let mut idx = pos;
-        while k < t && k < m {
-            idx = if idx == 0 { t - 1 } else { idx - 1 };
-            acc += self.taps[k] * self.hist[idx];
-            k += 1;
+        // Segment 1 (no wrap): i in 0..seg1, hist index = pos−1−i.
+        let seg1 = need.min(pos);
+        for i in 0..seg1 {
+            acc += taps[i] * unsafe { *h.add(pos - 1 - i) };
+        }
+        // Segment 2 (wrapped): hist index = base2−i, continuing the ring walk.
+        let n2 = need - seg1;
+        if n2 > 0 {
+            let base2 = t - 1 - seg1 + pos;
+            for i in 0..n2 {
+                acc += taps[seg1 + i] * unsafe { *h.add(base2 - i) };
+            }
         }
         self.last_out = acc;
         acc

@@ -53,6 +53,9 @@
 //! piece of thread-local state that belongs with the demod, not the
 //! ring).
 
+use alloc::vec;
+use alloc::vec::Vec;
+
 use num_complex::Complex;
 
 /// Default ring capacity in complex samples. Kept **small on purpose**
