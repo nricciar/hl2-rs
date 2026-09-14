@@ -1,7 +1,5 @@
 # HL2 Client on Teensy 4.1
 
-![Waterfall](doc/waterfall.gif)
-
 Proof of concept client using the `hl2` crate from this repo to connect to Hermes Lite 2
 and stream the waterfall to a ILI9341 base LCD over SPI and stream demodulated audio to
 the WM8731 audio codec board.
@@ -35,3 +33,5 @@ codec board over I2C.
 //     SDA        18
 //     SCL        19
 ```
+
+![Waterfall](doc/waterfall.gif)
