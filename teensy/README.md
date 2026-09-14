@@ -4,6 +4,16 @@ Proof of concept client using the `hl2` crate from this repo to connect to Herme
 and stream the waterfall to a ILI9341 base LCD over SPI and stream demodulated audio to
 the WM8731 audio codec board.
 
+* https://www.mikroe.com/audio-codec-proto-board
+
+## Build
+
+```
+cargo objcopy --release -- -O ihex hl2.hex
+```
+
+Download `hl2.hex` to your Teensy 4.1 with Teensy Loader.
+
 ## Pins
 
 Currently this teensy project interacts with three pieces of hardware. the Teensy ethernet

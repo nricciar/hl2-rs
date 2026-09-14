@@ -658,12 +658,6 @@ pub async fn discover() -> Vec<(SocketAddr, DiscoveryInfo)> {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), HL2_PORT),
     );
 
-    for addr in ["169.254.19.221", "192.168.1.67"] {
-        if let Ok(ip) = addr.parse::<IpAddr>() {
-            let _ = socket.send_to(&request, SocketAddr::new(ip, HL2_PORT));
-        }
-    }
-
     let local_addr = socket.local_addr().unwrap();
     drop(socket);
 

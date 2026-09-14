@@ -13,7 +13,7 @@ Hermes Lite 2 SDR client implemented in Rust. Project is a work in progress with
 | `hl2-api`| `api/`  | Rocket + WebSocket server; Provides API access to hl2 radio |
 | `hl2-ui` | `ui/`   | Yew/WASM UI.            |
 | `pskrep` | `pskrep/` | PSK Reporter client + spot queue/dedup.  |
-| `teensy` | `teensy/` | [TODO] Teensy hl2 client/ui |
+| `teensy` | `teensy/` | Teensy hl2 client/ui |
 
 ## Supported Modes
 
@@ -42,4 +42,3 @@ Most of the code in this repo was auto generated with Qwen 3.8 27b and OpenCode.
 
 * Modes [CW, and more]
 * TX
-* Teensy support

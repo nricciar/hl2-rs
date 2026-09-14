@@ -476,10 +476,7 @@ async fn main() {
             //   hl2 ft8 192.168.1.67 7074000 --seconds 48              # offset 0, known-good
             //   hl2 ft8 192.168.1.67 7050000 --offset 24000 --seconds 48  # offset +24k
             //
-            let hl2_addr: std::net::IpAddr = args
-                .get(1)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or("192.168.1.67".parse().unwrap());
+            let hl2_addr: std::net::IpAddr = args.get(1).and_then(|s| s.parse().ok()).unwrap();
             let freq: u32 = args
                 .get(2)
                 .and_then(|s| s.parse().ok())

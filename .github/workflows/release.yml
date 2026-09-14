@@ -61,7 +61,6 @@ jobs:
           mkdir -p "$staging"
           cp "$bin" "$staging/hl2-api"
           cp README.md "$staging/"
-          printf 'hl2-api %s\n\nA single self-contained binary: SDR control server + embedded web UI.\nRun it and open http://localhost:8000/\n' "$version" > "$staging/README.txt"
           tar czf "hl2-api-${version}-${arch}.tar.gz" -C dist "$(basename "$staging")"
           ls -lh "hl2-api-${version}-${arch}.tar.gz"
           tar tzf "hl2-api-${version}-${arch}.tar.gz"
