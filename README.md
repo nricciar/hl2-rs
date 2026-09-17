@@ -1,6 +1,6 @@
 # hl2-rs
 
-![Screenshot of hl2-api decoding 40m FT8, JS8 and FT4 signals](https://i.imgur.com/VwVrjqi.png)
+![Screenshot of hl2-api decoding 40m FT8, JS8 and FT4 signals](https://i.imgur.com/EIrOoV9.png)
 
 Hermes Lite 2 SDR client implemented in Rust. Project is a work in progress with known bugs and limitations [see issues].
 
