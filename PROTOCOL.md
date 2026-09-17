@@ -970,10 +970,11 @@ is on the left, the tune (NCO) is at the centre, and "high RF" is on the right:
 * display bin `m/2` (centre)       =  NCO / `center_hz`      — the tune
 * display bin `m-1` (right edge)   =  `center_hz + span/2`   — furthest above the NCO
 
-with `m = 1024` display bins and `span = SharedState.spectrum_span_hz` (96.7
-kHz for the EP6 source on the 192 kHz option, or 76.8 MHz for EP4 — the
-real ADC rate, `ADC_CLOCK_HZ`, whose Nyquist is 38.4 MHz; the UI shows only
-the positive half, DC→38.4 MHz). The UI
+with `m = 1024` display bins and `span = SharedState.spectrum_span_hz`.
+`spectrum_span()` (`api/src/hub.rs`) returns the **full sample rate of the
+stream being FFT'd** — the DDC delivers a **complex** I/Q stream, so a
+centred spectrum spans `−fs/2…+fs/2`.
+The UI
 (→ `ui/src/canvas.rs::draw_center_cursor_and_ruler`) draws a vertical
 cursor at the centre (the tune) and a frequency ruler (band-left / NCO /
 band-right) on each panel, using exactly these values, so the user can read
