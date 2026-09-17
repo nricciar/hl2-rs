@@ -61,7 +61,7 @@ impl DigitalCore {
         mode_label: &'static str,
     ) -> Self {
         let m = source_rate_hz as usize / audio.rate_hz as usize;
-        let bw_ratio = (2_600.0f64 / source_rate_hz as f64).clamp(1e-3, 0.4);
+        let bw_ratio = (3_000.0f64 / source_rate_hz as f64).clamp(1e-3, 0.4);
         // 511 taps on the 12 kHz digital path: with Kaiser β = 12 this gives
         // ~107 dB out-of-band rejection across the 3.8–6.0 kHz band — past
         // the 80 dB floor the rejection test guards and clear headroom for a

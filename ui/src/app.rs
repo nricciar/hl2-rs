@@ -138,11 +138,8 @@ impl VrxModeChoice {
             VrxModeChoice::Am => 8_000,
             VrxModeChoice::Fm => 15_000,
             VrxModeChoice::FmNarrow => 5_000,
-            VrxModeChoice::Ft8
-            | VrxModeChoice::Js8
-            | VrxModeChoice::Ft4
-            | VrxModeChoice::Usb
-            | VrxModeChoice::Lsb => 2_600,
+            VrxModeChoice::Ft8 | VrxModeChoice::Js8 | VrxModeChoice::Ft4 => 3_000,
+            VrxModeChoice::Usb | VrxModeChoice::Lsb => 2_600,
         }
     }
 }
@@ -1314,8 +1311,8 @@ fn draw_all(sh: &Shared) {
     // one-sided USB strip (carrier → carrier + bw) covering the decoder's
     // channel-select passband, so the user sees what the headless decoders are
     // listening to on the spectrum / waterfall. The digital modes all share the
-    // 2 600 Hz channel-select bandwidth, so `(freq, 2600)` is a faithful band.
-    const AUTO_BW_HZ: u32 = 2_600;
+    // 3 000 Hz channel-select bandwidth, so `(freq, 3000)` is a faithful band.
+    const AUTO_BW_HZ: u32 = 3_000;
     let auto_bands: Vec<(u32, u32)> = {
         let src = *sh.spectrum_source.borrow();
         src.and_then(|slot| {

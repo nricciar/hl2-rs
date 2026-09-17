@@ -1928,7 +1928,7 @@ fn synthetic_vrx_state(slot: u8, nco_hz: u32, freq_hz: u32, auto_mode: AutoMode)
         slot,
         offset_hz: (freq_hz as i64 - nco_hz as i64) as i32,
         mode: auto_to_vrx_mode(auto_mode),
-        bw_hz: 2_600,
+        bw_hz: 3_000,
         gain_db: 0.0,
         rate_hz: VRX_FT8_RATE_HZ,
         muted: true,

@@ -561,7 +561,7 @@ async fn main() {
                 // negate. (This is the same sign fix applied in
                 // `api/src/hub.rs::spawn_vrx` / `spawn_auto`.)
                 source_center_hz: -offset_hz,
-                bandwidth_hz: Some(2600u32),
+                bandwidth_hz: Some(3000u32),
                 audio: AudioConfig {
                     rate_hz: audio_rate,
                     gain_db: 0.0,

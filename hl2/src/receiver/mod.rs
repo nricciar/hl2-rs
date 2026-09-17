@@ -182,11 +182,11 @@ impl Mode {
             Mode::FmNarrow => 5_000,
             Mode::Ssb(_) => 2_600,
             #[cfg(feature = "ft8")]
-            Mode::Ft8 => 2_600,
+            Mode::Ft8 => 3_000,
             #[cfg(feature = "js8")]
-            Mode::Js8 => 2_600,
+            Mode::Js8 => 3_000,
             #[cfg(feature = "ft4")]
-            Mode::Ft4 => 2_600,
+            Mode::Ft4 => 3_000,
         }
     }
 
