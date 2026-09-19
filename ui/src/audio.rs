@@ -183,8 +183,11 @@ impl Audio {
     }
 
     /// Re-anchor the playback timeline to just-ahead-of-now (used across the
-    /// server-side sideband/BW/gain rebuild gap) so the next frame starts with
-    /// a clean head lead instead of a stale backlog. Does not alter the level.
+    /// server-side **mode-change** rebuild gap, where the decode thread is
+    /// torn down and re-spawned with a new audio rate) so the next frame
+    /// starts with a clean head lead instead of a stale backlog. Same-mode
+    /// BW/gain/offset retunes are applied in-place server-side (no audio
+    /// gap), so they no longer call this. Does not alter the level.
     pub fn reset(&self) {
         if let Some(p) = self.inner.borrow_mut().as_mut() {
             p.next_start = p.ctx.current_time() + LOOKAHEAD;

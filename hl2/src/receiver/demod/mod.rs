@@ -72,6 +72,18 @@ pub type AmDemodulator = StandardDemod<AmCore>;
 pub type DigitalDemodulator = StandardDemod<DigitalCore>;
 pub type FmDemodulator = StandardDemod<FmCore>;
 
+/// The demod core does not support an in-place [`DemodCore::retune`] (it has
+/// none, or its channel-select DSP is fixed). The caller should fall back to
+/// a full rebuild.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetuneUnsupported;
+impl fmt::Display for RetuneUnsupported {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "demod: this mode does not support a live retune")
+    }
+}
+impl ::core::error::Error for RetuneUnsupported {}
+
 /// The source rate is too close to the audio rate to decimate cleanly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RateTooClose {
@@ -208,6 +220,25 @@ pub trait Demodulator: Send {
     /// higher-level wrappers that call a uniform `flush`).
     fn flush(&mut self, sink: &mut dyn AudioSink) -> Result<(), DemodError> {
         self.flush_audio(sink).map(|_| ())
+    }
+
+    /// Set the playback gain (dB, applied on top of the AGC) **in place** —
+    /// the audio tail reads `gain_db` fresh on every emit, so no state is
+    /// invalidated. Default: no-op (a demod with no gain knob).
+    fn set_gain_db(&mut self, _gain_db: f32) {}
+
+    /// Retune the running demod **in place** (no thread restart): change the
+    /// channel-offset NCO to `source_center_hz` (Hz from the source centre)
+    /// and re-tap the channel-select / quadrature DSP for `bandwidth_hz`.
+    ///
+    /// On success the audio tail is re-seeded (see
+    /// [`AudioEngine::note_retune`] — its AGC + accumulator are reset so
+    /// samples produced under the old filters are not normalised with the
+    /// new passband's statistics). Default: [`RetuneUnsupported`] — a mode
+    /// that doesn't implement this tells the caller to fall back to a full
+    /// rebuild.
+    fn retune(&mut self, _source_center_hz: f64, _bandwidth_hz: u32) -> Result<(), DemodError> {
+        Err(Box::new(RetuneUnsupported))
     }
 }
 

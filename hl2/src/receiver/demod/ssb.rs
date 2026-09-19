@@ -51,6 +51,7 @@ use alloc::vec::Vec;
 use core::f64::consts;
 use num_complex::Complex;
 
+use super::DemodError;
 use super::core::DemodCore;
 use super::dsp::{F32Fir, F32FirState, KAISER_BETA, Nco, PolyphaseDecimator, fir_taps};
 use crate::receiver::AudioConfig;
@@ -102,6 +103,10 @@ pub struct SsbCore {
     /// Write position in [`Self::i_delay`] (holds the oldest sample to be read
     /// as the delayed I output, then overwritten).
     i_idx: usize,
+    /// The full-rate complex source sample rate (`Hz`) the core was built for
+    /// — fixed for the receiver's lifetime, but stored for in-place retune
+    /// (`Nco::set_step` needs `2π·center / source_rate`).
+    source_rate_hz: u32,
 }
 
 impl SsbCore {
@@ -181,6 +186,7 @@ impl SsbCore {
             lp,
             i_delay: vec![0.0f32; i_delay_samples.max(1)],
             i_idx: 0,
+            source_rate_hz,
         }
     }
 
@@ -192,6 +198,50 @@ impl SsbCore {
     /// The polyphase anti-alias / decimation stage.
     pub fn lp(&self) -> &PolyphaseDecimator {
         &self.lp
+    }
+
+    /// Retune in place: change the channel NCO to `source_center_hz` and
+    /// re-tap the channel-select + quadrature DSP for `bandwidth_hz`,
+    /// reusing the *exact* sizing rules of [`SsbCore::new`] so a retuned
+    /// filter is indistinguishable from one built with the new settings:
+    ///
+    /// * NCO — `Nco::set_step` (phase-preserving; the next sample mixes at
+    ///   the same phase and advances at the new frequency),
+    /// * Hilbert — `F32Fir::hilbert` with a `max(bw, 1000)` Hz transition at
+    ///   the 24 kHz intermediate rate,
+    /// * channel-select — `F32Fir::lowpass` with `max(bw, 1500)` Hz
+    ///   transition and `bw/48k` passband ratio (identical to `new`),
+    /// * the I-arm delay line is resized to the (possibly new) Hilbert group
+    ///   delay and the delay index restarted, and
+    /// * the decimation factor `s = 24k / audio_rate` is unchanged (it is a
+    ///   function of the rates, not of the bandwidth) — read back from the
+    ///   existing decimator's branch count.
+    ///
+    /// The pre-decimation stage is bandwidth- and offset-invariant (it only
+    /// needs to pass the phasing band, ≈ ±15 kHz) and is left untouched.
+    pub fn retune_params(&mut self, source_center_hz: f64, bandwidth_hz: u32) {
+        self.nco
+            .set_step(2.0 * consts::PI * source_center_hz / self.source_rate_hz as f64);
+        // Intermediate (24 kHz) rate Hilbert + the I-arm delay line sized to
+        // its group delay, exactly as in `new`.
+        let intermediate_rate = 24_000u32;
+        let hilb_transition = bandwidth_hz.max(1_000);
+        let hilb_taps = fir_taps(intermediate_rate, hilb_transition, KAISER_BETA);
+        let hilb_fir = F32Fir::hilbert(hilb_taps, KAISER_BETA);
+        self.hilb.retap(hilb_fir.taps());
+        let i_delay_samples = (hilb_fir.len() - 1) / 2;
+        self.i_delay = vec![0.0f32; i_delay_samples.max(1)];
+        self.i_idx = 0;
+        // Final channel-select + decimate (24 kHz → audio). The decimation
+        // factor is rate-derived and was already `24k / audio_rate` at build
+        // time, so the retap keeps the same factor (branch count).
+        let s = self.lp.decimation();
+        let cs_transition = bandwidth_hz.max(1_500);
+        let cs_taps = fir_taps(intermediate_rate, cs_transition, KAISER_BETA);
+        let cs_ratio = (bandwidth_hz as f64) / 48_000.0;
+        let cs_h = F32Fir::lowpass(cs_taps, cs_ratio.clamp(1e-3, 0.49), KAISER_BETA);
+        let cs_h = cs_h.taps().to_vec();
+        self.lp.retap(&cs_h, s);
     }
 }
 
@@ -252,6 +302,11 @@ impl DemodCore for SsbCore {
         } else {
             "ssb-lsb"
         }
+    }
+
+    fn retune(&mut self, source_center_hz: f64, bandwidth_hz: u32) -> Result<(), DemodError> {
+        self.retune_params(source_center_hz, bandwidth_hz);
+        Ok(())
     }
 }
 
@@ -386,6 +441,93 @@ mod tests {
             peak_lsb > 50,
             "LSB NCO-moved tone should be passable: {peak_lsb}"
         );
+    }
+
+    /// [`SsbCore::retune`](super::DemodCore::retune) must produce the *exact*
+    /// same Hilbert / channel-select FIR as a freshly-built
+    /// [`SsbCore::new`] with the new bandwidth (the sizing rules are shared
+    /// between the two paths — any divergence would mean a retuned receiver
+    /// sounds *different* from a freshly-tuned one, not merely "re-tuned"),
+    /// preserve the pre-decimation stage (it is bandwidth-invariant), and
+    /// keep the channel-select decimation factor (it is rate-derived, not
+    /// bandwidth-derived). Catches any retune regression that re-sizes the
+    /// wrong taps, changes the decimation factor, or perturbs the pre-dec.
+    #[test]
+    fn retune_matches_fresh_build_byte_for_byte() {
+        let rate = 192_000u32;
+        let sideband = Sideband::Usb;
+        let center_a = 0.0;
+        let center_b = 12_000.0;
+        let bw_a = 2_600u32;
+        let bw_b = 4_000u32;
+        let cfg = AudioConfig {
+            rate_hz: 4_800,
+            gain_db: 0.0,
+        };
+        let mut a = SsbCore::new(sideband, rate, center_a, bw_a, cfg);
+        let b = SsbCore::new(sideband, rate, center_b, bw_b, cfg);
+        // Before retune: A's channel-select is the *narrower* 2_600 design.
+        // After retune to (center_b, bw_b): A must be byte-identical to B on
+        // the Hilbert and channel-select paths, with the NCO at B's step.
+        a.retune_params(center_b, bw_b);
+        // Hilbert: identical impulse response.
+        assert_eq!(
+            a.hilb.taps().to_vec(),
+            b.hilb.taps().to_vec(),
+            "hilbert taps diverge after retune"
+        );
+        assert_eq!(
+            a.hilb.len(),
+            b.hilb.len(),
+            "hilbert tap count diverges after retune"
+        );
+        // Channel-select: identical branch taps (polyphase decomposition is
+        // deterministic over the full-rate h, so equal h ⇒ equal branches).
+        assert_eq!(
+            a.lp.decimation(),
+            b.lp.decimation(),
+            "decimation factor changed on retune"
+        );
+        for p in 0..b.lp.decimation() {
+            assert_eq!(
+                a.lp.branch_taps(p).to_vec(),
+                b.lp.branch_taps(p).to_vec(),
+                "channel-select branch {p} taps diverge"
+            );
+        }
+        // I-arm delay line is sized to the Hilbert group delay — must match
+        // B's delay length and be re-seeded.
+        assert_eq!(a.i_delay.len(), b.i_delay.len(), "i_delay length diverges");
+        assert_eq!(a.i_idx, b.i_idx, "i_idx not reset");
+        // Pre-decimation is bandwidth/offset-invariant — identical taps and
+        // decimation for the same source rate.
+        assert_eq!(
+            a.pre_re.decimation(),
+            b.pre_re.decimation(),
+            "pre-decimation factor changed"
+        );
+        for p in 0..b.pre_re.decimation() {
+            assert_eq!(
+                a.pre_re.branch_taps(p).to_vec(),
+                b.pre_re.branch_taps(p).to_vec(),
+                "pre-re branch {p} taps diverge"
+            );
+            assert_eq!(
+                a.pre_im.branch_taps(p).to_vec(),
+                b.pre_im.branch_taps(p).to_vec(),
+                "pre-im branch {p} taps diverge"
+            );
+        }
+        // End-to-end: a USB in-band tone, centred at `center_b + 1.5 kHz`,
+        // passes the retuned receiver's channel-select and produces audio —
+        // the same signal a freshly-built receiver would pass.
+        let mut demod_a = a.demodulator(cfg, None);
+        let mut sink_a = VecSink::new();
+        let iq = complex_sine(rate, center_b + 1_500.0, 16_384, 0.5);
+        let n = demod_a.demod(&iq, &mut sink_a).expect("demod ok");
+        assert!(n > 0, "retuned SSB core produced {n} frames");
+        let peak = sink_a.samples().iter().map(|s| s.abs()).max().unwrap_or(0);
+        assert!(peak > 50, "retune in-band peak too low: {peak}");
     }
 
     /// A tap that forwards every pre-AGC f32 slice to a shared `Vec`, so the

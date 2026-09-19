@@ -25,7 +25,7 @@ use alloc::sync::Arc;
 use num_complex::Complex;
 
 use super::engine::AudioEngine;
-use super::{DemodError, Demodulator, IqBlock, RawSampleTap};
+use super::{DemodError, Demodulator, IqBlock, RawSampleTap, RetuneUnsupported};
 use crate::receiver::AudioConfig;
 use crate::receiver::sink::AudioSink;
 
@@ -59,6 +59,21 @@ pub trait DemodCore: Send + 'static {
             .rsplit("::")
             .next()
             .unwrap_or("DemodCore")
+    }
+
+    /// Retune the running receiver **in place** (no thread restart): change
+    /// the channel-offset NCO to `source_center_hz` and re-tap the
+    /// channel-select / quadrature DSP for `bandwidth_hz`. The sideband and
+    /// decimation structure stay unchanged. The audio tail (AGC) is
+    /// re-seeded by [`Self::demodulator`] / [`StandardDemod`] — see
+    /// [`Demodulator::retune`].
+    ///
+    /// Default: `Err(RetuneUnsupported)` — a mode that doesn't implement
+    /// this (e.g. the fixed-3 kHz digital path) tells the caller to fall
+    /// back to a full rebuild.
+    fn retune(&mut self, source_center_hz: f64, bandwidth_hz: u32) -> Result<(), DemodError> {
+        let _ = (source_center_hz, bandwidth_hz);
+        Err(Box::new(RetuneUnsupported))
     }
 
     /// Compose this core with the shared audio tail into a full [`Demodulator`].
@@ -123,5 +138,15 @@ impl<C: DemodCore> Demodulator for StandardDemod<C> {
         }
         written += self.engine.flush_residue(sink)?;
         Ok(written)
+    }
+
+    fn set_gain_db(&mut self, gain_db: f32) {
+        self.engine.set_gain_db(gain_db);
+    }
+
+    fn retune(&mut self, source_center_hz: f64, bandwidth_hz: u32) -> Result<(), DemodError> {
+        self.core.retune(source_center_hz, bandwidth_hz)?;
+        self.engine.note_retune();
+        Ok(())
     }
 }

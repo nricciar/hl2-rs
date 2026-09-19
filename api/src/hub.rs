@@ -139,6 +139,8 @@ struct VrxTask {
     /// activated, and that is the only activation state the idempotency
     /// checks need.
     demod: Option<std::thread::JoinHandle<()>>,
+    /// A pending (offset / BW / gain) for the running vrx
+    retune_req: std::sync::Arc<std::sync::Mutex<Option<RetuneReq>>>,
     /// The coalescing tokio fan-out task that drains `buf` and broadcasts
     /// `WsEvent::Audio` frames. Aborted on stop.
     fanout: Option<tokio::task::JoinHandle<()>>,
@@ -146,6 +148,18 @@ struct VrxTask {
     ft8: Option<DecodeTask>,
     js8: Option<DecodeTask>,
     ft4: Option<DecodeTask>,
+}
+
+/// A request to **modify a running [`VrxTask`] in place**
+///
+/// * `offset_hz` — vrx offset relative to NCO
+/// * `bw_hz` — the channel-select bandwidth (Hz).
+/// * `gain_db` — the playback gain on top of the AGC (dB).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RetuneReq {
+    offset_hz: i32,
+    bw_hz: u32,
+    gain_db: f32,
 }
 
 /// Stack size for a mode-decode thread (FT8/JS8): deep DSP frame chains
@@ -1033,45 +1047,71 @@ impl RadioHub {
                 if !started {
                     return ServerResponse::err(id, &state0, "HL2 not started");
                 }
-                // Idempotency: if this slot already has a vrx whose config
-                // matches the request *and* the slot is currently activated,
-                // return the current snapshot without tearing down and
-                // re-spawning the demod thread. UI reconciliation can (and
-                // does) re-send `setvrx` for the active tab on every stale
-                // echo it cannot match against a fresh response — a
-                // rebuild-per-command would churn the demod, reset AGC
-                // state, and spam `vrx started` logs endlessly. Equality is
-                // on (slot, mode, bw, gain, offset); `muted` is deliberately
-                // NOT part of it (mute is a separate command, and a stale-mute
-                // `setvrx` must not force a rebuild just because the mute
-                // intent changed).
+                // Idempotency / **in-place retune**: if this slot already has
+                // an activated vrx with the **same mode** (so the demod core
+                // type and audio rate don't change), any change to gain /
+                // bandwidth / offset is applied **in-place** via the
+                // [`RetuneReq`] mailbox — no thread restart, no audio gap, no
+                // AGC reset beyond the tail's own re-seed. UI reconciliation
+                // can (and does) re-send `setvrx` for the active tab on every
+                // stale echo; when the config already matches we return the
+                // current snapshot without touching the receiver at all.
                 //
-                // Activation matters too: `Hl2::baseband_ring(slot)` resolves
-                // to the slot's *dedicated* ring only once `tune(slot, ..)`
-                // has registered it in the fan-out (the first successful
-                // tune does this), and falls back to the position-0 (RX1)
-                // ring until then. A receiver spawned *before* its slot was
-                // tuned is therefore demodulating the wrong ring; we must
-                // re-spawn it against the now-dedicated ring. The library
-                // exposes `Hl2::is_slot_active(slot)` for exactly this
-                // predicate — the hub asks the library instead of re-deriving
-                // "is this slot alive" from its own bookkeeping. `tune_cmd`
-                // re-binds any affected vrx as the slot comes online (see
-                // `rebind_vrx_on_activate`), so the two paths agree without
-                // comparing ring-handle identity.
-                let up_to_date = {
-                    let guard = self.session.lock().await;
-                    guard.as_ref().is_some_and(|s| {
-                        s.ctrl.is_slot_active(c.slot)
-                            && s.vrx.get(&c.slot).is_some_and(|existing| {
-                                existing.state.mode == c.mode
-                                    && existing.state.bw_hz == c.bw_hz
-                                    && (existing.state.gain_db - c.gain_db).abs() < 1e-6
-                                    && existing.state.offset_hz == c.offset_hz
-                            })
-                    })
+                // `None` (fall through to the rebuild path) covers:
+                // * no session / slot not activated (the spawn below fetches
+                //   a valid ring via `baseband_ring(slot)`),
+                // * no existing vrx on this slot (fresh start), and
+                // * a **mode change** (the demod core type and the audio
+                //   sample rate both change — the rebuild tears down the
+                //   decode thread, re-spawns the demod with the new rate,
+                //   and rebinds the fan-out `rate_u16`).
+                //
+                // `muted` is deliberately NOT part of the equality check
+                // (mute is a separate command; a stale `setvrx` must not
+                // suppress the in-place retune just because the mute intent
+                // changed, and it must not force a rebuild either).
+                let in_place_done: Option<bool> = {
+                    let mut guard = self.session.lock().await;
+                    let mut result: Option<bool> = None;
+                    if let Some(s) = guard.as_mut() {
+                        if s.ctrl.is_slot_active(c.slot) {
+                            if let Some(v) = s.vrx.get_mut(&c.slot) {
+                                if v.state.mode == c.mode {
+                                    let already = v.state.bw_hz == c.bw_hz
+                                        && (v.state.gain_db - c.gain_db).abs() < 1e-6
+                                        && v.state.offset_hz == c.offset_hz;
+                                    if !already {
+                                        *v.retune_req.lock().unwrap() = Some(RetuneReq {
+                                            offset_hz: c.offset_hz,
+                                            bw_hz: c.bw_hz,
+                                            gain_db: c.gain_db,
+                                        });
+                                        v.state.offset_hz = c.offset_hz;
+                                        v.state.bw_hz = c.bw_hz;
+                                        v.state.gain_db = c.gain_db;
+                                    }
+                                    result = Some(already);
+                                }
+                            }
+                        }
+                    }
+                    result
                 };
-                if up_to_date {
+                if let Some(already) = in_place_done {
+                    if !already {
+                        // The mode is unchanged, so the passband shape (for
+                        // the spectrum overlay) is the same family — just
+                        // update the bandwidth so the overlay matches the
+                        // new tuning.
+                        self.passband_bw
+                            .store(c.bw_hz as u64, std::sync::atomic::Ordering::Relaxed);
+                        if std::env::var("HL2_DEBUG").is_ok() {
+                            eprintln!(
+                                "[HUB] vrx retuned in-place (slot={} offset={} bw={} gain={:.1}dB)",
+                                c.slot, c.offset_hz, c.bw_hz, c.gain_db
+                            );
+                        }
+                    }
                     let (state, _) = self.snapshot().await;
                     return ServerResponse::ok(id, &state);
                 }
@@ -1662,6 +1702,10 @@ async fn spawn_vrx(
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop2 = stop.clone();
     let ring2 = ring.clone();
+    // A live-retune mailbox the hub's in-place `setvrx` path pushes into and
+    // the demod thread drains between I/Q blocks (see `RetuneReq`).
+    let retune_req = std::sync::Arc::new(std::sync::Mutex::new(Option::<RetuneReq>::None));
+    let retune2 = retune_req.clone();
     let demod = std::thread::Builder::new()
         .name("vrx-demod".into())
         .spawn(move || {
@@ -1672,6 +1716,21 @@ async fn spawn_vrx(
                 if stop2.load(std::sync::atomic::Ordering::Relaxed) {
                     let _ = rx.flush();
                     return;
+                }
+                // Drain any pending live retune (channel NCO / channel-select
+                // BW / gain) before the next block, so the new DSP is applied
+                // as early as possible without a thread restart. `None` in the
+                // common case (no retune pending) — the lock is uncontended
+                // and the take is a no-op. A same-mode `setvrx` is the only
+                // writer; a failed retune (a mode the core can't retune) is
+                // logged and the receiver keeps its previous filters.
+                if let Some(r) = retune2.lock().unwrap().take() {
+                    if let Err(e) = rx.retune(-(r.offset_hz as f64), r.bw_hz.max(1)) {
+                        if std::env::var("HL2_DEBUG").is_ok() {
+                            eprintln!("[HUB] vrx retune failed: {e}");
+                        }
+                    }
+                    let _ = rx.set_gain_db(r.gain_db);
                 }
                 // Peek non-destructively from our own reader cursor; the
                 // buffer is shared with every other receiver on this slot
@@ -1743,6 +1802,7 @@ async fn spawn_vrx(
         stop,
         muted,
         demod: Some(demod),
+        retune_req,
         fanout: Some(fanout_task),
         ft8: ft8_task,
         js8: js8_task,
