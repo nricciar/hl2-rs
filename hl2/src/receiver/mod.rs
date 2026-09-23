@@ -482,7 +482,7 @@ mod tests {
 
         let iq = tone(rate, new_center + 1_500.0, 12_000, 0.5);
         let frames = rx.process(&iq).expect("process ok");
-        assert!(frames >= 0, "retuned receiver produced {frames} frames");
+        assert!(frames > 0, "retuned receiver produced {frames} frames");
 
         // set_gain_db propagates to the demod's audio format (per-emit read).
         rx.set_gain_db(6.0);
