@@ -115,6 +115,18 @@ impl Nco {
         }
     }
 
+    /// Change the step rate, keeping the accumulated phase `(c, s)` — a live
+    /// retune of the channel offset with no phase discontinuity: the next
+    /// `step()` mixes at the same phase and then advances at the new rate.
+    ///
+    /// (If the new step is exactly `0.0`, `step()` takes its identity
+    /// short-circuit and applies the accumulated phase as a constant
+    /// rotation — harmless for every downstream DSP in this stack.)
+    pub fn set_step(&mut self, step: f64) {
+        self.cos_step = step.cos();
+        self.sin_step = step.sin();
+    }
+
     /// Multiply by `e^(−j·φ)` and advance by one step.
     #[inline]
     pub fn step(&mut self, x: Complex<f32>) -> Complex<f32> {
@@ -302,6 +314,18 @@ impl F32FirState {
         self.taps.is_empty()
     }
 
+    /// Replace the impulse response in place (a live retune): the history
+    /// ring's length follows the new taps and its contents are zeroed, so
+    /// the filter restarts with the same zero-padded onset an
+    /// [`F32FirState::new`] instance has at build time.
+    pub fn retap(&mut self, taps: &[f32]) {
+        let t = taps.len().max(1);
+        self.taps = taps.to_vec();
+        self.hist = vec![0.0f32; t];
+        self.processed = 0;
+        self.last_out = 0.0;
+    }
+
     /// Push one input sample and return the new filtered output.
     ///
     /// `x` is appended to the history (oldest dropped on overflow). The
@@ -420,9 +444,38 @@ impl PolyphaseDecimator {
         Self { branches, pos: 0 }
     }
 
+    /// Rebuild in place from a new full-rate impulse response `h` at the
+    /// same decimation factor (`h` must decompose into the existing branch
+    /// count `m` — the channel-select retune path always passes taps that
+    /// do). Clears every branch's history, so the decimator restarts at the
+    /// zero-padded onset exactly like a `new`-built one.
+    pub fn retap(&mut self, h: &[f32], m: usize) {
+        assert!(!h.is_empty(), "PolyphaseDecimator needs ≥ 1 tap");
+        assert!(m >= 1, "PolyphaseDecimator decimation factor ≤ 0");
+        let mut branches = Vec::with_capacity(m);
+        for p in 0..m {
+            let mut taps = Vec::new();
+            let mut j = p;
+            while j < h.len() {
+                taps.push(h[j]);
+                j += m;
+            }
+            branches.push(F32FirState::new_taps(&taps));
+        }
+        self.branches = branches;
+        self.pos = 0;
+    }
+
     /// Decimation factor (`rate_in / rate_out`).
     pub fn decimation(&self) -> usize {
         self.branches.len()
+    }
+
+    /// The `p`-th branch's impulse response (a view). Useful for asserting a
+    /// [`Self::retap`] reproduced a known FIR exactly (the SSB retune test
+    /// compares against a freshly-built decimator's branch taps).
+    pub fn branch_taps(&self, p: usize) -> &[f32] {
+        &self.branches[p].taps
     }
 
     /// Push one input sample. Returns `Some(·)` — the completed group's
@@ -533,6 +586,126 @@ mod tests {
             // N is a multiple of every tested m.
             assert_eq!(emitted, N / m);
         }
+    }
+
+    /// [`Nco::set_step`] must preserve the accumulated phase `(c, s)` so a
+    /// live retune introduces no phase discontinuity: the *next* `step()`
+    /// mixes at the same phase the oscillator had before `set_step`, then
+    /// advances at the new rate. Capturing the phase of one full-rate sample
+    /// before vs. after a `set_step` proves the retune is glitchless — a
+    /// regression that reset `(c,s)` to `(1,0)` would change that sample.
+    #[test]
+    fn nco_set_step_preserves_phase() {
+        let step0 = TAU * 1_500.0 / 192_000.0;
+        let mut nco = Nco::new(step0);
+        let x = Complex::new(0.3f32, -0.2f32);
+        // Advance a non-trivial number of steps so the accumulated phase far
+        // from the identity is meaningful to preserve.
+        for _ in 0..817 {
+            nco.step(x);
+        }
+        // Read the current phase `(c, s)` (the next mix factor) via one
+        // sample, then re-apply the same step and confirm the first output is
+        // identical — i.e. `set_step` did not touch `(c, s)`.
+        let before = nco.step(x); // consume + advance
+        let mut nco2 = Nco::new(step0);
+        for _ in 0..817 {
+            nco2.step(x);
+        }
+        nco2.set_step(TAU * 2_500.0 / 192_000.0);
+        let after = nco2.step(x); // same accumulated phase, new step
+        assert!(
+            (before.re - after.re).abs() < 1e-6 && (before.im - after.im).abs() < 1e-6,
+            "set_step changed the next mix factor: before {before} after {after}"
+        );
+        // The *following* sample diverges, because the advance now uses the
+        // new step — the retune is applied prospectively, not retroactively.
+        let next_before = nco.step(x);
+        let next_after = nco2.step(x);
+        assert!(
+            (next_before.re - next_after.re).abs() > 1e-4
+                || (next_before.im - next_after.im).abs() > 1e-4,
+            "new step not applied to the next advance: {next_before} vs {next_after}"
+        );
+    }
+
+    /// [`F32FirState::retap`] must swap in the new impulse response and reset
+    /// the history to the zero-padded onset (exactly like a fresh
+    /// `F32FirState::new`): a DC input then yields the new tap sum on the
+    /// first sample (no stale pre-retap samples leak in).
+    #[test]
+    fn firstate_retap_resets_history_and_applies_new_taps() {
+        let fir_a = F32Fir::lowpass(31, 0.03, KAISER_BETA);
+        let mut st = F32FirState::new(&fir_a);
+        // Drive a non-DC stream so the history ring is fully populated.
+        for k in 0..64 {
+            st.convolve((k % 7) as f32 / 7.0 - 0.5);
+        }
+        let fir_b = F32Fir::lowpass(63, 0.03, KAISER_BETA);
+        st.retap(fir_b.taps());
+        assert_eq!(st.taps(), fir_b.taps());
+        // After retap the history is the fresh zero-padded onset (a
+        // `new`-built filter). Drive a DC-1 stream and compare against the
+        // correct reference `fir_b.apply` over a growing `1,1,1,...` history —
+        // any residual pre-retap sample in the ring would diverge.
+        let mut hist = Vec::new();
+        for _ in 0..40 {
+            hist.push(1.0f32);
+            let got = st.convolve(1.0);
+            let want = fir_b.apply(&hist, hist.len() - 1);
+            assert!(
+                (got - want).abs() < 1e-4,
+                "retap out {got} != apply reference {want} at n={}",
+                hist.len()
+            );
+        }
+    }
+
+    /// [`PolyphaseDecimator::retap`] must rebuild every branch for the new
+    /// taps, keep the existing decimation factor, and restart at the
+    /// zero-padded onset. After a retap, the first `M` samples must sum to
+    /// the new full-rate filter's `h[0]..h[M−1]` contribution on a DC input —
+    /// a regression that kept the old branches would fail.
+    #[test]
+    fn polyphase_retap_preserves_m_and_resets_onset() {
+        let h_a = F32Fir::lowpass(51, 0.02, KAISER_BETA).taps().to_vec();
+        let m = 8;
+        let mut poly = PolyphaseDecimator::new(&h_a, m);
+        // Populate so `pos` and branch histories are non-trivial.
+        for _ in 0..(m * 3 + 2) {
+            poly.push(0.25);
+        }
+        let h_b = F32Fir::lowpass(97, 0.02, KAISER_BETA).taps().to_vec();
+        poly.retap(&h_b, m);
+        assert_eq!(poly.decimation(), m, "retap changed the decimation factor");
+        // Fresh-onset invariant: after retap the decimator restarts at the
+        // zero-padded onset, so it must reproduce the full-rate reference
+        // `y[n] = Σ_j h[j]·x[n−j]` (zero-padded) at every emit instant —
+        // exactly the identity `polyphase_matches_fullfir_decimate` checks
+        // for a `new`-built decimator. Any residual pre-retap branch history
+        // or a wrong decimation factor would diverge. Mirrors that reference.
+        let mut emitted = 0usize;
+        let n_total = 12 * m + 7;
+        for n in 0..n_total {
+            let got = poly.push(1.0f32); // DC-1 input throughout
+            if (n + 1) % m == 0 {
+                let got = got.expect("polyphase must emit every M-th sample");
+                emitted += 1;
+                let mut want = 0.0f64;
+                for (j, hj) in h_b.iter().enumerate() {
+                    if (j as i64) <= (n as i64) {
+                        want += *hj as f64; // x == 1
+                    }
+                }
+                assert!(
+                    (got as f64 - want).abs() < 1e-4,
+                    "retap onset n={n} ({emitted}th emit): got {got} want {want}"
+                );
+            } else {
+                assert!(got.is_none(), "n={n}: unexpected early emit");
+            }
+        }
+        assert_eq!(emitted, n_total / m, "retap broke M:1 decimation");
     }
 
     /// `F32FirState::convolve` must match `F32Fir::apply` over a full

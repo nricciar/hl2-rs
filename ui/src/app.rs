@@ -138,11 +138,8 @@ impl VrxModeChoice {
             VrxModeChoice::Am => 8_000,
             VrxModeChoice::Fm => 15_000,
             VrxModeChoice::FmNarrow => 5_000,
-            VrxModeChoice::Ft8
-            | VrxModeChoice::Js8
-            | VrxModeChoice::Ft4
-            | VrxModeChoice::Usb
-            | VrxModeChoice::Lsb => 2_600,
+            VrxModeChoice::Ft8 | VrxModeChoice::Js8 | VrxModeChoice::Ft4 => 3_000,
+            VrxModeChoice::Usb | VrxModeChoice::Lsb => 2_600,
         }
     }
 }
@@ -625,6 +622,13 @@ impl Shared {
     /// `vrx_bw_hz` / `vrx_gain_db`). Offset is fixed at 0 (one receiver per
     /// slot, centred on the tune). NCO offset is part of the wire `VrxCfg`
     /// but not exposed in the panel yet.
+    ///
+    /// Server-side, a same-mode `setvrx` (change to BW / gain / offset) is
+    /// applied **in-place** on the running receiver (no decode-thread
+    /// restart, no audio gap); only a **mode change** triggers the
+    /// tear-down / re-spawn rebuild. The client therefore never needs to
+    /// re-anchor the audio timeline for BW/gain edits — only the mode
+    /// selector does.
     fn send_vrx(sh: &Rc<Self>, mode: &str, bw_hz: u32, gain_db: f32) {
         let slot = *sh.vrx_slot.borrow();
         let Some(msg) = vrx_cmd_msg(slot, mode, bw_hz, gain_db) else {
@@ -1314,8 +1318,8 @@ fn draw_all(sh: &Shared) {
     // one-sided USB strip (carrier → carrier + bw) covering the decoder's
     // channel-select passband, so the user sees what the headless decoders are
     // listening to on the spectrum / waterfall. The digital modes all share the
-    // 2 600 Hz channel-select bandwidth, so `(freq, 2600)` is a faithful band.
-    const AUTO_BW_HZ: u32 = 2_600;
+    // 3 000 Hz channel-select bandwidth, so `(freq, 3000)` is a faithful band.
+    const AUTO_BW_HZ: u32 = 3_000;
     let auto_bands: Vec<(u32, u32)> = {
         let src = *sh.spectrum_source.borrow();
         src.and_then(|slot| {
@@ -1829,15 +1833,14 @@ pub fn app() -> Html {
                               value={vrx_bw_cur.to_string()} oninput={Callback::from(move |e: web_sys::InputEvent| {
                                   if let Some(inp) = e.target_dyn_into::<HtmlInputElement>() {
                                       let v: u32 = inp.value().parse::<u32>().unwrap_or(2600).max(300).min(20000);
-                                     let slot = *sh15.vrx_slot.borrow();
-                                     { let mut cfg = sh15.vrx_cfg.borrow_mut(); if let Some(c) = cfg.get_mut(&slot) { c.bw_hz = v; } }
-                                     if sh15.vrx.borrow().contains_key(&slot) {
-                                         let c = sh15.cfg_for(slot);
-                                         sh15.audio.reset();
-                                         Shared::send_vrx(&sh15, c.mode.as_str(), v, c.gain_db);
-                                     }
-                                 }
-                                 sh15.notify();
+                                      let slot = *sh15.vrx_slot.borrow();
+                                      { let mut cfg = sh15.vrx_cfg.borrow_mut(); if let Some(c) = cfg.get_mut(&slot) { c.bw_hz = v; } }
+                                      if sh15.vrx.borrow().contains_key(&slot) {
+                                          let c = sh15.cfg_for(slot);
+                                          Shared::send_vrx(&sh15, c.mode.as_str(), v, c.gain_db);
+                                      }
+                                  }
+                                  sh15.notify();
                              })} />
                      </div>
                      <div class="cfg-block">
@@ -1845,16 +1848,15 @@ pub fn app() -> Html {
                          <input type="number" min="-40" max="40" step="1" class="cfg-number"
                              value={format!("{:.1}", vrx_gain_cur)} oninput={Callback::from(move |e: web_sys::InputEvent| {
                                  if let Some(inp) = e.target_dyn_into::<HtmlInputElement>() {
-                                     let v: f32 = inp.value().parse::<f32>().unwrap_or(0.0).clamp(-40.0, 40.0);
-                                     let slot = *sh16.vrx_slot.borrow();
-                                     { let mut cfg = sh16.vrx_cfg.borrow_mut(); if let Some(c) = cfg.get_mut(&slot) { c.gain_db = v; } }
-                                     if sh16.vrx.borrow().contains_key(&slot) {
-                                         let c = sh16.cfg_for(slot);
-                                         sh16.audio.reset();
-                                         Shared::send_vrx(&sh16, c.mode.as_str(), c.bw_hz, v);
-                                     }
-                                 }
-                                 sh16.notify();
+                                      let v: f32 = inp.value().parse::<f32>().unwrap_or(0.0).clamp(-40.0, 40.0);
+                                      let slot = *sh16.vrx_slot.borrow();
+                                      { let mut cfg = sh16.vrx_cfg.borrow_mut(); if let Some(c) = cfg.get_mut(&slot) { c.gain_db = v; } }
+                                      if sh16.vrx.borrow().contains_key(&slot) {
+                                          let c = sh16.cfg_for(slot);
+                                          Shared::send_vrx(&sh16, c.mode.as_str(), c.bw_hz, v);
+                                      }
+                                  }
+                                  sh16.notify();
                               })} />
                       </div>
                       <div>

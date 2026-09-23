@@ -19,6 +19,7 @@
 //! variant.
 use num_complex::Complex;
 
+use super::DemodError;
 use super::core::DemodCore;
 use super::dsp::{F32Fir, KAISER_BETA, Nco, PolyphaseDecimator};
 use crate::receiver::AudioConfig;
@@ -42,6 +43,10 @@ pub struct DigitalCore {
     /// The mode this core was built for (`ft8` / `js8` / `ft4`), for debug
     /// logs (`DigitalCore::kind` returns this).
     mode_label: &'static str,
+    /// The full-rate complex source sample rate (`Hz`) the core was built for
+    /// — fixed for the receiver's lifetime, stored for in-place retune
+    /// (`Nco::set_step` needs `2π·center / source_rate`).
+    source_rate_hz: u32,
 }
 
 impl DigitalCore {
@@ -61,7 +66,7 @@ impl DigitalCore {
         mode_label: &'static str,
     ) -> Self {
         let m = source_rate_hz as usize / audio.rate_hz as usize;
-        let bw_ratio = (2_600.0f64 / source_rate_hz as f64).clamp(1e-3, 0.4);
+        let bw_ratio = (3_000.0f64 / source_rate_hz as f64).clamp(1e-3, 0.4);
         // 511 taps on the 12 kHz digital path: with Kaiser β = 12 this gives
         // ~107 dB out-of-band rejection across the 3.8–6.0 kHz band — past
         // the 80 dB floor the rejection test guards and clear headroom for a
@@ -76,6 +81,7 @@ impl DigitalCore {
             nco,
             lp,
             mode_label,
+            source_rate_hz,
         }
     }
 }
@@ -85,6 +91,16 @@ impl DemodCore for DigitalCore {
         let post = self.nco.step(x);
         // USB: the in-phase arm directly — no Hilbert, no LSB path.
         self.lp.push(post.re)
+    }
+
+    fn retune(&mut self, source_center_hz: f64, _bandwidth_hz: u32) -> Result<(), DemodError> {
+        // The digital path's channel-select is a fixed ≈ 3 kHz LPF (the
+        // decoder's window rate), so a live retune only moves the NCO
+        // (the channel offset). `bandwidth_hz` is accepted for trait
+        // uniformity but does not re-tap this core's LPF.
+        self.nco
+            .set_step(2.0 * std::f64::consts::PI * source_center_hz / self.source_rate_hz as f64);
+        Ok(())
     }
 
     fn kind(&self) -> &'static str {

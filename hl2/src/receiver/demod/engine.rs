@@ -91,6 +91,33 @@ impl AudioEngine {
         self.audio_cfg
     }
 
+    /// Set the playback gain (dB, applied on top of the AGC) in place.
+    /// `gain_db` is already a per-emit read (see `emit_full_blocks` /
+    /// `normalize_to_i16_with_agc`), so this is a single field write and the
+    /// change takes effect on the very next emitted block.
+    pub fn set_gain_db(&mut self, gain_db: f32) {
+        self.audio_cfg.gain_db = gain_db;
+    }
+
+    /// Called by the demodulator after an in-place channel retune (the core's
+    /// NCO / channel-select DSP has been re-tapped). The decimated sample
+    /// stream is valid but its statistics have changed (different passband,
+    /// different in-band level), so:
+    ///
+    /// * drop any partially-accumulated block (it mixes samples produced
+    ///   under the *old* filter design, and would be normalised as if it
+    ///   belonged to the new one), and
+    /// * reset the one-pole AGC to its build-time seed (1000.0) instead of
+    ///   carrying the pre-retune scale factor into the new passband.
+    ///
+    /// The AGC re-converges in a few emits (~30 ms of 4.8 kHz audio) thanks
+    /// to its fast-attack alpha; during that window the perceived level may
+    /// drift, which is the intended "settling" transient of a live retune.
+    pub fn note_retune(&mut self) {
+        self.audio_buf.clear();
+        self.agc_gain = 1000.0;
+    }
+
     /// Accumulate one decimated `f32` sample. Emits nothing here on its own —
     /// see [`emit_full_blocks`](Self::emit_full_blocks). A core calls this once
     /// per decimator output it produces, then calls
@@ -246,4 +273,50 @@ fn normalize_to_i16_with_agc(
         *o = s.clamp(-32_768.0, 32_767.0) as i16;
     }
     n
+}
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use super::*;
+    use crate::receiver::sink::VecSink;
+
+    /// [`AudioEngine::note_retune`] re-seeds the AGC to its build-time seed
+    /// (1000.0) and drops any partially-accumulated block, so the first
+    /// post-retune block isn't normalised with a scale factor that belongs to
+    /// the *old* passband. Drive the engine long enough for the one-pole AGC
+    /// to move away from 1000.0, then confirm `note_retune` restores both.
+    /// `set_gain_db` must update `audio_format().gain_db` (read per-emit) with
+    /// no other state touched.
+    #[test]
+    fn note_retune_resets_agc_and_clears_buffer() {
+        let mut eng = AudioEngine::new(4_800, 0.0, "test");
+        // Feed a non-DC unit-amplitude stream so the AGC target (≈ −20 dBFS
+        // for ~0.707 RMS input) diverges strongly from the 1000.0 seed.
+        use core::f64::consts::TAU;
+        for k in 0..4_800 {
+            let s = (TAU * 400.0 * k as f64 / 4_800.0).sin() as f32;
+            eng.push(s);
+            if k % 256 == 0 {
+                let mut snk = VecSink::default();
+                let _ = eng.emit_full_blocks(&mut snk);
+            }
+        }
+        debug_assert!((eng.agc_gain - 1000.0).abs() > 1e-3, "AGC never moved?");
+        // Accumulate a partial (non-emit) block to prove it is cleared.
+        for _ in 0..32 {
+            eng.push(0.5);
+        }
+        let pre_len = eng.audio_buf.len();
+        eng.note_retune();
+        assert!((eng.agc_gain - 1000.0).abs() < 1e-9, "agc not re-seeded");
+        assert!(
+            eng.audio_buf.is_empty(),
+            "partial block not cleared (had {pre_len})"
+        );
+
+        // set_gain_db is a per-emit field read; no AGC / buffer side effect.
+        eng.set_gain_db(6.0);
+        assert!((eng.audio_format().gain_db - 6.0).abs() < 1e-9);
+        assert!((eng.agc_gain - 1000.0).abs() < 1e-9);
+    }
 }

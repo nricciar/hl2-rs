@@ -1,26 +1,3 @@
-# Hermes-Lite 2 — Protocol & Implementation Reference
-
-> **Two audiences, one document.**
->
-> 1. **The protocol** — what the Hermes-Lite 2 speaks over the wire, in
->    openHPSDR / Metis ("protocol 1") terms.
-> 2. **The implementation** — where each byte of that protocol is built,
->    parsed, and driven in this repo, with `file:symbol` pointers you can
->    jump straight to.
->
-> If a section shows `→` after a sentence, that line is the code that makes the
-> sentence true. Everything in code paths is Rust (`hl2`, `hl2-common`,
-> `hl2-api`) or Yew/WASM (`hl2-ui`).
-
-This implementation targets a **core subset** of the openHPSDR protocol so that
-a Hermes-Lite 2 (Board_ID `0x06`) can be driven by standard openHPSDR software,
-and so this repo can talk to it over plain UDP. The sections marked
-**[full spec]** describe behavior the hardware defines but this code does not
-yet exercise — they are kept verbatim from the openHPSDR reference so the
-document stays a complete, self-contained reference.
-
----
-
 ## Table of contents
 
 1. [Repository layout](#1-repository-layout)
@@ -1093,7 +1070,7 @@ BasebandSource               Demodulator                      AudioSink
     `Mode` variant + a `default_bandwidth_hz` arm (receiver/mod.rs:145), and a
     match arm here — **nothing else changes**.
 
-### 16.3a SSB demodulation (the DSP that's implemented)
+### 16.3a SSB demodulation
 
  The SSB core is `SsbCore::process`
  ([`demod/ssb.rs:145`](hl2/src/receiver/demod/ssb.rs:145)): an **NCO +
@@ -1180,7 +1157,7 @@ BasebandSource               Demodulator                      AudioSink
   pre-phasing code failed (0 dB image rejection). `mod.rs` tests cover the
   full `VirtualReceiver` over a `VecSource`.
 
-### 16.3b AM demodulation (DSB-FC)
+### 16.3b AM demodulation
  
  The AM core is `AmCore::process`
  ([`demod/am.rs:106`](hl2/src/receiver/demod/am.rs:106)): **envelope
@@ -1213,7 +1190,7 @@ BasebandSource               Demodulator                      AudioSink
  Dispatch: `Mode::Am` → `AmCore::new(…).demodulator(…)` in
  [`make_demod_tap`](hl2/src/receiver/demod/mod.rs:133).
 
-### 16.3c Digital demodulation (FT8 / JS8 / FT4, 12 kHz USB)
+### 16.3c Digital demodulation (FT8 / JS8 / FT4)
  
  The digital core is `DigitalCore::process`
  ([`demod/digital.rs:87`](hl2/src/receiver/demod/digital.rs:87)): **NCO →
@@ -1233,7 +1210,7 @@ BasebandSource               Demodulator                      AudioSink
  `DigitalCore::new(…, <label>).demodulator(…)` in
  [`make_demod_tap`](hl2/src/receiver/demod/mod.rs:133).
 
-### 16.3d FM / NFM demodulation (phase derivative of a polyphase-LPF'd complex baseband)
+### 16.3d FM / NFM demodulation
 
   The FM core is `FmCore::process`
   ([`demod/fm.rs:148`](hl2/src/receiver/demod/fm.rs:148)); standard FM
@@ -1318,80 +1295,6 @@ BasebandSource               Demodulator                      AudioSink
   Dispatch: `Mode::{Fm,FmNarrow}` →
   `FmCore::new(…, "fm"|"nfm").demodulator(…)` in
   [`make_demod_tap`](hl2/src/receiver/demod/mod.rs:167).
-
-### 16.3e — The S-meter: a consumer of the displayed slot's *band spectrum*
-
-The S-meter is **not** part of the `hl2` DSP tail any more (the in-engine
-`meter_tick` is gone). It is an `hl2-api` consumer of the **band spectrum**
-that `run_spectral` already produces for the panadapter/waterfall — a
-single, mode-agnostic source of both the *signal* and the *noise floor*.
-
-The core insight is that a band spectrum has two cleanly separable
-quantities, and *mode enters only to select the passband window*:
-
-* **level** = the **root-mean-square** spectral energy *inside* the running
-  receiver's channel passband. Measuring **energy, not a single peak bin**,
-  means an AM carrier (a huge, near-constant DC line) blends with its
-  sidebands, so the reading rises and falls with the **modulation** (speech
-  vs. silence) instead of latching onto the constant carrier. The window the
-  RMS is taken over is *mode-oriented* — it mirrors the band the UI shades on
-  the panadapter (see `draw_vrx_passband`), so it is the band the receiver
-  actually passes:
-
-  | mode          | passband window          |
-  | ------------- | ------------------------ |
-  | USB, FT8/FT4/JS8 | `[centre, centre+bw]`  |
-  | LSB           | `[centre−bw, centre]`     |
-  | AM, FM, NFM   | `[centre−bw, centre+bw]`  |
-
-  This orientation is the single source of the `VrxMode → PassbandShape`
-  mapping (`crate::meter::shape_for_mode`, written to
-  `RadioHub::passband_mode` on `set_vrx`). Without it USB and LSB read
-  identically (the meter latched onto the *other* sideband's carrier, which
-  the receiver never passes).
-* **floor** = the 25th percentile of the *whole* display's magnitudes. A
-  single carrier/tone sits in a handful of the hundreds of noise bins, so the
-  percentile lands on the **noise** regardless of where — or whether — the
-  signal is. This is the band's ambient floor.
-
-Both are computed **per FFT frame** by the pure function
-[`compute_s_meter`](api/src/meter.rs) — `mags` (the displayed band
-magnitudes, scaled `0..=65535`) + the passband width (in display bins,
-derived in `run_spectral` from the running receiver's channel bandwidth,
-`RadioHub::passband_bw`) + the [`PassbandShape`](api/src/meter.rs) + a `25`
-percentile. The reading the UI renders is `level − floor`, in dB of *band
-signal energy over the noise floor* — a mode-agnostic band SNR that works
-identically for SSB, AM, FM, NFM and the digital modes (tones read as
-in-band energy over the noise). Measuring RMS rather than the peak also
-**rescales the absolute level reading**: a single narrow line (CW / FT8) is
-`10·log10(bins)` dB below where the old *peak* reading placed it, and an AM
-carrier's DC line no longer dominates. The relative S-unit ordering against
-the noise floor is preserved — only the numeric values shift.
-
-Concretely:
-
-* **`vrx_levels`** ([`common/src/lib.rs`](common/src/lib.rs)) — the passband
-  peak, dB relative to the band's full scale.
-* **`vrx_floors`** ([`common/src/lib.rs`](common/src/lib.rs)) — the band
-  noise floor, dB, same reference.
-
-The reading the UI renders is **`vrx_levels[slot] − vrx_floors[slot]`, in dB
-of signal over the band floor** — a scale-independent SNR that works
-identically for SSB, AM, FM, NFM, and the digital modes (FT8/JS8/FT4 tones
-read as passband energy over the noise).
-
-Wiring: `run_spectral` already runs the FFT every frame and owns the band
-magnitudes, so it computes the meter when the displayed source is an EP6
-per-slot stream (`SpectrumSource::Ep6 { slot }`) and pushes it into a
-`MeterState` (three lock-free `AtomicU64`s: slot, level, floor —
-[`api/src/meter.rs`](api/src/meter.rs)). `Session::shared_state` reads that
-back into `vrx_levels` / `vrx_floors` (only for the slot currently on
-display), and the ~100 ms `run_levels` task re-broadcasts so a freshly-opened
-client's `welcome`/`get_state` carries the live reading. The demod's pre-AGC
-`RawSampleTap` seam now carries **only** the FT8/JS8/FT4 decoders — no
-composite, no meter. UI-side `track_floors`
-([`ui/src/app.rs`](ui/src/app.rs)) remains a *fallback* for old servers; the
-server-supplied `vrx_floors` wins when present.
 
 ### 16.4 Sinks
 

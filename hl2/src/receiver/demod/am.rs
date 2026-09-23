@@ -37,6 +37,7 @@ use num_complex::Complex;
 #[cfg(not(feature = "std"))]
 use num_traits::Float as _;
 
+use super::DemodError;
 use super::core::DemodCore;
 use super::dsp::{F32Fir, KAISER_BETA, Nco, PolyphaseDecimator};
 use crate::receiver::AudioConfig;
@@ -54,6 +55,10 @@ pub struct AmCore {
     nco: Nco,
     lp_i: PolyphaseDecimator,
     lp_q: PolyphaseDecimator,
+    /// The full-rate complex source sample rate (`Hz`) the core was built for
+    /// — fixed for the receiver's lifetime, stored for in-place retune
+    /// (`Nco::set_step` needs `2π·center / source_rate`).
+    source_rate_hz: u32,
 }
 
 impl AmCore {
@@ -82,7 +87,29 @@ impl AmCore {
         let lp_i = PolyphaseDecimator::new(&h, m);
         let lp_q = PolyphaseDecimator::new(&h, m);
         let nco = Nco::new(2.0 * consts::PI * source_center_hz / source_rate_hz as f64);
-        Self { nco, lp_i, lp_q }
+        Self {
+            nco,
+            lp_i,
+            lp_q,
+            source_rate_hz,
+        }
+    }
+
+    /// Retune in place: change the channel NCO to `source_center_hz` and
+    /// re-tap the channel-select LPF for `bandwidth_hz`, reusing the *exact*
+    /// tap-width heuristic and ratio of [`AmCore::new`] (257 taps for the
+    /// narrow voice bands, 129 for wider; `bw/source_rate` passband, clamped
+    /// `1e-3..0.4`). The decimation factor is rate-derived and already
+    /// stored in the decimators, so the retap keeps it (branch count).
+    pub fn retune_params(&mut self, source_center_hz: f64, bandwidth_hz: u32) {
+        self.nco
+            .set_step(2.0 * consts::PI * source_center_hz / self.source_rate_hz as f64);
+        let bw_ratio = (bandwidth_hz as f64 / self.source_rate_hz as f64).clamp(1e-3, 0.4);
+        let taps = if bandwidth_hz <= 4_000 { 257 } else { 129 };
+        let h = F32Fir::lowpass(taps, bw_ratio, KAISER_BETA).taps().to_vec();
+        let m = self.lp_i.decimation();
+        self.lp_i.retap(&h, m);
+        self.lp_q.retap(&h, m);
     }
 }
 
@@ -117,6 +144,11 @@ impl DemodCore for AmCore {
 
     fn kind(&self) -> &'static str {
         "am"
+    }
+
+    fn retune(&mut self, source_center_hz: f64, bandwidth_hz: u32) -> Result<(), DemodError> {
+        self.retune_params(source_center_hz, bandwidth_hz);
+        Ok(())
     }
 }
 

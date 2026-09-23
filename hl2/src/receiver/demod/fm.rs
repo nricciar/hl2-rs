@@ -60,6 +60,7 @@ use num_complex::Complex;
 #[cfg(not(feature = "std"))]
 use num_traits::Float as _;
 
+use super::DemodError;
 use super::core::DemodCore;
 use super::dsp::{F32Fir, KAISER_BETA, Nco, PolyphaseDecimator};
 use crate::receiver::AudioConfig;
@@ -88,6 +89,10 @@ pub struct FmCore {
     /// value). Updated on every emitted sample; the phase-derivative read
     /// is `phase − prev_phase` wrapped to `(−π, π]`.
     prev_phase: f32,
+    /// The full-rate complex source sample rate (`Hz`) the core was built for
+    /// — fixed for the receiver's lifetime, stored for in-place retune
+    /// (`Nco::set_step` needs `2π·center / source_rate`).
+    source_rate_hz: u32,
 }
 
 impl FmCore {
@@ -130,12 +135,32 @@ impl FmCore {
             lp_q,
             label,
             prev_phase: 0.0,
+            source_rate_hz,
         }
     }
 
     /// The kind tag this instance was built with (`"fm"` / `"nfm"`).
     pub fn label(&self) -> &'static str {
         self.label
+    }
+
+    /// Retune in place: change the channel NCO to `source_center_hz` and
+    /// re-tap the channel-select LPF for `bandwidth_hz`, reusing the *exact*
+    /// tap-width heuristic and ratio of [`FmCore::new`]. The decimation
+    /// factor is rate-derived and kept (branch count) via `retap`.
+    pub fn retune_params(&mut self, source_center_hz: f64, bandwidth_hz: u32) {
+        self.nco
+            .set_step(2.0 * consts::PI * source_center_hz / self.source_rate_hz as f64);
+        let bw_ratio = (bandwidth_hz as f64 / self.source_rate_hz as f64).clamp(1e-3, 0.4);
+        let taps = if bandwidth_hz <= 4_000 { 257 } else { 129 };
+        let h = F32Fir::lowpass(taps, bw_ratio, KAISER_BETA).taps().to_vec();
+        let m = self.lp_i.decimation();
+        self.lp_i.retap(&h, m);
+        self.lp_q.retap(&h, m);
+        // Retune invalidates the phase accumulator's prior sample (the band
+        // and hence the demodulated phase have changed); reset it so the
+        // first post-retune delta is a small value, not a full-cycle jump.
+        self.prev_phase = 0.0;
     }
 }
 
@@ -169,6 +194,11 @@ impl DemodCore for FmCore {
 
     fn kind(&self) -> &'static str {
         self.label
+    }
+
+    fn retune(&mut self, source_center_hz: f64, bandwidth_hz: u32) -> Result<(), DemodError> {
+        self.retune_params(source_center_hz, bandwidth_hz);
+        Ok(())
     }
 }
 

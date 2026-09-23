@@ -182,11 +182,11 @@ impl Mode {
             Mode::FmNarrow => 5_000,
             Mode::Ssb(_) => 2_600,
             #[cfg(feature = "ft8")]
-            Mode::Ft8 => 2_600,
+            Mode::Ft8 => 3_000,
             #[cfg(feature = "js8")]
-            Mode::Js8 => 2_600,
+            Mode::Js8 => 3_000,
             #[cfg(feature = "ft4")]
-            Mode::Ft4 => 2_600,
+            Mode::Ft4 => 3_000,
         }
     }
 
@@ -359,6 +359,36 @@ impl VirtualReceiver {
     pub fn frames_processed(&self) -> usize {
         self.frames.load(Ordering::Relaxed)
     }
+
+    /// Change the playback gain (dB, applied on top of the AGC) **in place**
+    /// — no thread restart, no audio gap. Takes effect on the next emitted
+    /// block (the audio tail reads `gain_db` fresh on every emit).
+    pub fn set_gain_db(&mut self, gain_db: f32) {
+        self.cfg.audio.gain_db = gain_db;
+        self.demod.set_gain_db(gain_db);
+    }
+
+    /// Retune the running receiver **in place** (no thread restart, no audio
+    /// gap): change the channel-offset NCO to `source_center_hz` (Hz from the
+    /// source centre) and re-tap the channel-select / quadrature DSP for
+    /// `bandwidth_hz`.
+    ///
+    /// The mode, sideband and audio rate are unchanged (a mode change still
+    /// requires a full rebuild by the caller). On success
+    /// [`Self::config`] reports the new `source_center_hz` /
+    /// `bandwidth_hz`. On error (the mode's core can't retune — see
+    /// [`demod::RetuneUnsupported`]) the receiver is left running with its
+    /// previous filters and the caller falls back to a rebuild.
+    pub fn retune(
+        &mut self,
+        source_center_hz: f64,
+        bandwidth_hz: u32,
+    ) -> Result<(), ReceiverError> {
+        self.demod.retune(source_center_hz, bandwidth_hz)?;
+        self.cfg.source_center_hz = source_center_hz;
+        self.cfg.bandwidth_hz = Some(bandwidth_hz.max(1));
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -416,6 +446,53 @@ mod tests {
         ] {
             VirtualReceiver::new(cfg(m), Box::new(VecSink::new())).expect("receiver build");
         }
+    }
+
+    /// [`VirtualReceiver::retune`] must update the receiver's reported config
+    /// (`source_center_hz` / `bandwidth_hz`) and still pass audio — and
+    /// [`VirtualReceiver::set_gain_db`] must propagate to the demod's audio
+    /// format (read per-emit). These are the two same-mode in-place knobs the
+    /// hub's retune mailbox drives without a thread restart.
+    #[test]
+    fn virtual_receiver_retune_updates_config_and_produces_audio() {
+        let rate = 192_000u32;
+        let center = 12_000.0;
+        let bw = 2_600u32;
+        let mut rx = VirtualReceiver::new(
+            ReceiverConfig {
+                mode: Mode::Ssb(Sideband::Usb),
+                source_rate_hz: rate,
+                source_center_hz: center,
+                bandwidth_hz: Some(bw),
+                ..Default::default()
+            },
+            Box::new(VecSink::new()),
+        )
+        .expect("receiver build");
+        assert_eq!(rx.config().source_center_hz, center);
+        assert_eq!(rx.config().bandwidth_hz, Some(bw));
+
+        // In-place retune to a wider band + a different offset: config must
+        // reflect the new values and the receiver must still demodulate.
+        let new_center = 5_500.0;
+        let new_bw = 4_000u32;
+        rx.retune(new_center, new_bw).expect("retune ok");
+        assert_eq!(rx.config().source_center_hz, new_center);
+        assert_eq!(rx.config().bandwidth_hz, Some(new_bw));
+
+        let iq = tone(rate, new_center + 1_500.0, 12_000, 0.5);
+        let frames = rx.process(&iq).expect("process ok");
+        assert!(frames > 0, "retuned receiver produced {frames} frames");
+
+        // set_gain_db propagates to the demod's audio format (per-emit read).
+        rx.set_gain_db(6.0);
+        let fmt = rx.audio_format();
+        assert!(
+            (fmt.gain_db - 6.0).abs() < 1e-9,
+            "gain not propagated: {}",
+            fmt.gain_db
+        );
+        assert!((rx.config().audio.gain_db - 6.0).abs() < 1e-9);
     }
 
     #[test]

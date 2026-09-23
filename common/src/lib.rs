@@ -778,7 +778,7 @@ mod tests {
         );
         // A non-zero NCO offset decodes too (a receiver not at the slot tune).
         let c: ClientCmd = serde_json::from_str(
-            r#"{"cmd":"setvrx","data":{"cfg":{"slot":2,"offset_hz":1500,"mode":"ft8","bw_hz":2600,"gain_db":0.0}}}"#,
+            r#"{"cmd":"setvrx","data":{"cfg":{"slot":2,"offset_hz":1500,"mode":"ft8","bw_hz":3000,"gain_db":0.0}}}"#,
         )
         .unwrap();
         assert_eq!(
@@ -788,7 +788,7 @@ mod tests {
                     slot: 2,
                     offset_hz: 1_500,
                     mode: VrxMode::Ft8,
-                    bw_hz: 2_600,
+                    bw_hz: 3_000,
                     gain_db: 0.0,
                 })
             }
@@ -833,7 +833,7 @@ mod tests {
             slot: 2,
             offset_hz: 1_500,
             mode: VrxMode::Ft8,
-            bw_hz: 2_600,
+            bw_hz: 3_000,
             gain_db: 0.0,
             rate_hz: 12_000,
             muted: true,
@@ -923,7 +923,7 @@ mod tests {
             slot: 1,
             offset_hz: 0,
             mode: VrxMode::Ft8,
-            bw_hz: 2_600,
+            bw_hz: 3_000,
             gain_db: 0.0,
             rate_hz: 12_000,
             muted: false,
@@ -932,7 +932,7 @@ mod tests {
             slot: 2,
             offset_hz: 1_500,
             mode: VrxMode::Js8,
-            bw_hz: 2_600,
+            bw_hz: 3_000,
             gain_db: 0.0,
             rate_hz: 12_000,
             muted: true,
@@ -1097,7 +1097,7 @@ mod tests {
             slot: 1,
             offset_hz: 0,
             mode: VrxMode::Js8,
-            bw_hz: 2_600,
+            bw_hz: 3_000,
             gain_db: 0.0,
             rate_hz: 12_000,
             muted: false,
