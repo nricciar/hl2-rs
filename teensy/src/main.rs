@@ -829,9 +829,8 @@ mod app {
             // next iteration.
             let steps = encoder::take_steps();
             if steps != 0 {
-                let new_nco =
-                    (nco_hz + (steps as i64) * (encoder::step_hz() as i64))
-                        .clamp(0, u32::MAX as i64) as u32;
+                let new_nco = (nco_hz + (steps as i64) * (encoder::step_hz() as i64))
+                    .clamp(0, u32::MAX as i64) as u32;
                 nco_hz = new_nco as i64;
                 shared::set_nco_hz(new_nco);
                 handle.send_tune(new_nco);
@@ -875,10 +874,12 @@ mod app {
         let mut status_detail = display::driver::TextLine::<32>::new();
         let mut status_meter = display::driver::TextLine::<16>::new();
         let mut status_cpu = display::driver::TextLine::<32>::new();
+        let mut status_freq = display::driver::TextLine::<24>::new();
 
         let mut painted_seq: u32 = 0;
         let mut last_state: u32 = u32::MAX;
         let mut last_peer: u32 = u32::MAX;
+        let mut last_nco: u32 = u32::MAX;
         let mut last_status_ms: i64 = now_millis();
         let mut last_heartbeat_ms: i64 = 0;
         let mut heartbeat_count: u32 = 0;
@@ -976,11 +977,13 @@ mod app {
 
             // Refresh status on changes and keep the RX counter live at 2 Hz.
             let now_ms = now_millis();
-            let st_changed = st != last_state || peer_u32 != last_peer;
+            let nco = shared::nco_hz();
+            let st_changed = st != last_state || peer_u32 != last_peer || nco != last_nco;
             let tick = (now_ms - last_status_ms) >= 500;
             if st_changed || tick {
                 last_state = st;
                 last_peer = peer_u32;
+                last_nco = nco;
                 last_status_ms = now_ms;
                 status_redraw(
                     &mut panel,
@@ -988,6 +991,7 @@ mod app {
                     &mut status_detail,
                     &mut status_meter,
                     &mut status_cpu,
+                    &mut status_freq,
                 );
             }
 
@@ -1003,6 +1007,7 @@ mod app {
         status_detail: &mut display::driver::TextLine<32>,
         status_meter: &mut display::driver::TextLine<16>,
         status_cpu: &mut display::driver::TextLine<32>,
+        status_freq: &mut display::driver::TextLine<24>,
     ) {
         let label = match shared::state() {
             shared::STATE_WAITING_IP => "WAIT IP",
@@ -1030,6 +1035,20 @@ mod app {
         write!(w, " F {}", shared::frames()).unwrap();
         let line_s = core::str::from_utf8(&w.target[..w.pos]).unwrap();
         status_detail.update(panel, 6, wf_y + 30, line_s, 0xF800, 0x0000);
+
+        // NCO line: the current RX1 NCO (kHz, 0.001 kHz resolution) updated
+        // live on every encoder retune.
+        let hz = shared::nco_hz();
+        let khz = hz / 1000;
+        let frac = (hz % 1000) as u32;
+        let mut freq = [0u8; 20];
+        let mut wf = radio::control::WriteBuf {
+            target: &mut freq,
+            pos: 0,
+        };
+        let _ = write!(wf, "{khz}.{frac:03} kHz RX1 96k");
+        let freq_s = core::str::from_utf8(&wf.target[..wf.pos]).unwrap();
+        status_freq.update(panel, 6, wf_y + 76, freq_s, 0xF800, 0x0000);
 
         // S-meter readout. The bar is `S1..S9` (one segment per unit), the
         // raw dB-over-floor margin to its right. The bar sits below the
