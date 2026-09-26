@@ -143,7 +143,7 @@ mod app {
 
     use super::{POLLER, cycles_now, ms_since, now_millis, poll_log};
     use cortex_m::peripheral::DWT;
-    use hl2_teensy::{autoscale, display, i2c, radio, shared, spectrum};
+    use hl2_teensy::{autoscale, display, encoder, i2c, radio, shared, spectrum};
     use imxrt_log as logging;
     use rtic_monotonics::systick::ExtU64;
     use rtic_monotonics::systick::Systick;
@@ -169,6 +169,25 @@ mod app {
         }
     }
 
+    /// Rotary-encoder A channel (p28, GPIO3_IO18) edge handler. Priority 1 —
+    /// above the priority-0 radio/render/audio software tasks, below the
+    /// priority-3 DMA IRQs. The encoder module owns the quadrature state and
+    /// the shared step counter, so the handler body is tiny (read PSR,
+    /// table-lookup, W1C-clear) and never blocks.
+    #[task(binds = GPIO3_COMBINED_16_31, priority = 1)]
+    fn enc_a_irq(_cx: enc_a_irq::Context) {
+        encoder::handle_edge();
+        encoder::clear_isr_gpio3_pin18();
+    }
+
+    /// Rotary-encoder B channel (p29, GPIO4_IO31) edge handler — same
+    /// contract as the A channel; both call into the same state machine.
+    #[task(binds = GPIO4_COMBINED_16_31, priority = 1)]
+    fn enc_b_irq(_cx: enc_b_irq::Context) {
+        encoder::handle_edge();
+        encoder::clear_isr_gpio4_pin31();
+    }
+
     /// Task-local type alias for the ILI9341 panel.
     type Panel = display::driver::Display;
 
@@ -186,6 +205,8 @@ mod app {
     fn init(cx: init::Context) -> (Shared, Local) {
         let board::Resources {
             mut gpio2,
+            mut gpio3,
+            mut gpio4,
             pins,
             usb,
             lpspi4,
@@ -240,6 +261,15 @@ mod app {
             board::ARM_FREQUENCY,
             rtic_monotonics::create_systick_token!(),
         );
+
+        // Rotary quadrature encoder on p28 (A, GPIO3_IO18) / p29 (B,
+        // GPIO4_IO31): pull-up + hysteresis on both pads, both-edge GPIO
+        // interrupts, and the NVIC vectors enabled/prioritized (see
+        // `encoder::init`). Must run before the first `radio_task` loop
+        // iteration (which drains `take_steps()`) and before any edge can
+        // fire into the enc_a/enc_b ISR tasks.
+        encoder::init(gpio3, gpio4, pins.p28, pins.p29);
+        shared::set_nco_hz(radio::control::TUNE_HZ);
 
         // Pins: CS=p10, DC=p9 (GPIO2); LPSPI4 SDO=p11, SDI=p12, SCK=p13.
         //
@@ -691,6 +721,11 @@ mod app {
         handle.send_lna(radio::control::LNA_GAIN_DB);
         handle.send_tune(radio::control::TUNE_HZ);
 
+        // Current RX1 NCO (Hz), mutated by the encoder retune path in the
+        // streaming loop below. `i64` so signed step deltas are trivial;
+        // `send_tune` takes `u32` (clamped on each retune).
+        let mut nco_hz: i64 = radio::control::TUNE_HZ as i64;
+
         // 8. Streaming.
         shared::set_state(shared::STATE_STREAMING);
         log::info!("EP6 streaming at 96 kSps, NCO 7.074 MHz (RX1)");
@@ -785,6 +820,21 @@ mod app {
             if ms_since(last_keepalive, now_c) >= radio::control::KEEPALIVE_INTERVAL_MS_CONST {
                 last_keepalive = now_c;
                 handle.send_keepalive();
+            }
+
+            // Encoder retune: drain signed quadrature steps accumulated by the
+            // enc_a/enc_b ISR tasks and step the RX1 NCO by ±`step_hz()` per
+            // detent. `take_steps` swaps the pending counter to 0 under
+            // AcqRel, so any steps that arrived mid-`send_tune` are picked up
+            // next iteration.
+            let steps = encoder::take_steps();
+            if steps != 0 {
+                let new_nco =
+                    (nco_hz + (steps as i64) * (encoder::step_hz() as i64))
+                        .clamp(0, u32::MAX as i64) as u32;
+                nco_hz = new_nco as i64;
+                shared::set_nco_hz(new_nco);
+                handle.send_tune(new_nco);
             }
 
             Systick::delay(1.millis()).await;

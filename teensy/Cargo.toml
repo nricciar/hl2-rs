@@ -37,10 +37,16 @@ features = [
     "rt",
 ]
 
-# Unoptimized smoltcp exceeds the BSP's 192 KiB ITCM region. Keep debug
-# symbols and assertions, but optimize firmware even for development builds.
+# The firmware sits right at the BSP's 192 KiB ITCM limit (`.text`). Keep
+# debug assertions, but optimize like release and drop DWARF: `.text` needs
+# O3 + thin LTO + `codegen-units = 1` to fit the 192 KiB ITCM once the
+# encoder + ISR plumbing is linked (O2 overflows by ~3.7 KiB, thin LTO alone
+# doesn't collapse it). `debug = 0` matches the release setup that links.
 [profile.dev]
-opt-level = 1
+opt-level = 3
+lto = "thin"
+debug = 0
+codegen-units = 1
 
 # Don't optimize build dependencies, like proc macros.
 # Helps with build times.
