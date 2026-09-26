@@ -185,6 +185,20 @@ pub fn irq_fires_inc() {
     IRQ_FIRES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Current RX1 NCO frequency (Hz). The radio task publishes it after each
+/// encoder retune; the render task displays it on the status line.
+static NCO_HZ: AtomicU32 = AtomicU32::new(0);
+
+/// Publish the current RX1 NCO frequency (Hz).
+pub fn set_nco_hz(hz: u32) {
+    NCO_HZ.store(hz, Ordering::Release);
+}
+
+/// The current RX1 NCO frequency (Hz); 0 until the first tune is sent.
+pub fn nco_hz() -> u32 {
+    NCO_HZ.load(Ordering::Acquire)
+}
+
 pub fn cpu_demod_pct() -> u32 {
     CPU_DEMOD_PCT.load(Ordering::Acquire)
 }
