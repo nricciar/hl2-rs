@@ -169,15 +169,32 @@ mod app {
         }
     }
 
-    /// Rotary-encoder A channel (p28, GPIO3_IO18) edge handler. Priority 1 —
-    /// above the priority-0 radio/render/audio software tasks, below the
-    /// priority-3 DMA IRQs. The encoder module owns the quadrature state and
-    /// the shared step counter, so the handler body is tiny (read PSR,
-    /// table-lookup, W1C-clear) and never blocks.
+    /// GPIO3 **upper-half** (bits 16..=31) IRQ handler. The RT1060 routes
+    /// each 16-bit half of a GPIO port through a separate vector — A
+    /// (p28, bit 18) **and** the button (p30, bit 23) both land on *this*
+    /// vector (see `encoder::isr_gpio3_upper_active`). Priority 1 — above
+    /// priority-0 radio/render/audio tasks, below priority-3 DMA IRQs.
+    ///
+    /// The encoder module owns its quadrature state and the shared counters,
+    /// so the handler body is tiny (bit inspect, table-lookup, W1C-clear)
+    /// and never blocks. We must clear *every* pending bit that fired us,
+    /// or the vector will re-fire forever (bit 23 re-fires at priority 1
+    /// and starves all the priority-0 tasks — the mode-toggle freeze).
     #[task(binds = GPIO3_COMBINED_16_31, priority = 1)]
     fn enc_a_irq(_cx: enc_a_irq::Context) {
-        encoder::handle_edge();
-        encoder::clear_isr_gpio3_pin18();
+        let active = encoder::isr_gpio3_upper_active();
+        if active & (1u32 << 18) != 0 {
+            // A pin fired: advance the quadrature state machine.
+            encoder::handle_edge();
+            encoder::clear_isr_gpio3_pin18();
+        }
+        if active & (1u32 << 23) != 0 {
+            // Button fired: latch the pending mode-toggle request. Do NOT
+            // call `handle_edge` for the button — bit 23 is not part of
+            // the quadrature phase (that's bits 18 + 31 on GPIO3/GPIO4).
+            encoder::handle_button_press();
+            encoder::clear_isr_gpio3_pin23();
+        }
     }
 
     /// Rotary-encoder B channel (p29, GPIO4_IO31) edge handler — same
@@ -186,6 +203,20 @@ mod app {
     fn enc_b_irq(_cx: enc_b_irq::Context) {
         encoder::handle_edge();
         encoder::clear_isr_gpio4_pin31();
+    }
+
+    /// Rotary-encoder push button (p30, GPIO3_IO23) — RX1 mode toggle.
+    /// Falling-edge only (the pad has a pull-up, so a press is always a
+    /// LOW-going transition); the ISR body is two calls: latch the pending
+    /// request, then W1C-clear the GPIO3 bit so the ISR doesn't re-fire.
+    /// Bounce is tolerated — the radio task's debounce (it only commits
+    /// the toggle if the pad is *still* low after `take_mode_request`
+    /// returns true) means a few extra falling edges in the 100 µs
+    /// debounce window collapse to one.
+    #[task(binds = GPIO3_COMBINED_0_15, priority = 1)]
+    fn enc_btn_irq(_cx: enc_btn_irq::Context) {
+        encoder::handle_button_press();
+        encoder::clear_isr_gpio3_pin23();
     }
 
     /// Task-local type alias for the ILI9341 panel.
@@ -205,8 +236,8 @@ mod app {
     fn init(cx: init::Context) -> (Shared, Local) {
         let board::Resources {
             mut gpio2,
-            mut gpio3,
-            mut gpio4,
+            gpio3,
+            gpio4,
             pins,
             usb,
             lpspi4,
@@ -263,12 +294,14 @@ mod app {
         );
 
         // Rotary quadrature encoder on p28 (A, GPIO3_IO18) / p29 (B,
-        // GPIO4_IO31): pull-up + hysteresis on both pads, both-edge GPIO
-        // interrupts, and the NVIC vectors enabled/prioritized (see
-        // `encoder::init`). Must run before the first `radio_task` loop
-        // iteration (which drains `take_steps()`) and before any edge can
-        // fire into the enc_a/enc_b ISR tasks.
-        encoder::init(gpio3, gpio4, pins.p28, pins.p29);
+        // GPIO4_IO31), plus its push button on p30 (GPIO3_IO23 — the
+        // encoder's RX1 mode-toggle key): pull-up + hysteresis on all three
+        // pads, A/B both-edge + button falling-edge GPIO interrupts, and the
+        // NVIC vectors enabled/prioritized (see `encoder::init`). Must run
+        // before the first `radio_task` loop iteration (which drains
+        // `take_steps()` + `take_mode_request()`) and before any edge can
+        // fire into the enc_a/enc_b/enc_btn ISR tasks.
+        encoder::init(gpio3, gpio4, pins.p28, pins.p29, pins.p30);
         shared::set_nco_hz(radio::control::TUNE_HZ);
 
         // Pins: CS=p10, DC=p9 (GPIO2); LPSPI4 SDO=p11, SDI=p12, SCK=p13.
@@ -781,8 +814,11 @@ mod app {
                 shared::publish(pipeline.mags());
                 // The S-meter is a spectrum consumer (PROTOCOL.md §16.3e) — the
                 // same 320-bin row the render task blits. Compute it here, off
-                // the render path, so the render task just paints.
-                let m = hl2_teensy::smeter::compute(pipeline.mags());
+                // the render path, so the render task just paints. Its
+                // passband follows the running RX1 mode (USB/LSB = one
+                // sideband, AM/FM/NFM = the centred double-sideband window).
+                let m =
+                    hl2_teensy::smeter::compute_for_mode(pipeline.mags(), shared::rx1_mode_index());
                 shared::set_slevel(m.sunits, m.margin_db);
                 // Auto floor/ceil: advance the window from the *same* row and
                 // publish it so the render task's `bin_color` ramps the live
@@ -836,6 +872,39 @@ mod app {
                 handle.send_tune(new_nco);
             }
 
+            // Encoder push button (p30) → RX1 mode toggle. The falling-edge
+            // ISR latched a pending request (`encoder::handle_button_press`);
+            // drain it here in the same drain step as the steps above. On a
+            // true press, advance the shared mode index (USB → LSB → AM → FM
+            // → NFM → USB …) and rebuild the virtual receiver's demod in
+            // place (`Rx::set_mode` reuses the I2S sink, so the audio path is
+            // uninterrupted). The render task notices the new index and
+            // repaints the mode label on the next status redraw.
+            //
+            // The shared index is advanced *before* the rebuild (via
+            // `next_rx1_mode`) so that if two presses land before the first
+            // rebuild completes, the rebuild is still for *the next entry*,
+            // not the same one — and if the rebuild fails we walk the index
+            // back so the label matches the receiver's actual mode.
+            if encoder::take_mode_request() {
+                let new_idx = shared::next_rx1_mode();
+                match rx.set_mode(new_idx) {
+                    Ok(()) => {
+                        log::info!("RX1 mode → {}", hl2_teensy::mode::label_at(new_idx));
+                    }
+                    Err(e) => {
+                        let n = hl2_teensy::mode::len();
+                        shared::set_rx1_mode_index((new_idx + n - 1) % n);
+                        log::warn!(
+                            "RX1 mode → {} failed: {}",
+                            hl2_teensy::mode::label_at(new_idx),
+                            e
+                        );
+                        poll_log();
+                    }
+                }
+            }
+
             Systick::delay(1.millis()).await;
             poll_log();
         }
@@ -874,12 +943,13 @@ mod app {
         let mut status_detail = display::driver::TextLine::<32>::new();
         let mut status_meter = display::driver::TextLine::<16>::new();
         let mut status_cpu = display::driver::TextLine::<32>::new();
-        let mut status_freq = display::driver::TextLine::<24>::new();
+        let mut status_freq = display::driver::TextLine::<28>::new();
 
         let mut painted_seq: u32 = 0;
         let mut last_state: u32 = u32::MAX;
         let mut last_peer: u32 = u32::MAX;
         let mut last_nco: u32 = u32::MAX;
+        let mut last_mode: u32 = u32::MAX;
         let mut last_status_ms: i64 = now_millis();
         let mut last_heartbeat_ms: i64 = 0;
         let mut heartbeat_count: u32 = 0;
@@ -978,12 +1048,17 @@ mod app {
             // Refresh status on changes and keep the RX counter live at 2 Hz.
             let now_ms = now_millis();
             let nco = shared::nco_hz();
-            let st_changed = st != last_state || peer_u32 != last_peer || nco != last_nco;
+            let mode_idx = shared::rx1_mode_index() as u32;
+            let st_changed = st != last_state
+                || peer_u32 != last_peer
+                || nco != last_nco
+                || mode_idx != last_mode;
             let tick = (now_ms - last_status_ms) >= 500;
             if st_changed || tick {
                 last_state = st;
                 last_peer = peer_u32;
                 last_nco = nco;
+                last_mode = mode_idx;
                 last_status_ms = now_ms;
                 status_redraw(
                     &mut panel,
@@ -1007,7 +1082,7 @@ mod app {
         status_detail: &mut display::driver::TextLine<32>,
         status_meter: &mut display::driver::TextLine<16>,
         status_cpu: &mut display::driver::TextLine<32>,
-        status_freq: &mut display::driver::TextLine<24>,
+        status_freq: &mut display::driver::TextLine<28>,
     ) {
         let label = match shared::state() {
             shared::STATE_WAITING_IP => "WAIT IP",
@@ -1041,12 +1116,13 @@ mod app {
         let hz = shared::nco_hz();
         let khz = hz / 1000;
         let frac = (hz % 1000) as u32;
-        let mut freq = [0u8; 20];
+        let mode_label = hl2_teensy::mode::label_at(shared::rx1_mode_index());
+        let mut freq = [0u8; 28];
         let mut wf = radio::control::WriteBuf {
             target: &mut freq,
             pos: 0,
         };
-        let _ = write!(wf, "{khz}.{frac:03} kHz RX1 96k");
+        let _ = write!(wf, "{khz}.{frac:03} kHz {mode_label} 96k");
         let freq_s = core::str::from_utf8(&wf.target[..wf.pos]).unwrap();
         status_freq.update(panel, 6, wf_y + 76, freq_s, 0xF800, 0x0000);
 

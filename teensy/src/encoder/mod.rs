@@ -1,36 +1,48 @@
 //! Rotary-encoder RX1 NCO tuning: pins 28 (A) / 29 (B), edge-triggered GPIO
-//! interrupts on both quadrature channels.
+//! interrupts on both quadrature channels, plus the encoder's push button
+//! (pin 30) — a falling-edge GPIO interrupt that requests an RX1 mode change
+//! (see [`handle_button_press`] / [`take_mode_request`]).
 //!
 //! Pin/port mapping on the RT1060 (i.MX RT 1062 family):
 //!
-//! * p28 → `GPIO_EMC_32` pad ⇒ GPIO3_IO18  (bit 18 ≥ 0x8000 = port 1 of GPIO3)
-//! * p29 → `GPIO_EMC_31` pad ⇒ GPIO4_IO31  (bit 31 ≥ 0x8000 = port 1 of GPIO4)
+//! * p28 → `GPIO_EMC_32` pad ⇒ GPIO3_IO18  (bit 18, in the **upper** half of GPIO3)
+//! * p29 → `GPIO_EMC_31` pad ⇒ GPIO4_IO31  (bit 31, in the **upper** half of GPIO4)
+//! * p30 → `GPIO_EMC_37` pad ⇒ GPIO3_IO23  (bit 23, in the **upper** half of GPIO3)
 //!
-//! Because the RT1060 routes each 16-bit half of a GPIO port through a
-//! separate IRQ vector, the active vectors are the *combined* "16..31"
-//! ones for both ports (pin 18 is in the upper half of GPIO3; pin 31 is in
-//! the upper half of GPIO4):
+//! The RT1060 routes each 16-bit half of a GPIO port through a **separate
+//! IRQ vector**: bits 0..=15 → `GPIOx_COMBINED_0_15`; bits 16..=31 →
+//! `GPIOx_COMBINED_16_31`. All three of our pins are in upper halves, so
+//! the A channel (bit 18) **and** the button (bit 23) land on the **same
+//! vector** `GPIO3_COMBINED_16_31`. The handler for that vector must
+//! therefore inspect [`isr_gpio3_upper_active`], and clear each pending bit
+//! individually via the W1C-clearers below. The `0_15` vector is bound too
+//! (as a fallback / semantic home) but the button never fires it in the
+//! current layout.
 //!
-//! * `GPIO3_COMBINED_16_31` (irq 85) → handles the A channel (pin 28)
-//! * `GPIO4_COMBINED_16_31` (irq 87) → handles the B channel (pin 29)
+//! All three vectors are bound in the RTIC `[task(binds = …)]` handlers in
+//! `main.rs`. The A/B handlers call [`handle_edge`] (advance the quadrature
+//! state machine, accumulate a pending step count); the button handler
+//! calls [`handle_button_press`] (latch a pending mode-toggle request).
+//! Each clears its own ISR bit with the matching `clear_isr_*` W1C helper.
 //!
-//! Both vectors are bound in the RTIC `[task(binds = …)]` handlers in
-//! `main.rs`; the ISR tasks there call [`handle_edge`] (which advances the
-//! quadrature state machine and accumulates a pending step count) and then
-//! [`clear_isr_gpio3_pin18`] / [`clear_isr_gpio4_pin31`] (W1C).
+//! The `radio_task` polls [`take_steps`] and [`take_mode_request`] every
+//! loop iteration. Per-step is user-configurable via [`set_step_hz`]; the
+//! current NCO is published via [`crate::shared::set_nco_hz`]; the
+//! cumulative retune count is available via [`retunes`].
 //!
-//! The `radio_task` polls [`take_steps`] every loop iteration; for each
-//! pending step it calls `handle.send_tune(NCO ± step_hz())`. Per-step is
-//! user-configurable via [`set_step_hz`]; the current NCO is published via
-//! [`crate::shared::set_nco_hz`] / [`crate::shared::nco_hz`] so the
-//! `render` task can show it, and the cumulative retune count is available
-//! via [`retunes`].
+//! The encoder's push button (p30) latches a pending mode-toggle request on
+//! a falling edge; the radio task drains it with [`take_mode_request`] in
+//! the same drain step as [`take_steps`] and advances the shared RX1 mode
+//! index (see `crate::shared::next_rx1_mode`) before rebuilding its virtual
+//! receiver (`crate::radio::rx::Rx::set_mode`). The task never samples the
+//! pin — the falling-edge ISR latches `true`, a later press just re-latches
+//! it, and the radio task sees one request per press.
 
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicI32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use cortex_m::interrupt::Mutex;
 use teensy4_bsp::hal::gpio::{Port, Trigger};
-use teensy4_bsp::pins::t41::{P28, P29};
+use teensy4_bsp::pins::t41::{P28, P29, P30};
 
 /// Per-step RX1 NCO increment (Hz). Positive = CW = up; the state machine
 /// also emits `−1` for CCW, so the total shift is `step × step_hz`.
@@ -40,6 +52,19 @@ static ENC_STEPS: AtomicI32 = AtomicI32::new(0);
 static ENC_RETUNES: AtomicI32 = AtomicI32::new(0);
 static ENC_STEP_HZ: AtomicI32 = AtomicI32::new(DEFAULT_STEP_HZ);
 static ENC_PHASE: Mutex<RefCell<u8>> = Mutex::new(RefCell::new(0));
+
+/// Push button (p30, GPIO3_IO23) — pending RX1 mode-toggle request. The
+/// falling-edge ISR latches this to `true` ([`handle_button_press`]); the
+/// radio task drains it with [`take_mode_request`] (an atomic flag swap,
+/// the same drain pattern as [`take_steps`]) and then advances the shared
+/// RX1 mode index and rebuilds its virtual receiver (see
+/// `crate::shared::next_rx1_mode` / `crate::radio::rx::Rx::set_mode`).
+///
+/// Pull-up + hysteresis (see [`init`]) make the idle pad level HIGH, so a
+/// *falling* edge is always the press. Hardware debounce is present on the
+/// button, so one press = one falling edge = one latch; the radio task does
+/// not re-sample the pin or time the edges.
+static BTN_TOGGLE_REQ: AtomicBool = AtomicBool::new(false);
 
 /// Set the per-step NCO increment. The radio task reads it on the next
 /// retune via [`step_hz`].
@@ -73,26 +98,32 @@ pub fn retunes() -> i32 {
 }
 
 /// Initialize pad pulls / hysteresis and the two GPIO inputs with both-edge
-/// triggers, plus the NVIC priorities for the two combined vectors.
+/// triggers, plus the push button (p30) with a falling-edge trigger, and the
+/// NVIC priorities for the three combined vectors.
 ///
 /// This is the sole caller of `set_interrupt` for these pins; once called,
 /// the pins are live and the ISR may fire on any subsequent edge.
-pub fn init(mut gpio3: Port, mut gpio4: Port, mut p28: P28, mut p29: P29) {
+pub fn init(mut gpio3: Port, mut gpio4: Port, mut p28: P28, mut p29: P29, mut p30: P30) {
     // Pull-up + hysteresis (Schmitt-trigger) for noise-robust edges.
     let pad = imxrt_iomuxc::Config::modify()
         .set_pull_keeper(Some(imxrt_iomuxc::PullKeeper::Pullup22k))
         .set_hysteresis(imxrt_iomuxc::Hysteresis::Enabled);
     imxrt_iomuxc::configure(&mut p28, pad);
     imxrt_iomuxc::configure(&mut p29, pad);
+    imxrt_iomuxc::configure(&mut p30, pad);
 
     let a = gpio3.input(p28).expect("p28 is a GPIO3 pin");
     let b = gpio4.input(p29).expect("p29 is a GPIO4 pin");
+    let btn = gpio3.input(p30).expect("p30 is a GPIO3 pin");
     gpio3
         .set_interrupt(&a, Some(Trigger::EitherEdge))
         .expect("a is on GPIO3 (same port)");
     gpio4
         .set_interrupt(&b, Some(Trigger::EitherEdge))
         .expect("b is on GPIO4 (same port)");
+    gpio3
+        .set_interrupt(&btn, Some(Trigger::FallingEdge))
+        .expect("btn is on GPIO3 (same port)");
 
     // NVIC: RTIC binds the `[task(binds = …)]` handlers for these vectors,
     // so the GPIO *block* (EDGE_SEL/IMR) is configured above and the vector
@@ -104,11 +135,15 @@ pub fn init(mut gpio3: Port, mut gpio4: Port, mut p28: P28, mut p29: P29) {
     // fast, never preempted by the radio pump, and it cannot starve the DMA
     // channels.
     unsafe {
+        // The push button (p30, GPIO3_IO23, lower half of GPIO3) is on the
+        // *other* 16-bit-half vector for the same GPIO3 block.
         cortex_m::peripheral::NVIC::unmask(teensy4_bsp::Interrupt::GPIO3_COMBINED_16_31);
         cortex_m::peripheral::NVIC::unmask(teensy4_bsp::Interrupt::GPIO4_COMBINED_16_31);
+        cortex_m::peripheral::NVIC::unmask(teensy4_bsp::Interrupt::GPIO3_COMBINED_0_15);
         let ipr = 0xE000_E400u32 as *mut u8;
-        *ipr.add(85) = 0x10; // GPIO3_COMBINED_16_31
-        *ipr.add(87) = 0x10; // GPIO4_COMBINED_16_31
+        *ipr.add(84) = 0x10; // GPIO3_COMBINED_0_15 (p30 push button)
+        *ipr.add(85) = 0x10; // GPIO3_COMBINED_16_31 (p28 A)
+        *ipr.add(87) = 0x10; // GPIO4_COMBINED_16_31 (p29 B)
     }
 
     // Seed the quadrature phase to the current pad state so the first
@@ -212,4 +247,53 @@ pub fn clear_isr_gpio4_pin31() {
     unsafe {
         (*teensy4_bsp::ral::gpio::GPIO4).ISR.write(1u32 << 31);
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Push button (p30) → RX1 mode toggle
+// ──────────────────────────────────────────────────────────────────────────
+
+/// p30 → `GPIO_EMC_37` pad ⇒ **GPIO3_IO23** (bit 23, lower half of GPIO3 ⇒
+/// `GPIO3_COMBINED_0_15`, irq 84).
+///
+/// Pull-up + hysteresis: idle pad is HIGH, press drives it LOW. The ISR is
+/// bound on the *falling* edge only, so one press fires the vector once.
+/// [`handle_button_press`] is idempotent (it only latches the flag to
+/// `true`), so a repeated falling edge — bounce, or a press held across an
+/// ISR re-fire before the radio task drains it — collapses to a single
+/// pending request.
+#[inline]
+pub fn handle_button_press() {
+    BTN_TOGGLE_REQ.store(true, Ordering::Release);
+}
+
+/// W1C-clear the push-button pin (GPIO3_IO23) bit in `ISR`. Must be called
+/// from the button ISR after [`handle_button_press`] has consumed the edge.
+#[inline]
+pub fn clear_isr_gpio3_pin23() {
+    // SAFETY: same argument as `clear_isr_gpio3_pin18`, for the upper half
+    // of the GPIO3 block (bit 23).
+    unsafe {
+        (*teensy4_bsp::ral::gpio::GPIO3).ISR.write(1u32 << 23);
+    }
+}
+
+/// Read back which of the GPIO3 *upper-half* interrupts (bits 16..=31) are
+/// pending: bit 18 (A channel, pin 28) and bit 23 (button, pin 30). Used by
+/// the `enc_a_irq` ISR to decide whether to handle the quadrature edge, the
+/// button, or both.
+#[inline]
+pub fn isr_gpio3_upper_active() -> u32 {
+    // SAFETY: ISR is a W1C RWRegister; the read returns the live pending
+    // state of any bit (1 = pending, 0 = clear).
+    unsafe { (*teensy4_bsp::ral::gpio::GPIO3).ISR.read() & 0xFFFF_0000 }
+}
+
+/// Drain the pending mode-toggle request. Returns `true` exactly once per
+/// press (the ISR latches it; this swaps it back to `false`). The caller
+/// (radio task) then advances the shared mode index and rebuilds its
+/// virtual receiver.
+#[inline]
+pub fn take_mode_request() -> bool {
+    BTN_TOGGLE_REQ.swap(false, Ordering::AcqRel)
 }

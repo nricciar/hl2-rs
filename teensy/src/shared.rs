@@ -189,6 +189,34 @@ pub fn irq_fires_inc() {
 /// encoder retune; the render task displays it on the status line.
 static NCO_HZ: AtomicU32 = AtomicU32::new(0);
 
+/// RX1 demod mode index into `crate::mode::MODES` (0 = USB). The radio
+/// task advances this on each encoder push-button press (via
+/// [`next_rx1_mode`]) and publishes the new value here; the render task
+/// reads it to display the current mode label. See `crate::mode` for the
+/// ordered list.
+static RX1_MODE_INDEX: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Publish a new RX1 mode index. The radio task calls this after it has
+/// successfully rebuilt its virtual receiver at that mode.
+pub fn set_rx1_mode_index(idx: usize) {
+    RX1_MODE_INDEX.store(idx, Ordering::Release);
+}
+
+/// The current RX1 mode index (into `crate::mode::MODES`); 0 until first change.
+pub fn rx1_mode_index() -> usize {
+    RX1_MODE_INDEX.load(Ordering::Acquire)
+}
+
+/// Advance the shared RX1 mode index to the next entry in `crate::mode::MODES`
+/// (wrapping) and return the new index. Caller is responsible for rebuilding
+/// the virtual receiver at that mode (see `crate::radio::rx::Rx::set_mode`).
+pub fn next_rx1_mode() -> usize {
+    let cur = RX1_MODE_INDEX.load(Ordering::Acquire);
+    let next = (cur + 1) % crate::mode::MODES.len();
+    RX1_MODE_INDEX.store(next, Ordering::Release);
+    next
+}
+
 /// Publish the current RX1 NCO frequency (Hz).
 pub fn set_nco_hz(hz: u32) {
     NCO_HZ.store(hz, Ordering::Release);

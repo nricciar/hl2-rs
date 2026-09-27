@@ -368,6 +368,72 @@ impl VirtualReceiver {
         self.demod.set_gain_db(gain_db);
     }
 
+    /// Change the receiver's demod mode **in place** (no full receiver
+    /// rebuild): tear down the current demodulator and build a new one from
+    /// the same `source_rate_hz` / `source_center_hz` / `audio` (only `mode`
+    /// changes; the band-select width resolves from `cfg.bandwidth_hz` if
+    /// set, otherwise from the new mode's default — matching `new`). The
+    /// `sink` is unchanged, so the downstream audio path (e.g. an I2S sink
+    /// feeding a codec) sees only a one-block transition on the first
+    /// `process` call after the swap.
+    ///
+    /// The new demodulator's DSP state (AGC, DC-blocker, channel-select
+    /// filter) is seeded fresh; the old state is dropped. Any block the old
+    /// demodulator was accumulating for its next `demod()` call is lost —
+    /// this is acceptable for a hardware-button mode toggle (a fraction of
+    /// a second of audio, bounded by the sink's block size).
+    ///
+    /// On success [`Self::config`] reports the new `mode`. On error
+    /// (e.g. a core's `new()` sanity check failed) the receiver is left
+    /// running with its **previous** demodulator.
+    pub fn set_mode(&mut self, mode: Mode) -> Result<(), ReceiverError> {
+        let bw = self
+            .cfg
+            .bandwidth_hz
+            .unwrap_or_else(|| mode.default_bandwidth_hz());
+        let new_demod = make_demod(
+            mode,
+            self.cfg.source_rate_hz,
+            self.cfg.source_center_hz,
+            bw,
+            self.cfg.audio,
+        )?;
+        self.demod = new_demod;
+        self.cfg.mode = mode;
+        // Keep `bandwidth_hz` (the *override*) in sync with what we actually
+        // built: if `cfg` carried no override, the new demod uses the mode
+        // default — record it so `config().bandwidth()` reports the truth.
+        if self.cfg.bandwidth_hz.is_none() {
+            self.cfg.bandwidth_hz = Some(bw);
+        }
+        Ok(())
+    }
+
+    /// Swap the running demodulator for `incoming` **in place, with no
+    /// allocation**: the caller built `incoming` ahead of time (e.g. from a
+    /// pre-built per-mode pool) and hands it over; this returns the
+    /// demodulator that was running so the caller can stash it for a later
+    /// swap back. Zero heap traffic per swap — the `Box` is just a pointer
+    /// move — which matters on a never-freed bump allocator.
+    ///
+    /// [`Self::config`] reports `mode` + (when the config carried no
+    /// `bandwidth_hz` override) `bandwidth_hz` as the *effective* width the
+    /// caller built `incoming` with — the same recording rule as
+    /// [`Self::set_mode`]. The `sink` is untouched, so the downstream audio
+    /// path sees only a one-block transition on the next `process`.
+    pub fn swap_demod(
+        &mut self,
+        incoming: Box<dyn Demodulator>,
+        mode: Mode,
+        bandwidth_hz: u32,
+    ) -> Box<dyn Demodulator> {
+        self.cfg.mode = mode;
+        if self.cfg.bandwidth_hz.is_none() {
+            self.cfg.bandwidth_hz = Some(bandwidth_hz);
+        }
+        core::mem::replace(&mut self.demod, incoming)
+    }
+
     /// Retune the running receiver **in place** (no thread restart, no audio
     /// gap): change the channel-offset NCO to `source_center_hz` (Hz from the
     /// source centre) and re-tap the channel-select / quadrature DSP for

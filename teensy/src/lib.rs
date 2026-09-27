@@ -23,6 +23,7 @@ pub mod display;
 pub mod encoder;
 pub mod ethernet;
 pub mod i2c;
+pub mod mode;
 pub mod radio;
 pub mod shared;
 pub mod smeter;

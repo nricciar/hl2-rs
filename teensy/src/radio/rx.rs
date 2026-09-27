@@ -16,22 +16,38 @@ use hl2::protocol::data::{
     BasebandChunk, HEADER_SIZE, parse_baseband_chunk_into, parse_data_header,
 };
 use hl2::protocol::{CHUNK_SIZE, DATA_PACKET_SIZE, ENDPOINT_DATA_TX};
-use hl2::receiver::VirtualReceiver;
+use hl2::receiver::{Demodulator, Mode, VirtualReceiver, make_demod};
 
+use crate::mode::len as mode_len;
 use crate::spectrum::Pipeline;
 
 /// The receive-side state the radio task owns (task-local; no sync needed).
 pub struct Rx {
     /// Fixed slots prevent malformed frames from dropping bump-allocated buffers.
     baseband: [BasebandChunk; 2],
-    /// The virtual USB-SSB receiver (offset 0) — the *same* demod pipeline as
-    /// the UI (`Mode::Ssb(Usb)`, 96 kSps → 2.6 kHz channel select → 4.8 kHz
-    /// audio). Built on [`hl2::ReceiverConfig::default()`] so it mirrors the
-    /// UI receiver exactly. It runs so the demod is exercised at CPU speed and
-    /// its cost is surfaced (see the radio task's CPU% readout); its audio is
-    /// routed through the I2S path (`crate::audio::sink::Sink`) → SAI1 → WM8731
-    /// (see `crate::audio` and the "Audio output" note in PROTOCOL.md §2 / §16).
+    /// The virtual-RX1 receiver (offset 0) — the *same* demod pipeline the
+    /// UI runs. Built on [`hl2::ReceiverConfig::default()`] (USB, 2.6 kHz)
+    /// so it mirrors the UI receiver byte-for-byte; its audio is routed
+    /// through the `crate::audio::sink::Sink` → SAI1 → WM8731 path. The
+    /// running demodulator is always `active`'s entry — the other
+    /// `crate::mode::len() - 1` live in [`pool`](Self::pool).
     vrx: VirtualReceiver,
+    /// The index into `crate::mode::MODES` the *running* demodulator is
+    /// (0 = USB at boot — must agree with `ReceiverConfig::default()`).
+    active: usize,
+    /// The *other* demodulators: index `i` holds `MODES[i]`'s demod (for
+    /// `i != self.active`), and `pool[self.active]` is `None` (that
+    /// demodulator is the one the `vrx` is running). Entries start `None`
+    /// and are built **once**, on first switch to them ([`set_mode`]), then
+    /// cached forever — so the *live* demod count is always ≤
+    /// `crate::mode::len()` (each slot only ever goes `None → Some` in the
+    /// one direction, back to `Some` holding its *own previous occupant*,
+    /// never rebuilt on top of a live one). That cap is what keeps the
+    /// no-free bump heap alive across a long button-tournament: a per-press
+    /// *rebuild* would leak a whole demod's DSP state every toggle and the
+    /// 160 KiB arena would run out. Once built, a switch is a pure
+    /// `mem::replace` pointer swap — zero heap traffic.
+    pool: [Option<Box<dyn Demodulator>>; mode_len()],
     /// Reused I/Q block handed to the virtual receiver each frame. Held as a
     /// field (not a per-call local) because the heap is a no_std bump arena
     /// that never frees — `clear()`, don't reallocate.
@@ -56,11 +72,24 @@ impl Rx {
         let sink = Box::new(crate::audio::sink::Sink::new());
         let vrx = VirtualReceiver::new(Default::default(), sink)
             .expect("virtual USB receiver at offset 0");
+        // The running demod is MODES[0]' (USB — `ReceiverConfig::default()`);
+        // the other entries start unbuilt ([`pool`](Self::pool) = all-`None`)
+        // and are **built once, on first switch, then cached for the life of
+        // the machine** (see `activate` below). Building is deferred out of
+        // `new` so the boot path stays light, and because each entry's `Some(..)`
+        // is written exactly once (the slot is never rebuilt back from `Some`
+        // — `activate` only ever writes `pool[old]=Some(..)` and
+        // `pool[old]` was `None` at that moment) the *live* demod count is
+        // always ≤ `crate::mode::len()`. That bound is what keeps the no-free
+        // bump heap alive across a long press-tournament: a per-press rebuild
+        // would allocate-and-leak a whole demod's DSP state every toggle.
         Self {
             baseband: core::array::from_fn(|_| BasebandChunk {
                 per_rx: alloc::vec::Vec::new(),
             }),
             vrx,
+            active: 0,
+            pool: core::array::from_fn(|_| None),
             iq_acc: Vec::new(),
             demod_cycles: 0,
             fft_cycles: 0,
@@ -81,6 +110,57 @@ impl Rx {
     /// per-second delta (see `crate::shared::set_cpu_fft_pct`).
     pub fn fft_cycles(&self) -> u64 {
         self.fft_cycles
+    }
+
+    /// Switch the running demodulator to `index` (into
+    /// `crate::mode::MODES`). On success the receiver runs `MODES[index]`;
+    /// on error it is left exactly as it was (callers can walk the shared
+    /// index back).
+    ///
+    /// The [`pool`](Self::pool) entry for `index` is either already built
+    /// (a pure pointer swap — zero heap traffic) or `None` on the *very
+    /// first* switch to that mode, in which case it is built now (a one-time
+    /// allocation; the pool's `None → Some`-only invariant means a mode is
+    /// never built twice, so a long button-tournament cannot exhaust the
+    /// no-free bump heap). The I2S sink is reused (the 10× upsample → SAI1 →
+    /// WM8731 path is unchanged), so no audio re-wiring — only the new demod's
+    /// fresh DSP state (AGC / DC-blocker / channel-select) is a one-block
+    /// transition on its first `process`.
+    pub fn set_mode(&mut self, index: usize) -> Result<(), hl2::receiver::ReceiverError> {
+        if index == self.active {
+            return Ok(());
+        }
+        let mode = crate::mode::mode_at(index);
+        let bw = mode.default_bandwidth_hz();
+        // Lazily build this mode's demod once (first switch to it); `None` is
+        // only ever reached for a slot that was never built, so `make_demod`
+        // runs at most once per entry — repeated toggles cost no heap.
+        let cfg = self.vrx.config();
+        let incoming = match self.pool[index].take() {
+            Some(d) => d,
+            None => make_demod(
+                mode,
+                cfg.source_rate_hz,
+                cfg.source_center_hz,
+                bw,
+                cfg.audio,
+            )?,
+        };
+        let retired = self.vrx.swap_demod(incoming, mode, bw);
+        self.pool[self.active] = Some(retired);
+        self.active = index;
+        Ok(())
+    }
+
+    /// The index the *running* demodulator is (into `crate::mode::MODES`).
+    pub fn mode_index(&self) -> usize {
+        self.active
+    }
+
+    /// The virtual receiver's current demod mode (the one at `mode_index()`
+    /// — `MODES[0]` = USB at boot, the most recent [`set_mode`] after that).
+    pub fn mode(&self) -> Mode {
+        crate::mode::mode_at(self.active)
     }
 
     /// Consume one 1032-byte datagram. Returns the number of complex I/Q

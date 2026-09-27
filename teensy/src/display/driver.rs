@@ -114,7 +114,7 @@ pub fn new_display(
         ili9341::DisplaySize240x320,
     )?;
     display.invert_mode(ili9341::ModeState::Off)?;
-    display.brightness(255)?;
+    display.brightness(99)?;
     Ok(display)
 }
 
