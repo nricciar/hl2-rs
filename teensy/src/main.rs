@@ -927,23 +927,15 @@ mod app {
     async fn render(_cx: render::Context, mut panel: Panel, mut dma: Dma) {
         let fb = WF.take();
 
-        // Boot: fill black (covers the red "HL2 TEENSY" splash), draw the
-        // status bar once.
+        // Boot: fill black (covers the red "HL2 TEENSY" splash). The top
+        // half of the panel is the status header (IP + state), the large
+        // frequency/mode readout, and the S-meter; the waterfall occupies
+        // the bottom half (y >= `display::WF_TOP`).
         display::driver::fill_rect(&mut panel, 0, 0, 320, 240, 0x0000);
-        display::driver::draw_text(
-            &mut panel,
-            6,
-            display::WF_ROWS as u16 + 76,
-            1,
-            "7.074MHz RX1 96k",
-            0xF800,
-            0x0000,
-        );
-        let mut status_label = display::driver::TextLine::<9>::new();
-        let mut status_detail = display::driver::TextLine::<32>::new();
+        let mut status_ip = display::driver::TextLine::<16>::new();
+        let mut status_state = display::driver::TextLine::<9>::new();
+        let mut status_freq = display::driver::TextLine::<20>::new();
         let mut status_meter = display::driver::TextLine::<16>::new();
-        let mut status_cpu = display::driver::TextLine::<32>::new();
-        let mut status_freq = display::driver::TextLine::<28>::new();
 
         let mut painted_seq: u32 = 0;
         let mut last_state: u32 = u32::MAX;
@@ -1038,8 +1030,15 @@ mod app {
                 //    poll the radio's MAC ring between chunks — the exact
                 //    "we're not stalling the network" win the DMA path was
                 //    meant to buy.
-                dma.draw_pixels(0, 0, (cols as u16) - 1, (rows as u16) - 1, &fb[..total])
-                    .await;
+                let wf_top = display::WF_TOP;
+                dma.draw_pixels(
+                    0,
+                    wf_top,
+                    (cols as u16) - 1,
+                    wf_top + (rows as u16) - 1,
+                    &fb[..total],
+                )
+                .await;
                 painted_seq = seq;
                 // Let the radio drain its MAC ring before further SPI work.
                 Systick::delay(1.millis()).await;
@@ -1062,11 +1061,10 @@ mod app {
                 last_status_ms = now_ms;
                 status_redraw(
                     &mut panel,
-                    &mut status_label,
-                    &mut status_detail,
-                    &mut status_meter,
-                    &mut status_cpu,
+                    &mut status_ip,
+                    &mut status_state,
                     &mut status_freq,
+                    &mut status_meter,
                 );
             }
 
@@ -1074,16 +1072,23 @@ mod app {
         }
     }
 
-    /// Update only changed status characters, including the live RX counter
-    /// and the per-stage CPU readout.
+    /// Layout of the top half (y 0..`display::WF_TOP`):
+    ///   * row 0 (y 6):   IP address / "NO IP" on the left, radio state
+    ///                    (WAIT IP / STREAMING / ...) on the right.
+    ///   * centre (y 16): the current NCO as MHz.kHz.Hz + mode, scaled up
+    ///                    to fill the remaining height (e.g. "07.074.000 USB").
+    ///   * y 106:         the S-meter (bar + "S{n} +{N} dB"), the last row
+    ///                    before the waterfall at y 120.
+    /// The frame-count and per-stage CPU shares are still computed and
+    /// published to `shared` but no longer painted, in case they come back.
     fn status_redraw(
         panel: &mut Panel,
-        status_label: &mut display::driver::TextLine<9>,
-        status_detail: &mut display::driver::TextLine<32>,
+        status_ip: &mut display::driver::TextLine<16>,
+        status_state: &mut display::driver::TextLine<9>,
+        status_freq: &mut display::driver::TextLine<20>,
         status_meter: &mut display::driver::TextLine<16>,
-        status_cpu: &mut display::driver::TextLine<32>,
-        status_freq: &mut display::driver::TextLine<28>,
     ) {
+        use core::fmt::Write;
         let label = match shared::state() {
             shared::STATE_WAITING_IP => "WAIT IP",
             shared::STATE_LINK => "LINK",
@@ -1094,53 +1099,69 @@ mod app {
             shared::STATE_ERROR => "ERROR",
             _ => "?",
         };
-        let wf_y = display::WF_ROWS as u16;
-        status_label.update(panel, 6, wf_y + 4, label, 0xF800, 0x0000);
-        use core::fmt::Write;
-        let mut line = [0u8; 32];
+        // 9 cells at 6px = 54px wide; right-aligned with a 6px margin.
+        status_state.update(panel, 320 - 6 - 9 * 6, 6, label, 0xF800, 0x0000);
+        let mut ip = [0u8; 16];
         let mut w = radio::control::WriteBuf {
-            target: &mut line,
+            target: &mut ip,
             pos: 0,
         };
-        if let Some(ip) = shared::peer() {
-            write!(w, "{ip}").unwrap();
-        } else {
-            write!(w, "-").unwrap();
+        match shared::peer() {
+            Some(ip) => {
+                let _ = write!(w, "{ip}");
+            }
+            None => {
+                let _ = write!(w, "NO IP");
+            }
         }
-        write!(w, " F {}", shared::frames()).unwrap();
-        let line_s = core::str::from_utf8(&w.target[..w.pos]).unwrap();
-        status_detail.update(panel, 6, wf_y + 30, line_s, 0xF800, 0x0000);
+        let ip_s = core::str::from_utf8(&w.target[..w.pos]).unwrap();
+        status_ip.update(panel, 6, 6, ip_s, 0xF800, 0x0000);
 
-        // NCO line: the current RX1 NCO (kHz, 0.001 kHz resolution) updated
-        // live on every encoder retune.
+        // Large frequency + mode, centred: NCO in MHz.kHz.Hz with 2-group
+        // separators (e.g. "07.074.000 USB"). Scale to the largest that
+        // still fits the panel width (8px margins) — the band height below
+        // the header is plenty wide, so width is the binding constraint —
+        // and vertically centre it in the band above the S-meter.
+        const FREQ_TOP: u16 = 16;
+        const FREQ_BOTTOM: u16 = 106;
         let hz = shared::nco_hz();
-        let khz = hz / 1000;
-        let frac = (hz % 1000) as u32;
         let mode_label = hl2_teensy::mode::label_at(shared::rx1_mode_index());
-        let mut freq = [0u8; 28];
+        let mut freq = [0u8; 20];
         let mut wf = radio::control::WriteBuf {
             target: &mut freq,
             pos: 0,
         };
-        let _ = write!(wf, "{khz}.{frac:03} kHz {mode_label} 96k");
+        let _ = write!(
+            wf,
+            "{:03}.{:03}.{:03} {}",
+            hz / 1_000_000,
+            (hz / 1000) % 1000,
+            hz % 1000,
+            mode_label
+        );
         let freq_s = core::str::from_utf8(&wf.target[..wf.pos]).unwrap();
-        status_freq.update(panel, 6, wf_y + 76, freq_s, 0xF800, 0x0000);
+        let len = freq_s.len() as u32;
+        let max_scale = (296u32 / (len * 6u32)).min((FREQ_BOTTOM - FREQ_TOP) as u32 / 7u32);
+        let scale = 1u16.max(max_scale as u16);
+        let text_w = len as u16 * 6u16 * scale;
+        let x0 = (320u16 / 2).saturating_sub(text_w / 2);
+        let y = FREQ_TOP + ((FREQ_BOTTOM - FREQ_TOP) / 2) - (7u16 * scale) / 2;
+        status_freq.update_scaled(panel, x0, y, scale, freq_s, 0xF800, 0x0000);
 
-        // S-meter readout. The bar is `S1..S9` (one segment per unit), the
-        // raw dB-over-floor margin to its right. The bar sits below the
-        // state label / IP/F counter row; the CPU split is on its own row
-        // further down (see `status_cpu` at the end of this fn).
+        // S-meter readout, the last row of the top half (y 106): the bar is
+        // `S1..S9` (one segment per unit), the raw dB-over-floor margin to
+        // its right.
         //
         // `fill_rect(display, x, y, w, h, color)` — the last 4 args are
         // width/height, NOT x2/y2.
         let s = shared::slevel();
         let margin = shared::smargin_db();
-        let bar_y = wf_y + 14u16;
+        let bar_y = 106u16;
         let seg_w = 8u16;
         let seg_h = 8u16;
-        let x0 = 6u16;
+        let bar_x = 6u16;
         for i in 0..9u16 {
-            let x = x0 + (i as u32 * ((seg_w + 1) as u32)) as u16;
+            let x = bar_x + (i as u32 * ((seg_w + 1) as u32)) as u16;
             let on = (i as u8 + 1) <= s;
             let fg: u16 = if on { 0xFFFF } else { 0x4020 };
             display::driver::fill_rect(panel, x, bar_y, seg_w, seg_h, fg);
@@ -1159,38 +1180,7 @@ mod app {
             let _ = write!(w2, "S{s} +{:.0} dB", margin);
         }
         let meter_s = core::str::from_utf8(&w2.target[..w2.pos]).unwrap();
-        let meter_x = x0 + (9u16 * (seg_w + 1) as u16) + 2u16;
+        let meter_x = bar_x + (9u16 * (seg_w + 1) as u16) + 2u16;
         status_meter.update(panel, meter_x, bar_y, meter_s, 0xF800, 0x0000);
-
-        // CPU split, on its own row **below the frequency line** (the "7.074 MHz…"
-        // line drawn at boot at `WF_ROWS + 76`). The three stages are the
-        // pipeline's three workloads, each reported as a percent (≤ 100) on its
-        // *own* task's rolling 1-second window:
-        //   * D — demod: EP6 baseband parse + virtual-USB demod  (radio task)
-        //   * F — fft:   the 2048-commit spectrum / S-meter window (radio task)
-        //   * L — lcd:   the waterfall shift + colourise           (render task)
-        // They run on one shared core, so the three can each read ~100 and
-        // overlap — that's the honest "what's eating the CPU" number.
-        let mut cpu = [0u8; 32];
-        let mut w3 = radio::control::WriteBuf {
-            target: &mut cpu,
-            pos: 0,
-        };
-        let _ = write!(
-            w3,
-            "CPU D:{:03} F:{:03} L:{:03} %",
-            shared::cpu_demod_pct(),
-            shared::cpu_fft_pct(),
-            shared::cpu_lcd_pct(),
-        );
-        let cpu_s = core::str::from_utf8(&w3.target[..w3.pos]).unwrap();
-        status_cpu.update(
-            panel,
-            6,
-            display::WF_ROWS as u16 + 85,
-            cpu_s,
-            0xF800,
-            0x0000,
-        );
     }
 }

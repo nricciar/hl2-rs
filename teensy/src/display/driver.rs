@@ -415,17 +415,89 @@ fn draw_char(display: &mut Display, x: u16, y: u16, scale: u16, ch: char, fg: u1
 /// fixed, and no other drawing may overwrite its cells between updates.
 pub struct TextLine<const N: usize> {
     text: [u8; N],
+    /// Last position + scale painted by `update_scaled` (−1 = never), so a
+    /// moved line (e.g. re-centred after a length change) can wipe its old
+    /// rectangle before redrawing at the new one.
+    lx: i32,
+    ly: i32,
+    ls: i32,
 }
 
 impl<const N: usize> TextLine<N> {
     pub const fn new() -> Self {
-        Self { text: [b' '; N] }
+        Self {
+            text: [b' '; N],
+            lx: -1,
+            ly: -1,
+            ls: -1,
+        }
     }
 
     pub fn update(&mut self, display: &mut Display, x: u16, y: u16, text: &str, fg: u16, bg: u16) {
         self.update_cells(text, |col, ch| {
             draw_char(display, x + col as u16 * 6, y, 1, ch as char, fg, bg);
         });
+    }
+
+    /// Paint `text` at (x, y) with each 5×7 glyph scaled `scale`×. Repaints
+    /// only when the text or its placement changed; `draw_char` fills every
+    /// cell (ink + background), so a redraw is self-cleaning apart from the
+    /// *old* rectangle, which is wiped first if the line moved, shrank, or
+    /// re-scaled.
+    pub fn update_scaled(
+        &mut self,
+        display: &mut Display,
+        x: u16,
+        y: u16,
+        scale: u16,
+        text: &str,
+        fg: u16,
+        bg: u16,
+    ) {
+        assert!(text.is_ascii() && text.len() <= N);
+        if self.text[..text.len()] == *text.as_bytes()
+            && self.lx == x as i32
+            && self.ly == y as i32
+            && self.ls == scale as i32
+        {
+            return;
+        }
+        if self.ls >= 0 {
+            // Wipe the previously painted rectangle (its real text width,
+            // not the padded buffer).
+            let mut old_w = 0usize;
+            for b in self.text.iter().rev() {
+                if *b == b' ' {
+                    break;
+                }
+                old_w += 1;
+            }
+            let mut w = (old_w as u32 * 6u32 * (self.ls as u32)).min(u16::MAX as u32) as u16;
+            let h = 7u16.saturating_mul(self.ls as u16);
+            let ox = self.lx.max(0) as u16;
+            let oy = self.ly.max(0) as u16;
+            w = w.min(320u16.saturating_sub(ox));
+            if w > 0 && h > 0 {
+                fill_rect(display, ox, oy, w, h, bg);
+            }
+        }
+        for (i, b) in text.as_bytes().iter().enumerate() {
+            draw_char(
+                display,
+                x + i as u16 * 6 * scale,
+                y,
+                scale,
+                *b as char,
+                fg,
+                bg,
+            );
+        }
+        for (i, slot) in self.text.iter_mut().enumerate() {
+            *slot = text.as_bytes().get(i).copied().unwrap_or(b' ');
+        }
+        self.lx = x as i32;
+        self.ly = y as i32;
+        self.ls = scale as i32;
     }
 
     fn update_cells(&mut self, text: &str, mut draw: impl FnMut(usize, u8)) {

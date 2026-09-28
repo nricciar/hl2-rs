@@ -12,3 +12,8 @@ pub mod palette;
 /// Waterfall band: 320 cols × 120 rows (u16 each).
 pub const WF_COLS: usize = 320;
 pub const WF_ROWS: usize = 120;
+
+/// Top edge (panel y) of the waterfall band: the *bottom* half of the 240-row
+/// panel. The top half (status header + large frequency + S-meter) sits above
+/// it (see `main::app` layout constants `HEADER_Y` / `FREQ_Y` / `SMETER_Y`).
+pub const WF_TOP: u16 = (240 - WF_ROWS) as u16;
