@@ -58,7 +58,8 @@ pub struct Rx {
     demod_cycles: u64,
     /// Cumulative DWT cycles spent committing the FFT windows (the
     /// `mags`/S-meter compute inside `Pipeline::push` once a full
-    /// `N_FFT`-sample window arrives). The *FFT* stage of the CPU readout.
+    /// `WIN_LEN`-sample window arrives, zero-padded to `N_FFT`). The
+    /// *FFT* stage of the CPU readout.
     fft_cycles: u64,
 }
 
@@ -105,8 +106,9 @@ impl Rx {
     }
 
     /// Cumulative DWT cycles spent committing the spectrum FFT windows
-    /// (`Pipeline::push` once a full `N_FFT`-sample window arrives — the
-    /// `mags`/S-meter compute). Monotonic; the radio task publishes the
+    /// (`Pipeline::push` once a full `WIN_LEN`-sample window arrives — the
+    /// `mags`/S-meter compute over the `[WIN_LEN, N_FFT)`-zero-padded FFT
+    /// output). Monotonic; the radio task publishes the
     /// per-second delta (see `crate::shared::set_cpu_fft_pct`).
     pub fn fft_cycles(&self) -> u64 {
         self.fft_cycles
@@ -180,10 +182,10 @@ impl Rx {
         }
         // One I/Q pair per record, per chunk; 63 per chunk at n_recv = 1,
         // 2 chunks per frame → 126 pair/frame in steady state. Each `push`
-        // either just accumulates a sample into the `N_FFT`-window (cost:
-        // one vector append — the *demod* stage) or, once every `N_FFT`
-        // samples, commits the window (cost: mean/window/FFT/max-pool — the
-        // *FFT* stage). The DWT taps below attribute each call to the one
+        // either just accumulates a sample into the `WIN_LEN`-window (cost:
+        // one vector append — the *demod* stage) or, once every `WIN_LEN`
+        // samples, commits the window (cost: mean/window/pad/FFT/max-pool —
+        // the *FFT* stage over the `[WIN_LEN, N_FFT)`-zero-padded input). The DWT taps below attribute each call to the one
         // that actually dominated (a new `frame_seq` appeared → FFT bucket,
         // otherwise demod).
         let mut pushed = 0usize;
@@ -351,7 +353,7 @@ mod tests {
             assert_eq!(received.mags(), direct.mags());
         }
         assert_eq!(received.frame_seq(), 2);
-        assert_eq!(received.len(), sample % crate::spectrum::N_FFT);
+        assert_eq!(received.len(), sample % crate::spectrum::WIN_LEN);
         assert!(received.mags()[80] > 8000);
     }
 }

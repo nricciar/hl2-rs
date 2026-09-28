@@ -46,7 +46,7 @@ use teensy4_bsp::pins::t41::{P28, P29, P30};
 
 /// Per-step RX1 NCO increment (Hz). Positive = CW = up; the state machine
 /// also emits `−1` for CCW, so the total shift is `step × step_hz`.
-pub const DEFAULT_STEP_HZ: i32 = 500;
+pub const DEFAULT_STEP_HZ: i32 = 25;
 
 static ENC_STEPS: AtomicI32 = AtomicI32::new(0);
 static ENC_RETUNES: AtomicI32 = AtomicI32::new(0);

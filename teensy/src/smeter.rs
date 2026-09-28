@@ -2,8 +2,9 @@
 //! row, mirroring `api/src/meter.rs::compute_s_meter` (PROTOCOL.md §16.3e).
 //!
 //! The UI's S-meter is *not* computed off the demod output: it is
-//! signal-over-noise read from the *spectrum* (`mags`) — the same 320-bin
-//! row the waterfall already displays. That module (`api/meter.rs`) even says
+//! signal-over-noise read from the *spectrum* (`mags`) — the same 320-column
+//! row the waterfall already displays (a centred, zoomed slice of the band,
+//! so each column is ~31 Hz wide at the default view). That module (`api/meter.rs`) even says
 //! "the S-meter is a consumer of the spectrum stream, which is the single
 //! correct source of the band floor." So this is a faithful `no_std` port of
 //! that method, and the virtual USB-SSB [`VirtualReceiver`] (see
@@ -35,18 +36,18 @@
 use core::f32;
 use num_traits::float::Float;
 
-use crate::spectrum::BINS;
+use crate::spectrum::{BINS, WF_BAND_HZ};
 
-/// Complex I/Q sample rate feeding the waterfall (Hz). One `mags` display bin
-/// spans this divided by the bin count (96 kSps / 320 = 300 Hz).
-pub const SAMPLE_RATE_HZ: u32 = 96_000;
 /// USB SSB receiver's channel-select bandwidth (Hz) — `Mode::Ssb`'s default
 /// passband (`hl2::receiver::Mode::default_bandwidth_hz` = 2600). Kept as a
 /// public const (for backwards-compat with the `teensy` unit tests and the
 /// `hl2` `receiver`'s own tests which use this exact value).
 pub const USB_PASSBAND_HZ: u32 = 2_600;
-/// Hz per display bin = sample rate / display bins (96 000 / 320 = 300).
-pub const DISPLAY_BIN_HZ: usize = SAMPLE_RATE_HZ as usize / BINS;
+/// Hz per display bin. The waterfall shows a centred [`WF_BAND_HZ`] slice of
+/// the band, so a display column spans the *displayed* band divided by the
+/// column count (10 kHz / 320 = 31.25 Hz at the default). The passband window
+/// below is derived from this, so it tracks whatever slice the display shows.
+pub const DISPLAY_BIN_HZ: usize = WF_BAND_HZ / BINS;
 /// Passband window width in display bins (`USB_PASSBAND_HZ`, rounded up).
 pub const USB_PASSBAND_BINS: usize =
     (USB_PASSBAND_HZ as usize + DISPLAY_BIN_HZ - 1) / DISPLAY_BIN_HZ;
@@ -382,9 +383,11 @@ mod tests {
     fn passband_width_is_sane() {
         let hz_per_bin = DISPLAY_BIN_HZ;
         let wbins = USB_PASSBAND_BINS;
-        // The passband must be a small handful of the 320 bins, not the whole
-        // display, and span roughly the voice bandwidth.
-        assert!(wbins >= 1 && wbins < BINS / 20, "passband {wbins} bins");
+        // The USB/LSB passband is *one-sided* (one side of the NCO), so it
+        // must fit on one half of the display, and span roughly the voice
+        // bandwidth. At the default 10 kHz display, 2.6 kHz is ~84 of the
+        // 160 half-display bins.
+        assert!(wbins >= 1 && wbins < BINS / 2, "passband {wbins} bins");
         assert!(
             (USB_PASSBAND_HZ as usize / hz_per_bin) <= wbins
                 && wbins <= USB_PASSBAND_HZ as usize / hz_per_bin + 1,
