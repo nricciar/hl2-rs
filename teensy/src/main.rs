@@ -143,7 +143,7 @@ mod app {
 
     use super::{POLLER, cycles_now, ms_since, now_millis, poll_log};
     use cortex_m::peripheral::DWT;
-    use hl2_teensy::{autoscale, display, encoder, i2c, radio, shared, spectrum};
+    use hl2_teensy::{autoscale, display, encoder, i2c, radio, shared, smeter, spectrum};
     use imxrt_log as logging;
     use rtic_monotonics::systick::ExtU64;
     use rtic_monotonics::systick::Systick;
@@ -1022,6 +1022,17 @@ mod app {
                         floor,
                         ceil,
                     );
+                }
+                // 2b. NCO line (centred column) + the mode's passband band,
+                //     composited onto the *whole* frame. The NCO is always
+                //     `BINS / 2` and the passband is a fixed offset from it
+                //     (USB/LSB one-sided, AM/FM double-sided), so both are
+                //     static in screen space and never distort as the user
+                //     tunes — only the trace scrolling underneath shifts. Same
+                //     window the S-meter integrates (see `smeter::passband_columns`).
+                {
+                    let (pb_lo, pb_hi) = smeter::passband_columns(shared::rx1_mode_index());
+                    display::overlay::apply(fb, pb_lo, pb_hi, cols / 2);
                 }
                 shared::add_lcd_cycles(u64::from(DWT::cycle_count().wrapping_sub(c0)));
                 // 3. Blit the band via eDMA. This hands the pixel work over

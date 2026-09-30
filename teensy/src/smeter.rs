@@ -146,28 +146,8 @@ pub fn compute(mags: &[u16]) -> Smeter {
 /// the value the render task publishes (always valid).
 pub fn compute_for_mode(mags: &[u16], mode_index: usize) -> Smeter {
     let n = mags.len();
-    let c = n / 2;
-    let entry = &crate::mode::MODES[mode_index];
 
-    // Resolve the passband geometry for this mode:
-    //   * sideband (upper/lower) for SSB modes
-    //   * centred, double-sided for AM / FM / NFM (mode's default bandwidth)
-    let default_bw_hz = entry.mode.default_bandwidth_hz();
-    let is_ssb = matches!(entry.mode, hl2::receiver::Mode::Ssb(_));
-    let bins = passband_bins(default_bw_hz);
-
-    let (lo, hi) = if is_ssb {
-        match entry
-            .mode
-            .sideband()
-            .unwrap_or(hl2::receiver::Sideband::Usb)
-        {
-            hl2::receiver::Sideband::Usb => (c, (c + bins).min(n.saturating_sub(1))),
-            hl2::receiver::Sideband::Lsb => (c.saturating_sub(bins), c),
-        }
-    } else {
-        (c.saturating_sub(bins), (c + bins).min(n.saturating_sub(1)))
-    };
+    let (lo, hi) = passband_window(n, mode_index);
     if n == 0 {
         return Smeter {
             level_db: -120.0,
@@ -237,6 +217,38 @@ pub fn compute_for_mode(mags: &[u16], mode_index: usize) -> Smeter {
 #[inline]
 fn passband_bins(bw_hz: u32) -> usize {
     (bw_hz as usize + DISPLAY_BIN_HZ - 1) / DISPLAY_BIN_HZ
+}
+
+/// The display-bin passband window for `mode_index` centred on `c` over a row
+/// of length `n`:
+///   * SSB — one side of the NCO (upper for USB, lower for LSB)
+///   * AM / FM / NFM — double-sided, the mode's default bandwidth each side.
+/// The NCO sits at `n / 2`, so `lo`/`hi` are relative to the *centre column*
+/// of the (NCO-centred) display row.
+fn passband_window(n: usize, mode_index: usize) -> (usize, usize) {
+    let c = n / 2;
+    let entry = &crate::mode::MODES[mode_index];
+    let bins = passband_bins(entry.mode.default_bandwidth_hz());
+    if matches!(entry.mode, hl2::receiver::Mode::Ssb(_)) {
+        match entry
+            .mode
+            .sideband()
+            .unwrap_or(hl2::receiver::Sideband::Usb)
+        {
+            hl2::receiver::Sideband::Usb => (c, (c + bins).min(n.saturating_sub(1))),
+            hl2::receiver::Sideband::Lsb => (c.saturating_sub(bins), c),
+        }
+    } else {
+        (c.saturating_sub(bins), (c + bins).min(n.saturating_sub(1)))
+    }
+}
+
+/// The passband window (in display-bin columns) for the *current display*
+/// length ([`BINS`] == the 320-column waterfall row). Reused by the
+/// waterfall overlay so its grey band is the *same* window the S-meter
+/// integrates — SSB one-sided (USB right / LSB left), AM/FM double-sided.
+pub fn passband_columns(mode_index: usize) -> (usize, usize) {
+    passband_window(BINS, mode_index)
 }
 
 #[cfg(test)]
@@ -393,5 +405,37 @@ mod tests {
                 && wbins <= USB_PASSBAND_HZ as usize / hz_per_bin + 1,
             "passband {wbins} bins ≈ {USB_PASSBAND_HZ} Hz at {hz_per_bin} Hz/bin"
         );
+    }
+
+    /// `passband_columns` must place the NCO at the band's outer edge for SSB
+    /// (one-sided) and at the middle for the double-sided modes — the exact
+    /// geometry the waterfall overlay draws in screen space.
+    #[test]
+    fn passband_columns_geometry() {
+        let c = BINS / 2;
+        // mode.rs order: [0] USB, [1] LSB, [2] AM, [3] FM, [4] NFM.
+        let (u_lo, u_hi) = passband_columns(0);
+        assert_eq!(u_lo, c, "USB lower edge is the NCO column");
+        assert!(u_hi > c && u_hi < BINS, "USB extends to the upper side");
+
+        let (l_lo, l_hi) = passband_columns(1);
+        assert_eq!(l_hi, c, "LSB upper edge is the NCO column");
+        assert!(l_lo < c, "LSB extends to the lower side");
+        assert_eq!(c - l_lo, u_hi - c, "LSB/USB bands are mirror-symmetric");
+
+        for idx in [2usize, 3, 4] {
+            let (lo, hi) = passband_columns(idx);
+            assert!(lo < c && hi > c, "[{idx}] double-sided straddles the NCO");
+            // Symmetric about the NCO — *unless* the band is so wide it
+            // reaches a window edge, in which case one side is clamped by the
+            // display boundary (the band still covers the whole visible side).
+            let left_span = c - lo;
+            let right_span = hi - c;
+            assert!(
+                left_span == right_span || lo == 0 || hi == BINS - 1,
+                "[{idx}] double-sided should be symmetric (got {left_span} vs {right_span})\
+                 or clamped to a window edge (lo={lo}, hi={hi}, BINS={BINS})"
+            );
+        }
     }
 }

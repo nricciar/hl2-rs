@@ -2,11 +2,13 @@
 //!
 //! Modules:
 //!   * `palette` — dB → RGB565 (waterfall ramp).
+//!   * `overlay` — NCO line + passband band composited into the frame.
 //!   * `glyphs`  — 5×7 font.
 //!   * `driver`  — ILI9341 + LPSPI4 + CS + text helpers (task-local).
 
 pub mod driver;
 pub mod glyphs;
+pub mod overlay;
 pub mod palette;
 
 /// Waterfall band: 320 cols × 120 rows (u16 each).

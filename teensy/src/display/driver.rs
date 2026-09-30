@@ -415,9 +415,10 @@ fn draw_char(display: &mut Display, x: u16, y: u16, scale: u16, ch: char, fg: u1
 /// fixed, and no other drawing may overwrite its cells between updates.
 pub struct TextLine<const N: usize> {
     text: [u8; N],
-    /// Last position + scale painted by `update_scaled` (−1 = never), so a
-    /// moved line (e.g. re-centred after a length change) can wipe its old
-    /// rectangle before redrawing at the new one.
+    /// Last text length (chars, NOT the padded buffer size) so the union
+    /// erase knows how wide the previous paint was.
+    len: usize,
+    /// Last placement painted by `update_scaled` (−1 = never).
     lx: i32,
     ly: i32,
     ls: i32,
@@ -427,6 +428,7 @@ impl<const N: usize> TextLine<N> {
     pub const fn new() -> Self {
         Self {
             text: [b' '; N],
+            len: 0,
             lx: -1,
             ly: -1,
             ls: -1,
@@ -439,11 +441,14 @@ impl<const N: usize> TextLine<N> {
         });
     }
 
-    /// Paint `text` at (x, y) with each 5×7 glyph scaled `scale`×. Repaints
-    /// only when the text or its placement changed; `draw_char` fills every
-    /// cell (ink + background), so a redraw is self-cleaning apart from the
-    /// *old* rectangle, which is wiped first if the line moved, shrank, or
-    /// re-scaled.
+    /// Paint `text` at (`x`, `y`) with each 5×7 glyph scaled `scale`×.
+    /// Repaints only when content or placement changed; each repaint first
+    /// erases the **bounding box of the *union* of the old and new
+    /// rectangles** — the union, not just the old box, because the line
+    /// re-centres whenever its content length changes (e.g. mode
+    /// "NFM"→"LSB"→"AM"): a *longer* new line starts left of the old, and a
+    /// *shorter* one starts right of it, so the old box alone misses a tail
+    /// of the previous line.
     pub fn update_scaled(
         &mut self,
         display: &mut Display,
@@ -459,27 +464,31 @@ impl<const N: usize> TextLine<N> {
             && self.lx == x as i32
             && self.ly == y as i32
             && self.ls == scale as i32
+            && self.len == text.len()
         {
             return;
         }
         if self.ls >= 0 {
-            // Wipe the previously painted rectangle (its real text width,
-            // not the padded buffer).
-            let mut old_w = 0usize;
-            for b in self.text.iter().rev() {
-                if *b == b' ' {
-                    break;
-                }
-                old_w += 1;
-            }
-            let mut w = (old_w as u32 * 6u32 * (self.ls as u32)).min(u16::MAX as u32) as u16;
-            let h = 7u16.saturating_mul(self.ls as u16);
-            let ox = self.lx.max(0) as u16;
-            let oy = self.ly.max(0) as u16;
-            w = w.min(320u16.saturating_sub(ox));
-            if w > 0 && h > 0 {
-                fill_rect(display, ox, oy, w, h, bg);
-            }
+            // Old rectangle (from the last paint) and the new one,
+            // both at the 6px-per-cell pitch.
+            let old_w = self.len as u32 * 6u32 * (self.ls as u32);
+            let new_w = text.len() as u32 * 6u32 * (scale as u32);
+            let old_h = 7u32 * (self.ls as u32);
+            let new_h = 7u32 * (scale as u32);
+
+            let old = (
+                self.lx.max(0) as u32,
+                self.ly.max(0) as u32,
+                (self.lx.max(0) as u32).saturating_add(old_w).min(320u32),
+                (self.ly.max(0) as u32).saturating_add(old_h).min(240u32),
+            );
+            let new = (
+                x as u32,
+                y as u32,
+                (x as u32).saturating_add(new_w).min(320u32),
+                (y as u32).saturating_add(new_h).min(240u32),
+            );
+            erase_union(display, old, new, bg);
         }
         for (i, b) in text.as_bytes().iter().enumerate() {
             draw_char(
@@ -495,6 +504,7 @@ impl<const N: usize> TextLine<N> {
         for (i, slot) in self.text.iter_mut().enumerate() {
             *slot = text.as_bytes().get(i).copied().unwrap_or(b' ');
         }
+        self.len = text.len();
         self.lx = x as i32;
         self.ly = y as i32;
         self.ls = scale as i32;
@@ -509,6 +519,56 @@ impl<const N: usize> TextLine<N> {
                 *old = new;
             }
         }
+    }
+}
+
+/// Bounding box of the union of two rectangles `(x0, y0, x1, y1)`, each
+/// clamped to the 320×240 panel. (x1/y1 are INCLUSIVE here, to match how
+/// `update_scaled` computes them as "last painted coordinate + 1".)
+///
+/// The union (not just the *old* box) must be wiped before repainting a
+/// centred text line: a shorter new line starts further right (the old
+/// line's right edge then extends past the new one), and a wider new line
+/// starts further left (the old line's left edge sticks out to the left).
+/// Either way, erasing only one side misses the tail of the other.
+///
+/// (Split out of `update_scaled` so the math is unit-testable headless.)
+pub(crate) fn erase_union_bbox(
+    ax0: u32,
+    ay0: u32,
+    ax1: u32,
+    ay1: u32,
+    bx0: u32,
+    by0: u32,
+    bx1: u32,
+    by1: u32,
+) -> (u32, u32, u32, u32) {
+    (
+        ax0.min(bx0).min(320),
+        ay0.min(by0).min(240),
+        ax1.max(bx1).min(320),
+        ay1.max(by1).min(240),
+    )
+}
+
+/// Fill `display` with `bg` over the union bounding box of the *old* and
+/// *new* text-line rectangles. No-op if the box has zero area.
+fn erase_union(
+    display: &mut Display,
+    old: (u32, u32, u32, u32),
+    new: (u32, u32, u32, u32),
+    bg: u16,
+) {
+    let (x0, y0, x1, y1) = erase_union_bbox(old.0, old.1, old.2, old.3, new.0, new.1, new.2, new.3);
+    if x1 > x0 && y1 > y0 {
+        fill_rect(
+            display,
+            x0 as u16,
+            y0 as u16,
+            (x1 - x0) as u16,
+            (y1 - y0) as u16,
+            bg,
+        );
     }
 }
 
@@ -545,5 +605,59 @@ mod tests {
         let mut cells = Vec::new();
         line.update_cells("192.168.1.5 F 100", |col, ch| cells.push((col, ch)));
         assert_eq!(cells, vec![(14, b'1'), (15, b'0'), (16, b'0')]);
+    }
+
+    // The frequency line is centred, so a mode change that *shortens* the
+    // text ("...LSB" 14ch → "...AM" 13ch) shifts its left edge right by
+    // half the width delta. The new (shorter) line therefore starts
+    // further right, and the OLD line's right edge sits PAST the new one —
+    // erasing only the old box would leak a tail of the old longer line.
+    // `erase_union_bbox` must cover both.
+    #[test]
+    fn union_bbox_when_new_is_shorter_starts_further_right() {
+        // scale 6px/char * glyph-scale 1  →  per-char width 6.
+        let old_x0 = 10u32;
+        let old_w = 14 * 6; // "...LSB"
+        let new_x0 = 13; // 1 char (6px) shorter → left edge moves right by
+        // half the 6px delta, rounded → a few px right.
+        let new_w = 13 * 6; // "...AM"
+        let old_x1 = old_x0 + old_w;
+        let new_x1 = new_x0 + new_w;
+        let (x0, _y0, x1, _y1) = erase_union_bbox(old_x0, 0, old_x1, 7, new_x0, 0, new_x1, 7);
+        assert!(x0 <= old_x0, "union must contain old left edge: {x0}");
+        assert!(
+            x1 >= old_x1,
+            "union must cover the old (longer) right edge: {x1}"
+        );
+        assert!(
+            x0 <= new_x0 && x1 >= new_x1,
+            "union must contain the new line too"
+        );
+    }
+
+    // The other direction: new line is WIDER (e.g. "...NFM"). The old left
+    // edge sticks out to the LEFT of the new one, so the union must extend
+    // left of the new.
+    #[test]
+    fn union_bbox_when_new_is_wider_starts_further_left() {
+        let old_x0 = 20u32;
+        let old_w = 13 * 6; // "...AM"
+        let new_x0 = 14; // wider → left edge further left.
+        let new_w = 14 * 6; // "...NFM-ish"
+        let old_x1 = old_x0 + old_w;
+        let new_x1 = new_x0 + new_w;
+        let (x0, _y0, x1, _y1) = erase_union_bbox(old_x0, 0, old_x1, 7, new_x0, 0, new_x1, 7);
+        assert!(x0 <= new_x0, "union must extend left of the new line: {x0}");
+        assert!(
+            x1 >= old_x1.max(new_x1),
+            "union right edge = further of either: {x1}"
+        );
+    }
+
+    // Clamping: an erase extending past the glass stops at the panel edges.
+    #[test]
+    fn union_bbox_clamps_to_panel() {
+        let (x0, y0, x1, y1) = erase_union_bbox(100, 50, 400, 300, 200, 60, 500, 400);
+        assert_eq!((x0, y0, x1, y1), (100, 50, 320, 240));
     }
 }
