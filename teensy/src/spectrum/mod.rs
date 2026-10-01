@@ -1,13 +1,16 @@
 //! Spectrum pipeline for the panadapter / waterfall.
 //!
-//! Mirrors `api/src/hub.rs::run_spectral` + `api/src/spectrum.rs::display_mags_into`,
-//! but `no_std` (uses `core` + `alloc` + libm via `num-traits`) and sized for
-//! a small LCD — one 2048-complex-sample window, max-pool to 320 display bins
-//! (full width, centred on the NCO).
+//! Each 2048-sample complex I/Q window produces a 320-column row every
+//! 21.3 ms at 96 kSps. The view spans 24 kHz about the NCO: 75 Hz/column,
+//! with DC at column 160 and USB (complex-negative frequencies) to the right.
 //!
-//! Data comes in one EP6 chunk at a time (63 I/Q pairs/chunk at
-//! 96 kSps, `n_recv = 1`). Each full, non-overlapping 2048-sample window
-//! produces a row, approximately every 21.3 ms at that rate.
+//! The mean is removed before Hann windowing. Zero-padding to 4096 samples
+//! halves FFT-bin spacing to 23.4375 Hz but does not improve the resolution
+//! of the 2048-sample window (46.875 Hz bin spacing before padding).
+//!
+//! Columns max-pool FFT magnitudes, falling back to the nearest bin for
+//! narrow zooms. Output is unnormalized and clipped to u16 display scale;
+//! it is not a calibrated power spectrum, and the DC carrier is suppressed.
 
 pub mod fft;
 
@@ -20,29 +23,26 @@ use num_traits::float::Float;
 
 use crate::spectrum::fft::Fft;
 
-/// FFT size (samples / bins).
-pub const N_FFT: usize = 2048;
-/// Display bins — one bin per LCD pixel column (ILI9341 is 320 wide).
+/// Complex samples in the Hann analysis window.
+pub const WIN_LEN: usize = 2048;
+/// Zero-padded FFT length; padding interpolates without adding resolution.
+pub const N_FFT: usize = 4096;
+/// One display bin per LCD column.
 pub const BINS: usize = 320;
+/// Complex I/Q sample rate (Hz).
+pub const SAMPLE_RATE_HZ: usize = 96_000;
+/// Validated display span (Hz), shared by pooling, meter and passband overlay.
+/// The default is 24 kHz (nominally +/-12 kHz); zero or spans above Fs fail
+/// at compile time rather than silently changing one consumer's geometry.
+pub const WF_BAND_HZ: usize = {
+    let span = 24_000;
+    assert!(span > 0 && span <= SAMPLE_RATE_HZ);
+    span
+};
 
-/// Diagnostic: current step inside `Pipeline::new()`. Read by the render
-/// task (which keeps running as long as the RTIC scheduler preempts the
-/// blocked *radio* task) so we can find out *which* step of `new` is
-/// hung. Steps, in order:
-///
-///   0 — entered, before `Fft::new` (1024 cos/sin — software
-///       `num-traits/libm` trig).
-///   1 — `Fft::new` returned.
-///   2 — Hann window computed (2048 `Float::cos`, then `to_vec`).
-///   3 — heap `buf_re` / `buf_im` (16 KB total) allocated + zeroed.
-///   4 — heap `mags` allocated.
-///   5 — `acc_re` / `acc_im` created (`Vec::with_capacity(N_FFT)`).
-///   6 — `Ok(Self { .. })` returned.
-///
-/// Any step that stays constant across render-heartbeat polls is the
-/// step the hang is stuck on.
-/// Initial value is 6 (= "not currently building / already done"), so the
-/// render-task heartbeat stays quiet at boot.
+/// Constructor progress for render-task hang diagnostics: 0 entered,
+/// 1 FFT ready, 2 Hann ready, 3 FFT buffers ready, 4 magnitudes ready,
+/// 5 accumulators ready, 6 done (also the initial idle value).
 pub static PIPELINE_NEW_STEP: AtomicUsize = AtomicUsize::new(6);
 
 /// Render task / panic handler sample this to find the stuck step.
@@ -66,37 +66,26 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
-    /// Build the pipeline. The 1024 complex twiddles occupy 8 KiB.
-    ///
-    /// The Hann-window table is allocated on the heap directly (as
-    /// a [`Vec<f32>`]) so the caller's stack never has to hold a
-    /// full 8 KB local — under RTIC 2.x all tasks share the 16 KB
-    /// main stack, and a synchronous function that peaks at ~8 KB
-    /// stack *on top of* three pre-allocated task-future frames is
-    /// already close to the stack limit. A 1-2 KB overrun here is
-    /// silent (no guard pages on `thumbv7em-none`) and would
-    /// corrupt a neighbouring frame and hang the core with no
-    /// panic blink.
+    /// Allocate tables and buffers directly on the heap; RTIC tasks share
+    /// a 16 KiB stack. The 2048 complex twiddles alone occupy 16 KiB.
     pub fn new() -> Result<Self, &'static str> {
-        PIPELINE_NEW_STEP.store(0, Ordering::Relaxed); // entered, before Fft::new
+        PIPELINE_NEW_STEP.store(0, Ordering::Relaxed);
         let fft = Fft::new(N_FFT)?;
-        PIPELINE_NEW_STEP.store(1, Ordering::Relaxed); // Fft::new done
-        // Build the Hann window into a pre-sized heap buffer — zero
-        // stack beyond this single `Vec` (24 bytes).
-        let mut win = vec![0f32; N_FFT];
+        PIPELINE_NEW_STEP.store(1, Ordering::Relaxed);
+        let mut win = vec![0f32; WIN_LEN];
         for (i, v) in win.iter_mut().enumerate() {
-            *v = 0.5 * (1.0 - Float::cos(2.0 * f32::consts::PI * (i as f32 / N_FFT as f32)));
+            *v = 0.5 * (1.0 - Float::cos(2.0 * f32::consts::PI * (i as f32 / WIN_LEN as f32)));
         }
-        PIPELINE_NEW_STEP.store(2, Ordering::Relaxed); // window done
+        PIPELINE_NEW_STEP.store(2, Ordering::Relaxed);
         let buf_re = vec![0f32; N_FFT];
         let buf_im = vec![0f32; N_FFT];
-        PIPELINE_NEW_STEP.store(3, Ordering::Relaxed); // buf_re/im done
+        PIPELINE_NEW_STEP.store(3, Ordering::Relaxed);
         let mags = vec![0u16; BINS];
-        PIPELINE_NEW_STEP.store(4, Ordering::Relaxed); // mags done
-        let acc_re = Vec::with_capacity(N_FFT);
-        let acc_im = Vec::with_capacity(N_FFT);
-        PIPELINE_NEW_STEP.store(5, Ordering::Relaxed); // acc done; about to return
-        PIPELINE_NEW_STEP.store(6, Ordering::Relaxed); // returned
+        PIPELINE_NEW_STEP.store(4, Ordering::Relaxed);
+        let acc_re = Vec::with_capacity(WIN_LEN);
+        let acc_im = Vec::with_capacity(WIN_LEN);
+        PIPELINE_NEW_STEP.store(5, Ordering::Relaxed);
+        PIPELINE_NEW_STEP.store(6, Ordering::Relaxed);
         Ok(Self {
             fft,
             win,
@@ -118,45 +107,65 @@ impl Pipeline {
     pub fn push(&mut self, re: f32, im: f32) {
         self.acc_re.push(re);
         self.acc_im.push(im);
-        if self.acc_re.len() == N_FFT {
+        if self.acc_re.len() == WIN_LEN {
             self.commit_frame();
         }
     }
 
     /// Consume the next full 2048-sample window.
     fn commit_frame(&mut self) {
-        debug_assert_eq!(self.acc_re.len(), N_FFT);
-        debug_assert_eq!(self.acc_im.len(), N_FFT);
+        debug_assert_eq!(self.acc_re.len(), WIN_LEN);
+        debug_assert_eq!(self.acc_im.len(), WIN_LEN);
         // Remove the unwindowed mean first; windowing DC would spread it
         // into adjacent bins that subtracting a post-window mean cannot fix.
-        let re_mean = self.acc_re.iter().sum::<f32>() / N_FFT as f32;
-        let im_mean = self.acc_im.iter().sum::<f32>() / N_FFT as f32;
-        for i in 0..N_FFT {
+        let re_mean = self.acc_re.iter().sum::<f32>() / WIN_LEN as f32;
+        let im_mean = self.acc_im.iter().sum::<f32>() / WIN_LEN as f32;
+        for i in 0..WIN_LEN {
             self.buf_re[i] = (self.acc_re[i] - re_mean) * self.win[i];
             self.buf_im[i] = (self.acc_im[i] - im_mean) * self.win[i];
         }
         self.acc_re.clear();
         self.acc_im.clear();
+        // Clear the previous FFT output from the zero-padding region.
+        for i in WIN_LEN..N_FFT {
+            self.buf_re[i] = 0.0;
+            self.buf_im[i] = 0.0;
+        }
 
         self.fft.process(&mut self.buf_re, &mut self.buf_im);
 
-        // Partition all FFT bins proportionally. Preserve the reversed
-        // frequency orientation, with raw DC at display column BINS / 2.
+        self.pool_display(WF_BAND_HZ);
+        self.frame_seq = self.frame_seq.wrapping_add(1);
+    }
+
+    fn pool_display(&mut self, band: usize) {
+        debug_assert!(band > 0 && band <= SAMPLE_RATE_HZ);
+        // Column centres are (BINS/2 - d) * band/BINS Hz. Include raw-bin
+        // centres within half a column on either side (3-4 bins at 24 kHz).
+        let col_bins_f = band as f32 * N_FFT as f32 / (SAMPLE_RATE_HZ as f32 * BINS as f32);
+        let half_b = BINS / 2;
         for d in 0..BINS {
-            let lo = d * N_FFT / BINS;
-            let hi = (d + 1) * N_FFT / BINS;
-            let mut peak = 0f32;
-            for j in lo..hi {
-                let k = (N_FFT + N_FFT / 2 - j) % N_FFT;
-                let s = self.buf_re[k] * self.buf_re[k] + self.buf_im[k] * self.buf_im[k];
-                if s > peak {
-                    peak = s;
+            let k_c = (half_b as f32 - d as f32) * col_bins_f;
+            let mut lo = Float::ceil(k_c - col_bins_f * 0.5) as i32;
+            let mut hi = Float::floor(k_c + col_bins_f * 0.5) as i32;
+            // Below 7.5 kHz columns can contain no FFT-bin centre.
+            if lo > hi {
+                lo = Float::round(k_c) as i32;
+                hi = lo;
+            }
+            let mut best = 0f32;
+            for k in lo..=hi {
+                let idx = k.rem_euclid(N_FFT as i32) as usize;
+                let re = self.buf_re[idx];
+                let im = self.buf_im[idx];
+                let m = re * re + im * im;
+                if m > best {
+                    best = m;
                 }
             }
-            let mag = (peak.sqrt() * 65_535.0).min(65_535.0) as u16;
-            self.mags[d] = mag;
+            let mag = Float::sqrt(best);
+            self.mags[d] = (mag * 65_535.0).min(65_535.0) as u16;
         }
-        self.frame_seq = self.frame_seq.wrapping_add(1);
     }
 
     /// The current mags (320 bins, `u16` 0..65535).
@@ -178,53 +187,81 @@ mod tests {
 
     // Amplitude keeps the unnormalized Hann-windowed FFT below saturation.
     #[test]
-    fn peak_at_expected_display_bin() {
+    fn peak_at_expected_display_column() {
         let mut p = Pipeline::new().unwrap();
-        // Fixed raw-bin / column pairs include both near-DC sides and bins
-        // in the final 128 positions that floor-stride pooling discarded.
+        // Coherent WIN_LEN-bin tones map to even padded FFT bins. Include
+        // both near-DC sides and the first/last columns of the 24 kHz view.
         for (b, target) in [
-            (1021, 0),
-            (512, 80),
-            (3, 159),
-            (-3, 160),
-            (-512, 240),
-            (-960, 310),
-            (-1020, 319),
+            (256, 0),
+            (254, 1),
+            (40, 135),
+            (3, 158),
+            (-3, 162),
+            (-40, 185),
+            (-254, 319),
         ] {
-            for i in 0..N_FFT {
-                let ang = 2.0 * f32t::consts::PI * i as f32 * b as f32 / N_FFT as f32;
+            for i in 0..WIN_LEN {
+                let ang = 2.0 * f32t::consts::PI * i as f32 * b as f32 / WIN_LEN as f32;
                 p.push(0.00025 * Float::cos(ang), 0.00025 * Float::sin(ang));
             }
             let mags = p.mags();
             let peak = mags.iter().enumerate().max_by_key(|(_, m)| **m).unwrap();
             let (pi, pm) = peak;
+            assert_eq!(pi, target, "signed bin {b}: magnitude {pm}");
+            let expected = 0.00025 * WIN_LEN as f32 / 2.0 * 65_535.0;
             assert!(
-                pi == target,
-                "target {target} (raw bin {b}): peak at {pi}, mag {pm}"
+                (*pm as f32 - expected).abs() < 8.0,
+                "signed bin {b}: peak {pm}, expected {expected}"
             );
-            let expected = 0.00025 * N_FFT as f32 / 2.0 * 65_535.0;
-            assert!((*pm as f32 - expected).abs() < 8.0, "peak magnitude {pm}");
         }
     }
 
     #[test]
     fn dc_is_removed_before_windowing() {
         let mut p = Pipeline::new().unwrap();
-        for _ in 0..N_FFT {
+        for _ in 0..WIN_LEN {
             p.push(0.125, -0.25);
         }
         assert!(p.mags().iter().all(|&m| m == 0));
 
         let mut clean = Pipeline::new().unwrap();
-        for i in 0..N_FFT {
-            let ang = 2.0 * f32t::consts::PI * i as f32 * 512.0 / N_FFT as f32;
+        for i in 0..WIN_LEN {
+            let ang = 2.0 * f32t::consts::PI * i as f32 * 40.0 / WIN_LEN as f32;
             let re = 0.00025 * Float::cos(ang);
             let im = 0.00025 * Float::sin(ang);
             clean.push(re, im);
             p.push(re + 0.125, im - 0.25);
         }
+        let expected_peak = 0.00025 * WIN_LEN as f32 / 2.0 * 65_535.0;
+        assert!((clean.mags()[135] as f32 - expected_peak).abs() < 8.0);
         for (&actual, &expected) in p.mags().iter().zip(clean.mags()) {
             assert!(actual.abs_diff(expected) <= 16, "{actual} vs {expected}");
+        }
+    }
+
+    #[test]
+    fn narrow_zoom_uses_nearest_bin_for_empty_columns() {
+        let mut p = Pipeline::new().unwrap();
+        // A varying, nonzero spectrum makes both holes and wrong-bin
+        // fallbacks observable, including wrapped negative frequencies.
+        for (i, re) in p.buf_re.iter_mut().enumerate() {
+            *re = (i + 1) as f32 / 8192.0;
+        }
+        for band in [1, 100, 3_000, 6_001, 7_100] {
+            p.pool_display(band);
+            let col_bins = band as f64 * N_FFT as f64 / (SAMPLE_RATE_HZ as f64 * BINS as f64);
+            let mut empty_columns = 0;
+            for (d, &mag) in p.mags().iter().enumerate() {
+                assert!(mag > 0, "band {band}, column {d}");
+                let centre = (BINS as f64 / 2.0 - d as f64) * col_bins;
+                if (centre - col_bins / 2.0).ceil() > (centre + col_bins / 2.0).floor() {
+                    empty_columns += 1;
+                    let nearest = (centre.round() as i32).rem_euclid(N_FFT as i32) as usize;
+                    let expected = (p.buf_re[nearest] * 65_535.0) as u16;
+                    assert_eq!(mag, expected, "band {band}, column {d}");
+                }
+            }
+            assert!(empty_columns > 0, "band {band} must exercise fallback");
         }
     }
 
@@ -232,16 +269,16 @@ mod tests {
     fn only_full_windows_commit_and_sequence_wraps() {
         let mut p = Pipeline::new().unwrap();
         assert_eq!(p.mags().len(), BINS);
-        for _ in 0..N_FFT - 1 {
+        for _ in 0..WIN_LEN - 1 {
             p.push(0.0, 0.0);
         }
         assert_eq!(p.frame_seq(), 0);
-        assert_eq!(p.len(), N_FFT - 1);
+        assert_eq!(p.len(), WIN_LEN - 1);
         p.push(0.0, 0.0);
         assert_eq!(p.frame_seq(), 1);
         assert_eq!(p.len(), 0);
         p.frame_seq = u32::MAX;
-        for _ in 0..N_FFT {
+        for _ in 0..WIN_LEN {
             p.push(0.0, 0.0);
         }
         assert_eq!(p.frame_seq(), 0);

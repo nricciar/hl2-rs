@@ -10,28 +10,38 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use num_complex::Complex;
 
-use cortex_m::peripheral::DWT;
-
 use hl2::protocol::data::{
     BasebandChunk, HEADER_SIZE, parse_baseband_chunk_into, parse_data_header,
 };
 use hl2::protocol::{CHUNK_SIZE, DATA_PACKET_SIZE, ENDPOINT_DATA_TX};
-use hl2::receiver::VirtualReceiver;
+use hl2::receiver::{Demodulator, Mode, VirtualReceiver, make_demod};
 
+use crate::mode::len as mode_len;
 use crate::spectrum::Pipeline;
+
+#[inline]
+fn cycle_count() -> u32 {
+    #[cfg(target_arch = "arm")]
+    {
+        cortex_m::peripheral::DWT::cycle_count()
+    }
+    #[cfg(not(target_arch = "arm"))]
+    {
+        0
+    }
+}
 
 /// The receive-side state the radio task owns (task-local; no sync needed).
 pub struct Rx {
     /// Fixed slots prevent malformed frames from dropping bump-allocated buffers.
     baseband: [BasebandChunk; 2],
-    /// The virtual USB-SSB receiver (offset 0) — the *same* demod pipeline as
-    /// the UI (`Mode::Ssb(Usb)`, 96 kSps → 2.6 kHz channel select → 4.8 kHz
-    /// audio). Built on [`hl2::ReceiverConfig::default()`] so it mirrors the
-    /// UI receiver exactly. It runs so the demod is exercised at CPU speed and
-    /// its cost is surfaced (see the radio task's CPU% readout); its audio is
-    /// routed through the I2S path (`crate::audio::sink::Sink`) → SAI1 → WM8731
-    /// (see `crate::audio` and the "Audio output" note in PROTOCOL.md §2 / §16).
+    /// RX1 at offset 0, feeding the I2S audio sink.
     vrx: VirtualReceiver,
+    /// Running mode index; starts at 0 to match `ReceiverConfig::default()`.
+    active: usize,
+    /// Inactive demodulators, built once and retained for the no-free bump heap.
+    /// The active slot and modes not yet visited are `None`.
+    pool: [Option<Box<dyn Demodulator>>; mode_len()],
     /// Reused I/Q block handed to the virtual receiver each frame. Held as a
     /// field (not a per-call local) because the heap is a no_std bump arena
     /// that never frees — `clear()`, don't reallocate.
@@ -42,25 +52,23 @@ pub struct Rx {
     demod_cycles: u64,
     /// Cumulative DWT cycles spent committing the FFT windows (the
     /// `mags`/S-meter compute inside `Pipeline::push` once a full
-    /// `N_FFT`-sample window arrives). The *FFT* stage of the CPU readout.
+    /// `WIN_LEN`-sample window arrives, zero-padded to `N_FFT`). The
+    /// *FFT* stage of the CPU readout.
     fft_cycles: u64,
 }
 
 impl Rx {
     pub fn new() -> Self {
-        // USB-SSB, offset 0, 96 kSps, 2.6 kHz, 4.8 kHz audio — the `hl2`
-        // crate's default receiver config, so the Teensy's virtual receiver is
-        // byte-for-byte the same DSP the UI drives. Audio is routed through
-        // the I2S path (`audio::sink::Sink`) → WM8731; the S-meter is a
-        // spectrum consumer (see `crate::smeter`).
         let sink = Box::new(crate::audio::sink::Sink::new());
-        let vrx = VirtualReceiver::new(Default::default(), sink)
-            .expect("virtual USB receiver at offset 0");
+        let vrx =
+            VirtualReceiver::new(Default::default(), sink).expect("virtual receiver at offset 0");
         Self {
             baseband: core::array::from_fn(|_| BasebandChunk {
                 per_rx: alloc::vec::Vec::new(),
             }),
             vrx,
+            active: 0,
+            pool: core::array::from_fn(|_| None),
             iq_acc: Vec::new(),
             demod_cycles: 0,
             fft_cycles: 0,
@@ -76,11 +84,47 @@ impl Rx {
     }
 
     /// Cumulative DWT cycles spent committing the spectrum FFT windows
-    /// (`Pipeline::push` once a full `N_FFT`-sample window arrives — the
-    /// `mags`/S-meter compute). Monotonic; the radio task publishes the
+    /// (`Pipeline::push` once a full `WIN_LEN`-sample window arrives — the
+    /// `mags`/S-meter compute over the `[WIN_LEN, N_FFT)`-zero-padded FFT
+    /// output). Monotonic; the radio task publishes the
     /// per-second delta (see `crate::shared::set_cpu_fft_pct`).
     pub fn fft_cycles(&self) -> u64 {
         self.fft_cycles
+    }
+
+    /// Select a mode index, building it on first use and reusing its DSP state later.
+    /// The sink is unchanged; build errors leave the current mode running.
+    pub fn set_mode(&mut self, index: usize) -> Result<(), hl2::receiver::ReceiverError> {
+        if index == self.active {
+            return Ok(());
+        }
+        let mode = crate::mode::mode_at(index);
+        let bw = mode.default_bandwidth_hz();
+        let cfg = self.vrx.config();
+        let incoming = match self.pool[index].take() {
+            Some(d) => d,
+            None => make_demod(
+                mode,
+                cfg.source_rate_hz,
+                cfg.source_center_hz,
+                bw,
+                cfg.audio,
+            )?,
+        };
+        let retired = self.vrx.swap_demod(incoming, mode, bw);
+        self.pool[self.active] = Some(retired);
+        self.active = index;
+        Ok(())
+    }
+
+    /// Running index into `crate::mode::MODES`.
+    pub fn mode_index(&self) -> usize {
+        self.active
+    }
+
+    /// The virtual receiver's current demod mode.
+    pub fn mode(&self) -> Mode {
+        crate::mode::mode_at(self.active)
     }
 
     /// Consume one 1032-byte datagram. Returns the number of complex I/Q
@@ -100,10 +144,10 @@ impl Rx {
         }
         // One I/Q pair per record, per chunk; 63 per chunk at n_recv = 1,
         // 2 chunks per frame → 126 pair/frame in steady state. Each `push`
-        // either just accumulates a sample into the `N_FFT`-window (cost:
-        // one vector append — the *demod* stage) or, once every `N_FFT`
-        // samples, commits the window (cost: mean/window/FFT/max-pool — the
-        // *FFT* stage). The DWT taps below attribute each call to the one
+        // either just accumulates a sample into the `WIN_LEN`-window (cost:
+        // one vector append — the *demod* stage) or, once every `WIN_LEN`
+        // samples, commits the window (cost: mean/window/pad/FFT/max-pool —
+        // the *FFT* stage over the `[WIN_LEN, N_FFT)`-zero-padded input). The DWT taps below attribute each call to the one
         // that actually dominated (a new `frame_seq` appeared → FFT bucket,
         // otherwise demod).
         let mut pushed = 0usize;
@@ -118,10 +162,10 @@ impl Rx {
             for rx in chunk.per_rx.iter().take(1) {
                 for c in rx.iter() {
                     let seq_before = pipeline.frame_seq();
-                    let t0 = DWT::cycle_count();
+                    let t0 = cycle_count();
                     // Waterfall spectrum (unchanged path).
                     pipeline.push(c.re, c.im);
-                    let t1 = DWT::cycle_count();
+                    let t1 = cycle_count();
                     let delta = u64::from(t1.wrapping_sub(t0));
                     if pipeline.frame_seq() != seq_before {
                         self.fft_cycles += delta;
@@ -129,17 +173,16 @@ impl Rx {
                         self.demod_cycles += delta;
                     }
                     pushed += 1;
-                    // …and the virtual USB-SSB receiver (offset 0), accumulated
-                    // per chunk and fed below.
+                    // Accumulate RX1 samples for demodulation below.
                     self.iq_acc.push(*c);
                 }
             }
             // Drive the virtual receiver with this chunk's I/Q (its audio is
             // pushed to the I2S sink; the S-meter itself reads the spectrum,
             // not this demod output).
-            let vr0 = DWT::cycle_count();
+            let vr0 = cycle_count();
             let _ = self.vrx.process(&self.iq_acc);
-            self.demod_cycles += u64::from(DWT::cycle_count().wrapping_sub(vr0));
+            self.demod_cycles += u64::from(cycle_count().wrapping_sub(vr0));
         }
         pushed
     }
@@ -246,18 +289,60 @@ mod tests {
     }
 
     #[test]
+    fn mode_pool_reuses_demodulators_across_full_cycles() {
+        let mut rx = Rx::new();
+        let mut pointers = [None; mode_len()];
+        assert!(rx.pool.iter().all(Option::is_none));
+        for _ in 0..3 {
+            for step in 1..=mode_len() {
+                let previous = rx.mode_index();
+                let index = step % mode_len();
+                rx.set_mode(index).unwrap();
+                rx.set_mode(index).unwrap();
+                let retired =
+                    rx.pool[previous].as_deref().unwrap() as *const dyn Demodulator as *const ();
+                if let Some(expected) = pointers[previous] {
+                    assert_eq!(retired, expected);
+                } else {
+                    pointers[previous] = Some(retired);
+                }
+                assert!(rx.pool[index].is_none());
+                assert_eq!(rx.mode_index(), index);
+                let mode = crate::mode::mode_at(index);
+                assert_eq!(rx.mode(), mode);
+                let cfg = rx.vrx.config();
+                assert_eq!(cfg.mode, mode);
+                assert_eq!(cfg.bandwidth(), mode.default_bandwidth_hz());
+                assert_eq!(cfg.source_rate_hz, 96_000);
+                assert_eq!(cfg.source_center_hz, 0.0);
+                assert_eq!(cfg.audio.rate_hz, 4_800);
+                assert_eq!(cfg.audio.gain_db, 0.0);
+                assert!(cfg.tap.is_none());
+            }
+            assert_eq!(rx.mode_index(), 0);
+            assert_eq!(
+                rx.pool.iter().filter(|slot| slot.is_some()).count(),
+                mode_len() - 1
+            );
+        }
+    }
+
+    #[test]
     fn feed_matches_direct_pipeline_across_windows() {
         let mut rx = Rx::new();
         let mut received = Pipeline::new().unwrap();
         let mut direct = Pipeline::new().unwrap();
         let mut sample = 0;
-        // A low-amplitude, exactly representable quarter-rate complex tone.
+        // Integer I/Q for a coherent 6 kHz tone inside the 24 kHz view.
         // Comparing rows catches scaling, I/Q order, and dropped chunks.
+        let sine = [
+            0, 392, 724, 946, 1024, 946, 724, 392, 0, -392, -724, -946, -1024, -946, -724, -392,
+        ];
         for _ in 0..34 {
             let mut buf = make_frame(ENDPOINT_DATA_TX);
             for off in [HEADER_SIZE, HEADER_SIZE + CHUNK_SIZE] {
                 for r in 0..63 {
-                    let (re, im) = [(1024, 0), (0, 1024), (-1024, 0), (0, -1024)][sample % 4];
+                    let (re, im) = (sine[(sample + 4) % 16], sine[sample % 16]);
                     sample += 1;
                     let base = off + EP6_SYNC_LEN + 5 + r * 8;
                     put_24be(&mut buf, base, re);
@@ -271,7 +356,7 @@ mod tests {
             assert_eq!(received.mags(), direct.mags());
         }
         assert_eq!(received.frame_seq(), 2);
-        assert_eq!(received.len(), sample % crate::spectrum::N_FFT);
+        assert_eq!(received.len(), sample % crate::spectrum::WIN_LEN);
         assert!(received.mags()[80] > 8000);
     }
 }

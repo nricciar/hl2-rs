@@ -37,10 +37,12 @@ features = [
     "rt",
 ]
 
-# Unoptimized smoltcp exceeds the BSP's 192 KiB ITCM region. Keep debug
-# symbols and assertions, but optimize firmware even for development builds.
+# Optimize development firmware to fit the BSP's 192 KiB ITCM region.
 [profile.dev]
-opt-level = 1
+opt-level = "s"
+lto = "thin"
+debug = 0
+codegen-units = 1
 
 # Don't optimize build dependencies, like proc macros.
 # Helps with build times.

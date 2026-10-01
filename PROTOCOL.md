@@ -1296,6 +1296,46 @@ BasebandSource               Demodulator                      AudioSink
   `FmCore::new(…, "fm"|"nfm").demodulator(…)` in
   [`make_demod_tap`](hl2/src/receiver/demod/mod.rs:167).
 
+### 16.3e S-meter and Teensy controls
+
+The server's `compute_s_meter` ([api/src/meter.rs](api/src/meter.rs)) and
+Teensy's `compute_for_mode` ([teensy/src/smeter.rs](teensy/src/smeter.rs))
+compare passband RMS magnitude with a display-wide noise percentile. The
+Teensy maps the nonnegative dB margin to S0..S9, with S1 at 6 dB and 6 dB
+per additional unit. This is a relative display estimate, not calibrated
+RF strength.
+
+The passband follows `Mode::sideband` and `Mode::default_bandwidth_hz`:
+USB lies right of the NCO, LSB left, and AM/FM/NFM extend to both sides.
+`smeter::passband_columns` supplies the same clipped bounds to the
+waterfall overlay. The Teensy display spans 24 kHz at 75 Hz/column;
+FM's +/-15 kHz passband therefore extends beyond the visible measurement.
+DC removal suppresses a carrier exactly at the NCO. Zoom, max-pooling,
+and magnitude saturation also affect the reading.
+
+The Teensy floor is the exact 25th percentile (zero-based rank `n * 25 / 100`).
+Two radix passes reuse a 256-counter histogram to select its high and low
+bytes without allocation or sorting. See `smeter::compute_for_mode`.
+
+The encoder uses p28 (GPIO3_IO18) and p29 (GPIO4_IO31), tuning RX1 by
+25 Hz per quadrature edge. Its hardware-debounced button on p30
+(GPIO3_IO23) shares GPIO3's upper-half interrupt with p28 and requests a
+mode change. RTIC owns the interrupt priorities. See
+[teensy/src/encoder/mod.rs](teensy/src/encoder/mod.rs).
+
+`mode::MODES` orders the cycle as USB, LSB, AM, FM, NFM. `Rx::set_mode`
+([teensy/src/radio/rx.rs](teensy/src/radio/rx.rs)) builds each demodulator
+once and retains it for allocation-free reuse; the audio sink is unchanged.
+The radio task publishes the mode only after a successful switch.
+`VirtualReceiver::set_mode` preserves bandwidth overrides and raw taps;
+`swap_demod` records the supplied demodulator's mode and bandwidth.
+See [hl2/src/receiver/mod.rs](hl2/src/receiver/mod.rs).
+
+The render task retains undecorated waterfall history and composites the
+current NCO/passband into DMA staging, so a mode change repaints the whole
+overlay without accumulating tint. See `overlay::pixel` and
+`Dma::draw_pixels` in [teensy/src/display](teensy/src/display).
+
 ### 16.4 Sinks
 
 * [`AudioSink`](hl2/src/receiver/sink.rs:30) is deliberately `i16`-mono only

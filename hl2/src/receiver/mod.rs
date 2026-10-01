@@ -368,6 +368,41 @@ impl VirtualReceiver {
         self.demod.set_gain_db(gain_db);
     }
 
+    /// Rebuild the demodulator for `mode`, preserving source, audio, tap and sink.
+    /// An explicit bandwidth override is retained; `None` uses each mode's default.
+    /// Success discards old DSP state and buffered audio; errors leave it unchanged.
+    pub fn set_mode(&mut self, mode: Mode) -> Result<(), ReceiverError> {
+        let bw = self
+            .cfg
+            .bandwidth_hz
+            .unwrap_or_else(|| mode.default_bandwidth_hz());
+        let new_demod = make_demod_tap(
+            mode,
+            self.cfg.source_rate_hz,
+            self.cfg.source_center_hz,
+            bw,
+            self.cfg.audio,
+            self.cfg.tap.clone(),
+        )?;
+        self.demod = new_demod;
+        self.cfg.mode = mode;
+        Ok(())
+    }
+
+    /// Swap demodulators without allocation, returning the old one and keeping the sink.
+    /// The caller must match the receiver's source, audio and tap configuration,
+    /// and supply the incoming mode and bandwidth. The width becomes an explicit override.
+    pub fn swap_demod(
+        &mut self,
+        incoming: Box<dyn Demodulator>,
+        mode: Mode,
+        bandwidth_hz: u32,
+    ) -> Box<dyn Demodulator> {
+        self.cfg.mode = mode;
+        self.cfg.bandwidth_hz = Some(bandwidth_hz);
+        core::mem::replace(&mut self.demod, incoming)
+    }
+
     /// Retune the running receiver **in place** (no thread restart, no audio
     /// gap): change the channel-offset NCO to `source_center_hz` (Hz from the
     /// source centre) and re-tap the channel-select / quadrature DSP for
@@ -445,6 +480,98 @@ mod tests {
             Mode::FmNarrow,
         ] {
             VirtualReceiver::new(cfg(m), Box::new(VecSink::new())).expect("receiver build");
+        }
+    }
+
+    #[test]
+    fn repeated_mode_switches_preserve_bandwidth_policy() {
+        for bandwidth_hz in [None, Some(4_000)] {
+            let mut rx = VirtualReceiver::new(
+                ReceiverConfig {
+                    bandwidth_hz,
+                    ..Default::default()
+                },
+                Box::new(VecSink::new()),
+            )
+            .unwrap();
+            for mode in [
+                Mode::Am,
+                Mode::Fm,
+                Mode::FmNarrow,
+                Mode::Ssb(Sideband::Usb),
+                Mode::Am,
+            ] {
+                rx.set_mode(mode).unwrap();
+                assert_eq!(rx.config().mode, mode);
+                assert_eq!(rx.config().bandwidth_hz, bandwidth_hz);
+                assert_eq!(
+                    rx.config().bandwidth(),
+                    bandwidth_hz.unwrap_or(mode.default_bandwidth_hz())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mode_switches_preserve_raw_tap() {
+        #[derive(Debug, Default)]
+        struct Tap(AtomicUsize);
+        impl RawSampleTap for Tap {
+            fn append(&self, samples: &[f32]) {
+                self.0.fetch_add(samples.len(), Ordering::Relaxed);
+            }
+        }
+
+        let tap = Arc::new(Tap::default());
+        let mut rx = VirtualReceiver::new(
+            ReceiverConfig {
+                tap: Some(tap.clone()),
+                ..Default::default()
+            },
+            Box::new(VecSink::new()),
+        )
+        .unwrap();
+        let iq = tone(rx.config().source_rate_hz, 1_500.0, 12_000, 0.5);
+        for mode in [Mode::Am, Mode::Fm, Mode::Ssb(Sideband::Usb)] {
+            rx.set_mode(mode).unwrap();
+            let before = tap.0.load(Ordering::Relaxed);
+            rx.process(&iq).unwrap();
+            rx.flush().unwrap();
+            assert!(tap.0.load(Ordering::Relaxed) > before);
+        }
+    }
+
+    #[test]
+    fn swaps_report_each_incoming_bandwidth() {
+        for bandwidth_hz in [None, Some(4_000)] {
+            let mut rx = VirtualReceiver::new(
+                ReceiverConfig {
+                    bandwidth_hz,
+                    ..Default::default()
+                },
+                Box::new(VecSink::new()),
+            )
+            .unwrap();
+            for (mode, width) in [
+                (Mode::Am, 8_000),
+                (Mode::Fm, 12_000),
+                (Mode::FmNarrow, 5_000),
+            ] {
+                let cfg = rx.config();
+                let incoming = make_demod_tap(
+                    mode,
+                    cfg.source_rate_hz,
+                    cfg.source_center_hz,
+                    width,
+                    cfg.audio,
+                    cfg.tap.clone(),
+                )
+                .unwrap();
+                let _retired = rx.swap_demod(incoming, mode, width);
+                assert_eq!(rx.config().mode, mode);
+                assert_eq!(rx.config().bandwidth_hz, Some(width));
+                assert_eq!(rx.config().bandwidth(), width);
+            }
         }
     }
 

@@ -143,7 +143,7 @@ mod app {
 
     use super::{POLLER, cycles_now, ms_since, now_millis, poll_log};
     use cortex_m::peripheral::DWT;
-    use hl2_teensy::{autoscale, display, i2c, radio, shared, spectrum};
+    use hl2_teensy::{autoscale, display, encoder, i2c, radio, shared, smeter, spectrum};
     use imxrt_log as logging;
     use rtic_monotonics::systick::ExtU64;
     use rtic_monotonics::systick::Systick;
@@ -169,6 +169,27 @@ mod app {
         }
     }
 
+    /// A and the button share GPIO3's upper-half interrupt.
+    #[task(binds = GPIO3_COMBINED_16_31, priority = 1)]
+    fn enc_a_irq(_cx: enc_a_irq::Context) {
+        let active = encoder::isr_gpio3_upper_active();
+        if active & (1u32 << 18) != 0 {
+            encoder::handle_edge();
+            encoder::clear_isr_gpio3_pin18();
+        }
+        if active & (1u32 << 23) != 0 {
+            encoder::handle_button_press();
+            encoder::clear_isr_gpio3_pin23();
+        }
+    }
+
+    /// Encoder B channel (p29, GPIO4_IO31).
+    #[task(binds = GPIO4_COMBINED_16_31, priority = 1)]
+    fn enc_b_irq(_cx: enc_b_irq::Context) {
+        encoder::handle_edge();
+        encoder::clear_isr_gpio4_pin31();
+    }
+
     /// Task-local type alias for the ILI9341 panel.
     type Panel = display::driver::Display;
 
@@ -186,6 +207,8 @@ mod app {
     fn init(cx: init::Context) -> (Shared, Local) {
         let board::Resources {
             mut gpio2,
+            gpio3,
+            gpio4,
             pins,
             usb,
             lpspi4,
@@ -240,6 +263,10 @@ mod app {
             board::ARM_FREQUENCY,
             rtic_monotonics::create_systick_token!(),
         );
+
+        // Configure GPIOs before RTIC enables the encoder interrupts.
+        encoder::init(gpio3, gpio4, pins.p28, pins.p29, pins.p30);
+        shared::set_nco_hz(radio::control::TUNE_HZ);
 
         // Pins: CS=p10, DC=p9 (GPIO2); LPSPI4 SDO=p11, SDI=p12, SCK=p13.
         //
@@ -691,6 +718,11 @@ mod app {
         handle.send_lna(radio::control::LNA_GAIN_DB);
         handle.send_tune(radio::control::TUNE_HZ);
 
+        // Current RX1 NCO (Hz), mutated by the encoder retune path in the
+        // streaming loop below. `i64` so signed step deltas are trivial;
+        // `send_tune` takes `u32` (clamped on each retune).
+        let mut nco_hz: i64 = radio::control::TUNE_HZ as i64;
+
         // 8. Streaming.
         shared::set_state(shared::STATE_STREAMING);
         log::info!("EP6 streaming at 96 kSps, NCO 7.074 MHz (RX1)");
@@ -744,10 +776,9 @@ mod app {
             if cur_seq != last_row_pub {
                 last_row_pub = cur_seq;
                 shared::publish(pipeline.mags());
-                // The S-meter is a spectrum consumer (PROTOCOL.md §16.3e) — the
-                // same 320-bin row the render task blits. Compute it here, off
-                // the render path, so the render task just paints.
-                let m = hl2_teensy::smeter::compute(pipeline.mags());
+                // Meter the visible passband for the running mode.
+                let m =
+                    hl2_teensy::smeter::compute_for_mode(pipeline.mags(), shared::rx1_mode_index());
                 shared::set_slevel(m.sunits, m.margin_db);
                 // Auto floor/ceil: advance the window from the *same* row and
                 // publish it so the render task's `bin_color` ramps the live
@@ -787,6 +818,35 @@ mod app {
                 handle.send_keepalive();
             }
 
+            // Apply the signed edges accumulated since the last iteration.
+            let steps = encoder::take_steps();
+            if steps != 0 {
+                let new_nco = (nco_hz + (steps as i64) * (encoder::step_hz() as i64))
+                    .clamp(0, u32::MAX as i64) as u32;
+                nco_hz = new_nco as i64;
+                shared::set_nco_hz(new_nco);
+                handle.send_tune(new_nco);
+            }
+
+            // Publish only successful mode changes so the display follows RX1.
+            if encoder::take_mode_request() {
+                let new_idx = (rx.mode_index() + 1) % hl2_teensy::mode::len();
+                match rx.set_mode(new_idx) {
+                    Ok(()) => {
+                        shared::set_rx1_mode_index(new_idx);
+                        log::info!("RX1 mode → {}", hl2_teensy::mode::label_at(new_idx));
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "RX1 mode → {} failed: {}",
+                            hl2_teensy::mode::label_at(new_idx),
+                            e
+                        );
+                        poll_log();
+                    }
+                }
+            }
+
             Systick::delay(1.millis()).await;
             poll_log();
         }
@@ -809,26 +869,22 @@ mod app {
     async fn render(_cx: render::Context, mut panel: Panel, mut dma: Dma) {
         let fb = WF.take();
 
-        // Boot: fill black (covers the red "HL2 TEENSY" splash), draw the
-        // status bar once.
+        // Boot: fill black (covers the red "HL2 TEENSY" splash). The top
+        // half of the panel is the status header (IP + state), the large
+        // frequency/mode readout, and the S-meter; the waterfall occupies
+        // the bottom half (y >= `display::WF_TOP`).
         display::driver::fill_rect(&mut panel, 0, 0, 320, 240, 0x0000);
-        display::driver::draw_text(
-            &mut panel,
-            6,
-            display::WF_ROWS as u16 + 76,
-            1,
-            "7.074MHz RX1 96k",
-            0xF800,
-            0x0000,
-        );
-        let mut status_label = display::driver::TextLine::<9>::new();
-        let mut status_detail = display::driver::TextLine::<32>::new();
+        let mut status_ip = display::driver::TextLine::<16>::new();
+        let mut status_state = display::driver::TextLine::<9>::new();
+        let mut status_freq = display::driver::TextLine::<20>::new();
         let mut status_meter = display::driver::TextLine::<16>::new();
-        let mut status_cpu = display::driver::TextLine::<32>::new();
 
         let mut painted_seq: u32 = 0;
+        let mut painted_mode = usize::MAX;
         let mut last_state: u32 = u32::MAX;
         let mut last_peer: u32 = u32::MAX;
+        let mut last_nco: u32 = u32::MAX;
+        let mut last_mode: u32 = u32::MAX;
         let mut last_status_ms: i64 = now_millis();
         let mut last_heartbeat_ms: i64 = 0;
         let mut heartbeat_count: u32 = 0;
@@ -884,8 +940,8 @@ mod app {
                 })
                 .unwrap_or(u32::MAX);
 
-            // Shift in RAM, then repaint the band because every row has moved.
-            if seq != painted_seq {
+            let mode_idx = shared::rx1_mode_index();
+            if seq != painted_seq || mode_idx != painted_mode {
                 let cols = display::WF_COLS;
                 let rows = display::WF_ROWS;
                 let total = cols * rows;
@@ -901,14 +957,16 @@ mod app {
                 //    (same shared wall as demod / fft). The eDMA blit below is
                 //    offloaded to the engine and is *not* counted as CPU.
                 let c0 = DWT::cycle_count();
-                fb.copy_within(..total - cols, cols);
-                // 2. new row at the top, ramped by the auto floor/ceil window.
-                for (i, px) in fb[..cols].iter_mut().enumerate() {
-                    *px = display::palette::bin_color(
-                        row.get(i).copied().unwrap_or(0u16),
-                        floor,
-                        ceil,
-                    );
+                if seq != painted_seq {
+                    fb.copy_within(..total - cols, cols);
+                    // 2. new row at the top, ramped by the auto floor/ceil window.
+                    for (i, px) in fb[..cols].iter_mut().enumerate() {
+                        *px = display::palette::bin_color(
+                            row.get(i).copied().unwrap_or(0u16),
+                            floor,
+                            ceil,
+                        );
+                    }
                 }
                 shared::add_lcd_cycles(u64::from(DWT::cycle_count().wrapping_sub(c0)));
                 // 3. Blit the band via eDMA. This hands the pixel work over
@@ -917,27 +975,43 @@ mod app {
                 //    poll the radio's MAC ring between chunks — the exact
                 //    "we're not stalling the network" win the DMA path was
                 //    meant to buy.
-                dma.draw_pixels(0, 0, (cols as u16) - 1, (rows as u16) - 1, &fb[..total])
-                    .await;
+                let wf_top = display::WF_TOP;
+                dma.draw_pixels(
+                    0,
+                    wf_top,
+                    (cols as u16) - 1,
+                    wf_top + (rows as u16) - 1,
+                    &fb[..total],
+                    smeter::passband_columns(mode_idx),
+                )
+                .await;
                 painted_seq = seq;
+                painted_mode = mode_idx;
                 // Let the radio drain its MAC ring before further SPI work.
                 Systick::delay(1.millis()).await;
             }
 
-            // Refresh status on changes and keep the RX counter live at 2 Hz.
+            // Refresh status on changes and the meter at 2 Hz.
             let now_ms = now_millis();
-            let st_changed = st != last_state || peer_u32 != last_peer;
+            let nco = shared::nco_hz();
+            let mode_idx = shared::rx1_mode_index() as u32;
+            let st_changed = st != last_state
+                || peer_u32 != last_peer
+                || nco != last_nco
+                || mode_idx != last_mode;
             let tick = (now_ms - last_status_ms) >= 500;
             if st_changed || tick {
                 last_state = st;
                 last_peer = peer_u32;
+                last_nco = nco;
+                last_mode = mode_idx;
                 last_status_ms = now_ms;
                 status_redraw(
                     &mut panel,
-                    &mut status_label,
-                    &mut status_detail,
+                    &mut status_ip,
+                    &mut status_state,
+                    &mut status_freq,
                     &mut status_meter,
-                    &mut status_cpu,
                 );
             }
 
@@ -945,15 +1019,15 @@ mod app {
         }
     }
 
-    /// Update only changed status characters, including the live RX counter
-    /// and the per-stage CPU readout.
+    /// Draw IP/state, centred frequency/mode, and the meter above the waterfall.
     fn status_redraw(
         panel: &mut Panel,
-        status_label: &mut display::driver::TextLine<9>,
-        status_detail: &mut display::driver::TextLine<32>,
+        status_ip: &mut display::driver::TextLine<16>,
+        status_state: &mut display::driver::TextLine<9>,
+        status_freq: &mut display::driver::TextLine<20>,
         status_meter: &mut display::driver::TextLine<16>,
-        status_cpu: &mut display::driver::TextLine<32>,
     ) {
+        use core::fmt::Write;
         let label = match shared::state() {
             shared::STATE_WAITING_IP => "WAIT IP",
             shared::STATE_LINK => "LINK",
@@ -964,38 +1038,65 @@ mod app {
             shared::STATE_ERROR => "ERROR",
             _ => "?",
         };
-        let wf_y = display::WF_ROWS as u16;
-        status_label.update(panel, 6, wf_y + 4, label, 0xF800, 0x0000);
-        use core::fmt::Write;
-        let mut line = [0u8; 32];
+        // 9 cells at 6px = 54px wide; right-aligned with a 6px margin.
+        status_state.update(panel, 320 - 6 - 9 * 6, 6, label, 0xF800, 0x0000);
+        let mut ip = [0u8; 16];
         let mut w = radio::control::WriteBuf {
-            target: &mut line,
+            target: &mut ip,
             pos: 0,
         };
-        if let Some(ip) = shared::peer() {
-            write!(w, "{ip}").unwrap();
-        } else {
-            write!(w, "-").unwrap();
+        match shared::peer() {
+            Some(ip) => {
+                let _ = write!(w, "{ip}");
+            }
+            None => {
+                let _ = write!(w, "NO IP");
+            }
         }
-        write!(w, " F {}", shared::frames()).unwrap();
-        let line_s = core::str::from_utf8(&w.target[..w.pos]).unwrap();
-        status_detail.update(panel, 6, wf_y + 30, line_s, 0xF800, 0x0000);
+        let ip_s = core::str::from_utf8(&w.target[..w.pos]).unwrap();
+        status_ip.update(panel, 6, 6, ip_s, 0xF800, 0x0000);
 
-        // S-meter readout. The bar is `S1..S9` (one segment per unit), the
-        // raw dB-over-floor margin to its right. The bar sits below the
-        // state label / IP/F counter row; the CPU split is on its own row
-        // further down (see `status_cpu` at the end of this fn).
+        // Fit and centre the MHz.kHz.Hz readout between the header and meter.
+        const FREQ_TOP: u16 = 16;
+        const FREQ_BOTTOM: u16 = 106;
+        let hz = shared::nco_hz();
+        let mode_label = hl2_teensy::mode::label_at(shared::rx1_mode_index());
+        let mut freq = [0u8; 20];
+        let mut wf = radio::control::WriteBuf {
+            target: &mut freq,
+            pos: 0,
+        };
+        let _ = write!(
+            wf,
+            "{:03}.{:03}.{:03} {}",
+            hz / 1_000_000,
+            (hz / 1000) % 1000,
+            hz % 1000,
+            mode_label
+        );
+        let freq_s = core::str::from_utf8(&wf.target[..wf.pos]).unwrap();
+        let len = freq_s.len() as u32;
+        let max_scale = (296u32 / (len * 6u32)).min((FREQ_BOTTOM - FREQ_TOP) as u32 / 7u32);
+        let scale = 1u16.max(max_scale as u16);
+        let text_w = len as u16 * 6u16 * scale;
+        let x0 = (320u16 / 2).saturating_sub(text_w / 2);
+        let y = FREQ_TOP + ((FREQ_BOTTOM - FREQ_TOP) / 2) - (7u16 * scale) / 2;
+        status_freq.update_scaled(panel, x0, y, scale, freq_s, 0xF800, 0x0000);
+
+        // S-meter readout, the last row of the top half (y 106): the bar is
+        // `S1..S9` (one segment per unit), the raw dB-over-floor margin to
+        // its right.
         //
         // `fill_rect(display, x, y, w, h, color)` — the last 4 args are
         // width/height, NOT x2/y2.
         let s = shared::slevel();
         let margin = shared::smargin_db();
-        let bar_y = wf_y + 14u16;
+        let bar_y = 106u16;
         let seg_w = 8u16;
         let seg_h = 8u16;
-        let x0 = 6u16;
+        let bar_x = 6u16;
         for i in 0..9u16 {
-            let x = x0 + (i as u32 * ((seg_w + 1) as u32)) as u16;
+            let x = bar_x + (i as u32 * ((seg_w + 1) as u32)) as u16;
             let on = (i as u8 + 1) <= s;
             let fg: u16 = if on { 0xFFFF } else { 0x4020 };
             display::driver::fill_rect(panel, x, bar_y, seg_w, seg_h, fg);
@@ -1014,38 +1115,7 @@ mod app {
             let _ = write!(w2, "S{s} +{:.0} dB", margin);
         }
         let meter_s = core::str::from_utf8(&w2.target[..w2.pos]).unwrap();
-        let meter_x = x0 + (9u16 * (seg_w + 1) as u16) + 2u16;
+        let meter_x = bar_x + (9u16 * (seg_w + 1) as u16) + 2u16;
         status_meter.update(panel, meter_x, bar_y, meter_s, 0xF800, 0x0000);
-
-        // CPU split, on its own row **below the frequency line** (the "7.074 MHz…"
-        // line drawn at boot at `WF_ROWS + 76`). The three stages are the
-        // pipeline's three workloads, each reported as a percent (≤ 100) on its
-        // *own* task's rolling 1-second window:
-        //   * D — demod: EP6 baseband parse + virtual-USB demod  (radio task)
-        //   * F — fft:   the 2048-commit spectrum / S-meter window (radio task)
-        //   * L — lcd:   the waterfall shift + colourise           (render task)
-        // They run on one shared core, so the three can each read ~100 and
-        // overlap — that's the honest "what's eating the CPU" number.
-        let mut cpu = [0u8; 32];
-        let mut w3 = radio::control::WriteBuf {
-            target: &mut cpu,
-            pos: 0,
-        };
-        let _ = write!(
-            w3,
-            "CPU D:{:03} F:{:03} L:{:03} %",
-            shared::cpu_demod_pct(),
-            shared::cpu_fft_pct(),
-            shared::cpu_lcd_pct(),
-        );
-        let cpu_s = core::str::from_utf8(&w3.target[..w3.pos]).unwrap();
-        status_cpu.update(
-            panel,
-            6,
-            display::WF_ROWS as u16 + 85,
-            cpu_s,
-            0xF800,
-            0x0000,
-        );
     }
 }

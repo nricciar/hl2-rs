@@ -22,6 +22,8 @@ codec board over I2C.
 
 ### ILI9341
 
+LCD Output
+
 ```
 //    SCK        13
 //    MOSI       11
@@ -31,6 +33,8 @@ codec board over I2C.
 ```
 
 ### WM8731
+
+Audio Output
 
 ```
 //    MikroE   Teensy 4
@@ -42,6 +46,18 @@ codec board over I2C.
 //     DACL       20
 //     SDA        18
 //     SCL        19
+```
+
+### Rotary Encoder
+
+Used for tuning and mode switching
+
+```
+//   Encoder  Teensy 4
+//   -------  --------
+//    Pin1     28
+//    Pin2     29
+//    Btn      30
 ```
 
 ![Waterfall](doc/waterfall.gif)

@@ -12,6 +12,7 @@ use embedded_hal::spi::{ErrorType, Operation, SpiBus, SpiDevice};
 use static_cell::ConstStaticCell;
 use teensy4_bsp::{board, hal};
 
+use super::overlay;
 use crate::display::glyphs::glyph;
 
 /// LPSPI driver's error type (kept for the `ErrorType` impls below).
@@ -114,7 +115,7 @@ pub fn new_display(
         ili9341::DisplaySize240x320,
     )?;
     display.invert_mode(ili9341::ModeState::Off)?;
-    display.brightness(255)?;
+    display.brightness(99)?;
     Ok(display)
 }
 
@@ -123,29 +124,14 @@ const MEM_COLUMN: u8 = 0x2A;
 const MEM_ROW: u8 = 0x2B;
 const MEM_WRITE: u8 = 0x2C;
 
-/// Largest LPSPI transaction: the HAL caps `Transaction::new_words` at 128
-/// `u32` (4096-bit max frame size, see `lpspi::Transaction`), so one DMA
-/// transfer through this peripheral is bounded to 128 words (256
-/// RGB565 pixels — each `u32` holds two packed RGB565 halves, MSB-first).
-/// Chunk the pixel stream accordingly.
+/// LPSPI's 4096-bit frame limit: 128 words, each holding two RGB565 pixels.
 const MAX_TX_WORDS: usize = 128;
 
-/// Staging buffer for a 128-`u32` DMA transfer. Held in `.uninit` (OC-RAM)
-/// like the framebuffer. One `DmaDisplay` owns the `&'static mut` for its
-/// lifetime; the DMA engine reads it while the LPSPI streams the chunk to
-/// the panel, so it must not be mutated until the transfer's `DONE` bit
-/// clears. A `DmaDisplay` is single-task-owned, so the reference is
-/// uniquely held across the blit's lifetime.
+/// Owned by one `DmaDisplay`; reused only after each DMA write completes.
 static DMA_STAGE: ConstStaticCell<[u32; MAX_TX_WORDS]> = ConstStaticCell::new([0u32; MAX_TX_WORDS]);
 
-/// DMA-accelerated ILI9341 pixel blit.
-///
-/// Holds an LPSPI4 instance bitwise-copied from the blocking `DisplaySpi`
-/// (same register file, same clock settings — the LPSPI is not reconfigured
-/// after `Ili9341::new`, so a second handle on the same `Lpspi` state sees
-/// the same `ccr_cache` / `bit_order` / `mode` / `pcs` the DMA path uses),
-/// the display's CS and DC GPIO pins (bitwise-copied the same way), and a
-/// DMA `Channel` allocated from `resources.dma`.
+/// DMA blitter sharing SPI and GPIO hardware with the blocking display.
+/// Both handles must stay in one task and must not be used concurrently.
 pub struct DmaDisplay {
     spi: board::Lpspi,
     cs: hal::gpio::Output,
@@ -154,32 +140,15 @@ pub struct DmaDisplay {
     stage: &'static mut [u32; MAX_TX_WORDS],
 }
 
-/// Blocking u8 SPI write through `board::Lpspi` (via the embedded-hal
-/// `SpiBus` impl the blocking `DisplaySpi` already depends on). Used for the
-/// ILI9341 header bytes — a small number of command/address tokens that the
-/// DMA engine has no job here (they're interleaved with DC pin toggles).
+/// Send command/address bytes and drain SPI before the next DC change.
 fn lpspi_write_u8(spi: &mut board::Lpspi, bytes: &[u8]) {
     SpiBus::<u8>::write(spi, bytes).expect("lpspi cmd write");
     SpiBus::<u8>::flush(spi).expect("lpspi flush");
 }
 
 impl DmaDisplay {
-    /// Build a `DmaDisplay` by bitwise-copying the LPSPI + CS pin + DC pin
-    /// from their `&` references, and taking ownership of the eDMA channel.
-    ///
-    /// The caller retains ownership of the originals — those get moved into
-    /// the blocking `Display` (via `new_display`) later in the same
-    /// `init()` body. Both handles share the same LPSPI register file and
-    /// the same GPIO bits at the hardware level (the type system just
-    /// doesn't know about the second handle).
-    ///
-    /// # Safety
-    ///
-    /// `board::Lpspi` (`hal::lpspi::Lpspi`) has all-pod fields —
-    /// `NonZeroCell`, `ccr_cache`, `bit_order`, `mode`, `pcs` — none with
-    /// `Drop`. `hal::gpio::Output` is `{gpio: AnyInstance, offset: u32}` —
-    /// same story. `core::ptr::read`-ing each through a shared reference is
-    /// therefore a valid bitwise copy.
+    /// Copy the blocking display's hardware handles and own the DMA channel.
+    /// SPI configuration must remain consistent between the two handles.
     pub fn new(
         spi: &board::Lpspi,
         cs: &hal::gpio::Output,
@@ -187,6 +156,7 @@ impl DmaDisplay {
         chan: hal::dma::channel::Channel,
     ) -> Self {
         Self {
+            // These HAL handles have no Drop; access is serialized by the render task.
             spi: unsafe { core::ptr::read(spi) },
             cs: unsafe { core::ptr::read(cs) },
             dc: unsafe { core::ptr::read(dc) },
@@ -195,15 +165,9 @@ impl DmaDisplay {
         }
     }
 
-    /// Write the ILI9341 memory-window + memory-write header (column, row,
-    /// then the "stream pixels next" command). DC is toggled per segment in
-    /// exactly the byte order the blocking ILI9341 init path used.
+    /// Select an inclusive pixel window and begin a memory write.
     fn send_window(&mut self, x0: u16, y0: u16, x1: u16, y1: u16) {
-        // Assert CS for the whole pixel transfer — the ILI9341 holds its
-        // memory-window latch across CS boundaries only when the memory
-        // write command has been issued, and we don't want CS to deassert
-        // between header bytes because that would split the command stream
-        // the panel is expecting.
+        // Keep CS asserted through the header and all pixel chunks.
         self.cs.set_low();
         self.dc.set_low();
         lpspi_write_u8(&mut self.spi, &[MEM_COLUMN]);
@@ -224,121 +188,64 @@ impl DmaDisplay {
         self.dc.set_high();
     }
 
-    /// DMA-blit `pixels` (RGB565, in the row-major order the ILI9341
-    /// expects for the current memory window) into the window
-    /// `(x0..=x1, y0..=y1)`. This drives the header (memory window + write
-    /// command) synchronously, then hands the pixel stream to the eDMA
-    /// engine in `MAX_TX_WORDS`-sized chunks.
-    ///
-    /// Per chunk:
-    ///   1. Repack 256 u16 pixels → 128 u32s (upper half = left half of
-    ///      the u32 word, matching the LPSPI's MSB-first shift).
-    ///   2. `Lpspi::dma_write` programs the LPSPI TCR for the chunk and
-    ///      enables the LPSPI's DMA-tx bit.
-    ///   3. The returned `Write` future resolves when the eDMA signals the
-    ///      channel's `DONE` bit. The channel is armed with
-    ///      `set_interrupt_on_completion(true)`, so completion fires the
-    ///      `DMA0_DMA16` IRQ; the `dma_irq` handler in `main` calls
-    ///      `hal::dma::DMA.on_interrupt(0)`, which clears the flag and
-    ///      wakes the registered waker. The `.await` below stores that
-    ///      waker, so `render` yields its timeslice back to the RTIC loop
-    ///      and `radio_task` (network demod + spectrum) runs while the
-    ///      eDMA moves bytes — the exact win the DMA path was added for.
-    ///   4. `SpiBus::flush` waits until the panel has actually clocked
-    ///      out the last frame (the LPSPI's `BUSY` flag may still be set
-    ///      when the DMA's `DONE` bit clears) — necessary before the next
-    ///      chunk's TCR is enqueued.
-    pub async fn draw_pixels(&mut self, x0: u16, y0: u16, x1: u16, y1: u16, pixels: &[u16]) {
+    /// Blit undecorated RGB565 history, compositing overlays in DMA staging.
+    /// `passband` is ordered and inclusive, relative to the window's columns;
+    /// the NCO cursor is at its centre. Pixels must exactly fill the inclusive
+    /// window and have even length (two pixels per DMA word).
+    pub async fn draw_pixels(
+        &mut self,
+        x0: u16,
+        y0: u16,
+        x1: u16,
+        y1: u16,
+        pixels: &[u16],
+        passband: (usize, usize),
+    ) {
+        assert!(x0 <= x1 && y0 <= y1, "invalid pixel window");
+        let cols = usize::from(x1) - usize::from(x0) + 1;
+        let rows = usize::from(y1) - usize::from(y0) + 1;
+        assert_eq!(pixels.len() % 2, 0, "DMA requires paired pixels");
+        assert_eq!(
+            Some(pixels.len()),
+            cols.checked_mul(rows),
+            "pixel window size mismatch"
+        );
+        let (pb_lo, pb_hi) = passband;
         self.send_window(x0, y0, x1, y1);
-        // Arm interrupt-on-completion once. `prepare_write` (called inside
-        // `dma_write`) does not touch INTMAJOR, so this stays set across all
-        // chunks in this blit, and also stays set for subsequent blits — the
-        // channel is ours exclusively, so there's no contention to worry
-        // about. The `DMA0_DMA16` IRQ (channel 0) wakes whatever task is
-        // currently `.await`-ing on `self.chan`.
+        // The DMA IRQ wakes the render task between chunks.
         self.chan.set_interrupt_on_completion(true);
         let mut k = 0usize;
-        let mut cyc_setup = 0u64;
         let n = pixels.len();
-        let t0 = cortex_m::peripheral::DWT::cycle_count();
-        // Diagnostic: per-chunk wall time for the first 6 chunks + min/max
-        // across the rest, so we can tell "each of 150 chunks takes 15 ms"
-        // (all samples ~15000) from "one chunk stalls, rest fine" (one
-        // sample in the millions, rest ~124).
-        const SAMPLE_N: usize = 6;
-        let mut sample: [u32; SAMPLE_N] = [0; SAMPLE_N];
-        let mut sample_i: usize = 0;
-        let mut max_wait_us: u64 = 0;
-        let mut min_wait_us: u64 = u64::MAX;
-        // IRQ count across the blit — how many times the ISR actually fired.
-        let irq_start = crate::shared::irq_fires();
         while k < n {
             let chunk_end = (k + MAX_TX_WORDS * 2).min(n);
             let pairs = (chunk_end - k) / 2;
             for i in 0..pairs {
-                // Upper half first so the LPSPI MSB-first shift emits
-                // `pixel[0].hi, pixel[0].lo, pixel[1].hi, pixel[1].lo` —
-                // the exact byte order the ILI9341 samples.
-                self.stage[i] = ((pixels[k + 2 * i] as u32) << 16) | (pixels[k + 2 * i + 1] as u32);
+                let index = k + 2 * i;
+                let first = overlay::pixel(pixels[index], index % cols, pb_lo, pb_hi, cols / 2);
+                let second = overlay::pixel(
+                    pixels[index + 1],
+                    (index + 1) % cols,
+                    pb_lo,
+                    pb_hi,
+                    cols / 2,
+                );
+                // First pixel in the upper half for MSB-first SPI.
+                self.stage[i] = (u32::from(first) << 16) | u32::from(second);
             }
-            let a = cortex_m::peripheral::DWT::cycle_count();
-            let w = self
+            let result = self
                 .spi
                 .dma_write(&mut self.chan, &self.stage[..pairs])
-                .expect("dma_write setup");
-            let setup = cortex_m::peripheral::DWT::cycle_count().wrapping_sub(a);
-            let result = w.await;
-            let b = cortex_m::peripheral::DWT::cycle_count();
-            let wait_us = ((b.wrapping_sub(a)) as u64 * 1_000_000) / (board::ARM_FREQUENCY as u64);
-            if wait_us < min_wait_us {
-                min_wait_us = wait_us;
-            }
-            if wait_us > max_wait_us {
-                max_wait_us = wait_us;
-            }
-            if sample_i < SAMPLE_N {
-                sample[sample_i] = wait_us as u32;
-                sample_i += 1;
-            }
-            cyc_setup += setup as u64;
+                .expect("dma_write setup")
+                .await;
             if let Err(e) = result {
                 self.cs.set_high();
                 panic!("dma transfer error: {e:?}");
             }
             k = chunk_end;
         }
-        let irq_fires = crate::shared::irq_fires().wrapping_sub(irq_start);
-        // One final drain: every chunk's `Write::drop` already waited for
-        // `TDDE` to deassert (LPSPI idle), but belt-and-suspenders before
-        // we release CS so the last frame is on the wire before the panel
-        // latches.
+        // DMA completion need not mean SPI is idle; drain before releasing CS.
         SpiBus::<u8>::flush(&mut self.spi).expect("lpspi blit flush");
         self.cs.set_high();
-        let cycles = cortex_m::peripheral::DWT::cycle_count().wrapping_sub(t0);
-        let ms = cycles as f64 / (board::ARM_FREQUENCY as f64) * 1e3;
-        let fsr = self.spi.fifo_status();
-        let sr = self.spi.status().bits();
-        let cc = self.spi.clock_configs();
-        let sck_mhz = 132_000_000u64 as f64 / ((cc.sckdiv as u64 + 2) as f64) / 1e6;
-        // `info!` (not `debug!`) so the diagnostics survive release builds.
-        let eff_mbit_s = (n as f64 * 32.0) / (ms * 1e6);
-        let setup_us = cyc_setup as f64 / (board::ARM_FREQUENCY as f64) * 1e6;
-        let chunks = n / (MAX_TX_WORDS * 2);
-        /*log::info!(
-            "draw_pixels {n} px: total {ms:.3} ms (setup {setup_us:.1}us); wait_us min={min_wait_us} max={max_wait_us} first=[{s0},{s1},{s2},{s3},{s4},{s5}]; irq_fires={irq_fires} (expect {chunks}); sckdiv={sd} => sck={sck_mhz:.2} MHz; eff={eff_mbit_s:.2} Mbit/s; sr=0x{sr_val:08x} tx={tx}/{tmc} rx={rx}/{rmc}",
-            s0 = sample[0],
-            s1 = sample[1],
-            s2 = sample[2],
-            s3 = sample[3],
-            s4 = sample[4],
-            s5 = sample[5],
-            sd = cc.sckdiv,
-            sr_val = sr,
-            tx = fsr.txcount,
-            tmc = fsr.txcap,
-            rx = fsr.rxcount,
-            rmc = fsr.rxcap,
-        );*/
         if self.chan.is_error() {
             log::error!(
                 "dma channel 0 error end-of-blit: {:?}",
@@ -411,21 +318,80 @@ fn draw_char(display: &mut Display, x: u16, y: u16, scale: u16, ch: char, fg: u1
         .expect("text draw");
 }
 
-/// Cached ASCII text on a cleared background. Position and colors must stay
-/// fixed, and no other drawing may overwrite its cells between updates.
+/// Cached ASCII text. Colors must stay fixed; `update` also requires fixed
+/// placement. No other drawing may overwrite the cached cells.
 pub struct TextLine<const N: usize> {
     text: [u8; N],
+    /// Last scaled text length and placement (-1 = never painted).
+    len: usize,
+    lx: i32,
+    ly: i32,
+    ls: i32,
 }
 
 impl<const N: usize> TextLine<N> {
     pub const fn new() -> Self {
-        Self { text: [b' '; N] }
+        Self {
+            text: [b' '; N],
+            len: 0,
+            lx: -1,
+            ly: -1,
+            ls: -1,
+        }
     }
 
     pub fn update(&mut self, display: &mut Display, x: u16, y: u16, text: &str, fg: u16, bg: u16) {
         self.update_cells(text, |col, ch| {
             draw_char(display, x + col as u16 * 6, y, 1, ch as char, fg, bg);
         });
+    }
+
+    /// On content or placement changes, erase the old rectangle and paint
+    /// the new opaque glyph cells.
+    pub fn update_scaled(
+        &mut self,
+        display: &mut Display,
+        x: u16,
+        y: u16,
+        scale: u16,
+        text: &str,
+        fg: u16,
+        bg: u16,
+    ) {
+        assert!(text.is_ascii() && text.len() <= N);
+        if self.text[..text.len()] == *text.as_bytes()
+            && self.lx == x as i32
+            && self.ly == y as i32
+            && self.ls == scale as i32
+            && self.len == text.len()
+        {
+            return;
+        }
+        if self.ls >= 0 {
+            let old_x = (self.lx as u16).min(320);
+            let old_y = (self.ly as u16).min(240);
+            let old_w = (self.len as u32 * 6 * self.ls as u32).min(u32::from(320 - old_x));
+            let old_h = (7 * self.ls as u32).min(u32::from(240 - old_y));
+            fill_rect(display, old_x, old_y, old_w as u16, old_h as u16, bg);
+        }
+        for (i, b) in text.as_bytes().iter().enumerate() {
+            draw_char(
+                display,
+                x + i as u16 * 6 * scale,
+                y,
+                scale,
+                *b as char,
+                fg,
+                bg,
+            );
+        }
+        for (i, slot) in self.text.iter_mut().enumerate() {
+            *slot = text.as_bytes().get(i).copied().unwrap_or(b' ');
+        }
+        self.len = text.len();
+        self.lx = x as i32;
+        self.ly = y as i32;
+        self.ls = scale as i32;
     }
 
     fn update_cells(&mut self, text: &str, mut draw: impl FnMut(usize, u8)) {

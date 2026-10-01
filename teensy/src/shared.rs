@@ -185,6 +185,34 @@ pub fn irq_fires_inc() {
     IRQ_FIRES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Current RX1 NCO frequency (Hz). The radio task publishes it after each
+/// encoder retune; the render task displays it on the status line.
+static NCO_HZ: AtomicU32 = AtomicU32::new(0);
+
+/// Running RX1 mode index into `crate::mode::MODES` (0 = USB).
+static RX1_MODE_INDEX: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Publish a new RX1 mode index. The radio task calls this after it has
+/// successfully switched its virtual receiver to that mode.
+pub fn set_rx1_mode_index(idx: usize) {
+    RX1_MODE_INDEX.store(idx, Ordering::Release);
+}
+
+/// The current RX1 mode index (into `crate::mode::MODES`); 0 until first change.
+pub fn rx1_mode_index() -> usize {
+    RX1_MODE_INDEX.load(Ordering::Acquire)
+}
+
+/// Publish the current RX1 NCO frequency (Hz).
+pub fn set_nco_hz(hz: u32) {
+    NCO_HZ.store(hz, Ordering::Release);
+}
+
+/// The current RX1 NCO frequency (Hz); 0 until the first tune is sent.
+pub fn nco_hz() -> u32 {
+    NCO_HZ.load(Ordering::Acquire)
+}
+
 pub fn cpu_demod_pct() -> u32 {
     CPU_DEMOD_PCT.load(Ordering::Acquire)
 }
