@@ -108,9 +108,15 @@ const OPT_LEASE_TIME: u8 = 51;
 const OPT_MSG_TYPE: u8 = 53;
 const OPT_SERVER_ID: u8 = 54;
 const DHCP_MAGIC: [u8; 4] = [0x63, 0x82, 0x53, 0x63];
-const MSG_DISCOVER: u8 = 1;
-const MSG_OFFER: u8 = 2;
+const MSG_REQUEST: u8 = 3;
 const MSG_ACK: u8 = 5;
+/// Grace timeout (ms) after arming the DHCP server: if the client never
+/// sends a REQUEST (i.e. it only DISCOVERs), treat the first granted
+/// address as final and proceed. Chosen long enough that a strict 4-way
+/// client's REQUEST — which follows its DISCOVER immediately — lands first,
+/// short enough that we don't stall the radio forever on a non-standard
+/// client that skips the REQUEST.
+const DHCP_SERVER_GRACE_MS: u64 = 8_000;
 
 /// Monotonic pointer into the lease pool. No bookkeeping beyond this single
 /// counter: the next address is always `192.168.1.(150 + counter % POOL_SIZE)`.
@@ -135,12 +141,24 @@ fn emit_opt(out: &mut [u8], p: &mut usize, kind: u8, data: &[u8]) {
     *p += 2 + data.len();
 }
 
-/// Scan DHCP options in `buf` (which must at least be 241 bytes long) and
-/// return the byte value of the DHCP message type option (kind 0x35).
-/// Returns 0 if the option is missing — callers treat that as "unknown", and
-/// we map that to ACK by default, which is safe (ACK is what a client sends
-/// for a discovered address, and also what an HL2 will send on a second
-/// attempt with a pre-assigned address).
+/// Human name for a DHCP message type byte (option 53's single-byte value),
+/// for logging the type of each request we see.
+fn dhcp_msg_name(t: u8) -> &'static str {
+    match t {
+        1 => "DISCOVER",
+        2 => "OFFER",
+        3 => "REQUEST",
+        4 => "DECLINE",
+        5 => "ACK",
+        6 => "NAK",
+        7 => "RELEASE",
+        8 => "INFORM",
+        _ => "UNKNOWN",
+    }
+}
+
+/// Scan options in `buf` for the DHCP message type (option 53). Returns 0 if
+/// absent (logged as UNKNOWN; we ACK anyway).
 fn scan_dhcp_msg_type(buf: &[u8]) -> u8 {
     if buf.len() < 241 {
         return 0;
@@ -326,10 +344,17 @@ pub struct RadioHandle<'a, D: smoltcp::phy::Device + ?Sized> {
     pub sockets: &'a mut SocketSet<'static>,
     pub handles: &'a SocketHandles,
     now: Instant,
-    /// When true, we are acting as a DHCP server: the next poll will drain
-    /// the DHCP-request socket, hand out a lease, install our static address,
-    /// and flip this flag back off.
-    pending_dhcp: bool,
+    /// True while the button-armed DHCP server is active (waiting to hand
+    /// our client its lease and confirm the client accepted it).
+    dhcp_server: bool,
+    /// The lease to hand out, allocated once at button-press and kept for
+    /// the whole DHCP exchange so DISCOVER and REQUEST both get the same IP.
+    lease: Option<Ipv4Addr>,
+    /// First time (smoltcp microseconds) we sent an ACK to the client.
+    /// The grace window is measured from this moment, so a non-standard
+    /// DISCOVER-only client gets `DHCP_SERVER_GRACE_MS` to configure before
+    /// we proceed to streaming.
+    first_ack_at: Option<i64>,
 }
 
 impl<'a, D: smoltcp::phy::Device + ?Sized> RadioHandle<'a, D> {
@@ -347,7 +372,9 @@ impl<'a, D: smoltcp::phy::Device + ?Sized> RadioHandle<'a, D> {
             sockets,
             handles,
             now: Instant::from_millis(0),
-            pending_dhcp: false,
+            dhcp_server: false,
+            lease: None,
+            first_ack_at: None,
         }
     }
 
@@ -364,8 +391,9 @@ impl<'a, D: smoltcp::phy::Device + ?Sized> RadioHandle<'a, D> {
     }
 
     /// Activate the bare-bones DHCP server: install our static `OUR_IP`,
-    /// arm the `pending_dhcp` flag so the next [`handle_dhcp`] pass replies to
-    /// the first DISCOVER/REQUEST.
+    /// allocate the (single) lease we'll hand out, and arm the flag so the
+    /// [`handle_dhcp`] drain keeps replying to the client until it's
+    /// configured (REQUEST ACKed, or the grace window elapsed).
     pub fn activate_dhcp_server(&mut self) {
         self.iface.update_ip_addrs(|addrs| {
             addrs.clear();
@@ -376,67 +404,113 @@ impl<'a, D: smoltcp::phy::Device + ?Sized> RadioHandle<'a, D> {
                 ))
                 .map_err(|e| log::error!("activate dhcp: push {e}"));
         });
-        self.pending_dhcp = true;
+        self.dhcp_server = true;
+        self.lease = Some(next_lease());
+        self.first_ack_at = None;
     }
 
-    /// True if the button was pressed and we are waiting to hand out a lease.
+    /// True if the button was pressed and we are waiting to hand out a lease
+    /// (the server is armed, regardless of whether it has finished).
     pub fn dhcp_server_active(&self) -> bool {
-        self.pending_dhcp
+        self.dhcp_server
     }
 
-    /// Process one pending DHCP request: if the button was pressed since the
-    /// last call, drain the socket, hand out one lease, and clear the flag.
-    /// Returns the lease IP if we responded; `None` if nothing was pending
-    /// or no matching DHCP request was received.
+    /// The lease to hand out, allocated at arming and stable for the whole
+    /// DHCP exchange (so DISCOVER and REQUEST both get the same IP).
+    pub fn lease(&self) -> Option<Ipv4Addr> {
+        self.lease
+    }
+
+    /// Drain pending DHCP traffic on the server socket, replying ACK to every
+    /// valid DHCP packet the client sends. We reply with the *stable* lease
+    /// (allocated at arm time) so DISCOVER and REQUEST both get the same IP —
+    /// a strictly-conformant client binds to the server's reply and will send
+    /// a REQUEST for exactly that address, which we also ACK, completing its
+    /// configuration.
+    ///
+    /// Returns the lease IP once it's *safe to build on* — i.e. we have ACKed
+    /// the client's REQUEST (the RFC 2131 moment a client considers itself
+    /// configured), or the grace window has elapsed since our first ACK
+    /// (covers a non-standard client that only DISCOVERs and never REQUESTs).
+    /// `None` otherwise — the caller should keep polling.
     pub fn handle_dhcp(&mut self) -> Option<Ipv4Addr> {
-        if !self.pending_dhcp {
+        if !self.dhcp_server {
             return None;
         }
-        // Let any queued DHCP packet land on the server socket before we read it.
+        let Some(lease) = self.lease else {
+            return None;
+        };
+        // Ingress: let queued DHCP packets land on the server socket first.
         self.pump();
-        let s = self
-            .sockets
-            .get_mut::<udp::Socket>(self.handles.dhcp_server);
-        while s.can_recv() {
-            let mut buf = [0u8; 512];
-            let (n, _meta) = s.recv_slice(&mut buf).ok()?;
-            let req = smoltcp::wire::DhcpPacket::new_unchecked(&buf[..n]);
-            if req.magic_number() != 0x63825363 {
-                continue; // not a DHCP packet; keep draining
-            }
-            // Scan options for the DHCP message type (option 53, kind 0x35).
-            let msg = scan_dhcp_msg_type(&buf[..n]);
-            let xid = req.transaction_id();
-            let chaddr = req.client_hardware_address().0;
-            let lease = next_lease();
-            let mut out = [0u8; 300];
-            // Always reply with OFFER for DISCOVER; ACK for anything else
-            // (in practice, HL2's second attempt is a REQUEST for the
-            // advertised address, so ACK covers both cases).
-            let msg_byte = if msg == MSG_DISCOVER {
-                MSG_OFFER
-            } else {
-                MSG_ACK
-            };
-            let len = build_dhcp_reply(&mut out, xid, &chaddr, lease, msg_byte);
-            let dst = IpEndpoint {
-                addr: IpAddress::Ipv4(Ipv4Addr::BROADCAST),
-                port: DHCP_CLIENT_PORT,
-            };
-            if let Err(e) = s.send_slice(&out[..len], dst) {
-                log::error!("dhcp send: {e}");
-            }
-            self.pump();
-            log::info!(
-                "DHCP server: leased {lease} to {chaddr:02x?} ({})",
-                if msg_byte == MSG_OFFER {
-                    "OFFER"
-                } else {
-                    "ACK"
+        // Drain DHCP packets, queuing an ACK reply for each. `send_slice` only
+        // enqueues the datagram into the UDP TX buffer — the Ethernet frame
+        // goes out on the *next* [`pump`], so we flush below after dropping
+        // the socket borrow (which would conflict with `pump`'s `&mut self`).
+        let mut chaddr = [0u8; 6];
+        let mut last_req_type: u8 = 0;
+        let mut is_request = false;
+        let mut saw_dhcp = false;
+        {
+            let s = self
+                .sockets
+                .get_mut::<udp::Socket>(self.handles.dhcp_server);
+            while s.can_recv() {
+                let mut buf = [0u8; 512];
+                let Ok((n, _meta)) = s.recv_slice(&mut buf) else {
+                    break;
+                };
+                let req = smoltcp::wire::DhcpPacket::new_unchecked(&buf[..n]);
+                if req.magic_number() != 0x63825363 {
+                    continue; // not a DHCP packet; keep draining
                 }
+                saw_dhcp = true;
+                last_req_type = scan_dhcp_msg_type(&buf[..n]);
+                let this_is_request = last_req_type == MSG_REQUEST;
+                let xid = req.transaction_id();
+                chaddr = req.client_hardware_address().0;
+                let mut out = [0u8; 300];
+                let len = build_dhcp_reply(&mut out, xid, &chaddr, lease, MSG_ACK);
+                let dst = IpEndpoint {
+                    addr: IpAddress::Ipv4(Ipv4Addr::BROADCAST),
+                    port: DHCP_CLIENT_PORT,
+                };
+                if let Err(e) = s.send_slice(&out[..len], dst) {
+                    log::error!("dhcp send: {e}");
+                }
+                // A REQUEST + ACK is the canonical "client is now configured"
+                // moment; stop here so the borrow is released before we return.
+                if this_is_request {
+                    is_request = true;
+                    break;
+                }
+            }
+        }
+        // Egress: flush the queued ACK reply onto the wire now that the
+        // socket borrow is gone.
+        self.pump();
+        if saw_dhcp {
+            if self.first_ack_at.is_none() {
+                self.first_ack_at = Some(self.now.total_micros());
+            }
+            log::info!(
+                "DHCP server: got {}, sent ACK → {lease} (client {chaddr:02x?})",
+                dhcp_msg_name(last_req_type)
             );
-            self.pending_dhcp = false;
-            return Some(lease);
+            if is_request {
+                return Some(lease);
+            }
+        }
+        // No REQUEST yet. If we've ACKed at least one packet and the grace
+        // window has elapsed since that first ACK, a DISCOVER-only client
+        // cannot configure any further — proceed.
+        if let Some(t0) = self.first_ack_at {
+            let elapsed_ms = (self.now.total_micros().wrapping_sub(t0) / 1_000) as u64;
+            if elapsed_ms >= DHCP_SERVER_GRACE_MS {
+                log::info!(
+                    "DHCP server: grace ({elapsed_ms} ms) elapsed without REQUEST; assuming {lease} is configured"
+                );
+                return Some(lease);
+            }
         }
         None
     }
