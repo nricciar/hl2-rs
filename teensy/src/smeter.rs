@@ -1,57 +1,27 @@
-//! S-meter for the virtual USB receiver — a pure function of the spectrum
-//! row, mirroring `api/src/meter.rs::compute_s_meter` (PROTOCOL.md §16.3e).
+//! Display-derived S-meter: passband RMS relative to a display-row percentile.
 //!
-//! The UI's S-meter is *not* computed off the demod output: it is
-//! signal-over-noise read from the *spectrum* (`mags`) — the same 320-column
-//! row the waterfall already displays (a centred, zoomed slice of the band,
-//! so each column is ~31 Hz wide at the default view). That module (`api/meter.rs`) even says
-//! "the S-meter is a consumer of the spectrum stream, which is the single
-//! correct source of the band floor." So this is a faithful `no_std` port of
-//! that method, and the virtual USB-SSB [`VirtualReceiver`] (see
-//! `radio::rx`) exists to prove the demod runs at CPU speed, not to drive the
-//! meter.
+//! This is a clipped estimate, not absolute RF strength or full-band power.
+//! The waterfall supplies max-pooled, u16-saturated magnitudes from the
+//! centred 24 kHz view (75 Hz/column). DC is suppressed before the FFT, so
+//! a carrier at the NCO is removed. Wide passbands are clipped to the view;
+//! zoom, pooling and saturation can all change the reading.
 //!
-//! The reading is **signal over noise** in the running USB receiver's
-//! passband:
-//!
-//!   * `level` = RMS of the passband bins (the receiver's own channel-select
-//!     window — for USB, the upper side of the NCO), in dB relative to full
-//!     scale (`65535`). Measuring energy, not a single peak bin, means an AM
-//!     carrier's DC line blends with its modulated sidebands so the reading
-//!     follows the modulation rather than latching onto the carrier.
-//!   * `floor` = the [`FLOOR_PERCENTILE`]th magnitude of the WHOLE display —
-//!     an unbiased band-noise estimate (a single carrier is a few bins out of
-//!     320, so the percentile lands on the noise regardless of the signal).
-//!
-//!   `margin_db = level_db - floor_db` is the scale-independent S margin. The
-//!   render maps it to an S0..S9 index via [`margin_to_sunits`] — `S1` at
-//!   [`S1_DB_OVER_FLOOR`] over the floor, [`DB_PER_UNIT`] per step (S9 ≈ 54
-//!   dB over floor) — and shows the raw dB alongside.
-//!
-//! Pure + allocation-light: [`compute`] copies the magnitudes into a stack
-//! buffer for the percentile selection (no heap); the caller (the radio task)
-//! owns the buffer. `no_std` (uses `core` + `num_traits::Float` for the
-//! `log10`/`sqrt`, consistent with `crate::spectrum`).
+//! Level and floor use display full scale (65535) as their dB reference.
+//! Their nonnegative difference maps to S0..S9 at 6 dB per step. The exact
+//! percentile uses one stack histogram, with no heap allocation or sorting.
 
 use core::f32;
 use num_traits::float::Float;
 
 use crate::spectrum::{BINS, WF_BAND_HZ};
 
-/// USB SSB receiver's channel-select bandwidth (Hz) — `Mode::Ssb`'s default
-/// passband (`hl2::receiver::Mode::default_bandwidth_hz` = 2600). Kept as a
-/// public const (for backwards-compat with the `teensy` unit tests and the
-/// `hl2` `receiver`'s own tests which use this exact value).
+/// USB SSB default channel-select bandwidth (Hz).
 pub const USB_PASSBAND_HZ: u32 = 2_600;
-/// Hz per display bin. The waterfall shows a centred [`WF_BAND_HZ`] slice of
-/// the band, so a display column spans the *displayed* band divided by the
-/// column count (10 kHz / 320 = 31.25 Hz at the default). The passband window
-/// below is derived from this, so it tracks whatever slice the display shows.
-pub const DISPLAY_BIN_HZ: usize = WF_BAND_HZ / BINS;
-/// Passband window width in display bins (`USB_PASSBAND_HZ`, rounded up).
-pub const USB_PASSBAND_BINS: usize =
-    (USB_PASSBAND_HZ as usize + DISPLAY_BIN_HZ - 1) / DISPLAY_BIN_HZ;
-/// Band-noise percentile (percent); `25` matches the UI (`api/meter.rs`).
+/// Hz per display column, without integer-Hz truncation.
+pub const DISPLAY_BIN_HZ: f32 = WF_BAND_HZ as f32 / BINS as f32;
+/// USB passband extent from the NCO, rounded up to whole columns.
+pub const USB_PASSBAND_BINS: usize = passband_bins(USB_PASSBAND_HZ, BINS);
+/// Display noise-floor percentile; selects zero-based sorted rank `n * 25 / 100`.
 pub const FLOOR_PERCENTILE: usize = 25;
 
 /// The S margin (dB over the band floor) at which the meter first reads S1.
@@ -63,11 +33,11 @@ pub const S9: u8 = 9;
 
 /// One S-meter reading for a spectrum frame.
 pub struct Smeter {
-    /// Passband level, dB relative to full scale (65535).
+    /// Visible passband RMS, dB relative to display full scale (65535).
     pub level_db: f32,
-    /// Band noise floor (percentile), dB relative to full scale.
+    /// Display-row percentile, dB relative to display full scale.
     pub floor_db: f32,
-    /// `level_db - floor_db` — the scale-independent S margin (≥ 0).
+    /// Nonnegative `level_db - floor_db`.
     pub margin_db: f32,
     /// The S0..S9 index derived from `margin_db` (`S9` = [`S9`], 0 = noise).
     pub sunits: u8,
@@ -85,69 +55,39 @@ impl Smeter {
     }
 }
 
-/// Convert a `u16` magnitude to dB relative to full scale (`65535`). A zero or
-/// sub-1 magnitude maps to `-120 dB` (a "silent bin").
+/// Convert a display magnitude to dB; values <= 1 map to -120 dB.
 fn mag_to_db(m: u16) -> f32 {
     let v = f32::from(m);
     if v <= 1.0 {
         return -120.0;
     }
-    (20.0 * (v / 65_535.0).log10()).clamp(-120.0, 0.0)
+    (20.0 * Float::log10(v / 65_535.0)).clamp(-120.0, 0.0)
 }
 
 /// Map a signal-over-noise margin (dB over the band floor) to an S0..S9 index.
 ///
 /// `S1` at [`S1_DB_OVER_FLOOR`] over the floor, [`DB_PER_UNIT`] per step, so
-/// S9 lands at `S1_DB_OVER_FLOOR + 8·DB_PER_UNIT` (≈ 54 dB over floor). Below
-/// S1 (or non-finite) reads 0 (= noise floor). See the module doc for the
-/// calibration rationale; the two named constants are the recalibration knobs
-/// once the LNA / system sensitivity is nailed.
+/// S9 lands at 54 dB over the floor. Below S1 or non-finite reads zero.
 pub fn margin_to_sunits(margin_db: f32) -> u8 {
     if margin_db < S1_DB_OVER_FLOOR || !margin_db.is_finite() {
         return 0;
     }
-    let steps = ((margin_db - S1_DB_OVER_FLOOR) / DB_PER_UNIT).floor();
+    let steps = Float::floor((margin_db - S1_DB_OVER_FLOOR) / DB_PER_UNIT);
     (1u32 + steps as u32).clamp(1, S9 as u32) as u8
 }
 
-/// Compute the USB S-meter reading from one `mags` row.
-///
-/// `mags` is the *display* band magnitudes (centered: the NCO/DC at
-/// `len/2`, scaled `0..=65535`), i.e. the same 320-bin row the waterfall
-/// shows. The passband window is the *upper* side of the display centre
-/// (`[c, c + USB_PASSBAND_BINS]`) — the USB sideband for this DDC
-/// (complex negative-frequency = real upper sideband, see
-/// `hl2::receiver::demod::ssb`). The floor is the [`FLOOR_PERCENTILE`]th
-/// magnitude of the whole display.
-///
-/// USB is the default (index 0) in `crate::mode::MODES`; for the other
-/// modes use [`compute_for_mode`] with the current mode index.
+/// Compute the USB (mode 0) reading from a centred display row.
 pub fn compute(mags: &[u16]) -> Smeter {
     compute_for_mode(mags, 0)
 }
 
-/// Compute the S-meter reading at `mode_index` (into `crate::mode::MODES`).
-///
-/// The passband window depends on the mode:
-///
-/// * **USB / LSB** — the receiver's sideband, `USB_PASSBAND_HZ` (= 2600 Hz
-///   for SSB-USB) wide, on the matching side of the NCO (upper for USB,
-///   lower for LSB).
-/// * **AM / FM / NFM** — the receiver's *double-sideband* channel-select
-///   passband, centred on the NCO, with the mode's default bandwidth
-///   (`Mode::default_bandwidth_hz`).
-///
-/// The band-noise percentile (`FLOOR_PERCENTILE`) is computed on the whole
-/// display regardless of mode (a single passband peak doesn't drag the
-/// percentile), so the S reading remains "signal vs band noise" — the
-/// classic definition.
-///
-/// `mode_index` is assumed to be in range; called by the radio task with
-/// the value the render task publishes (always valid).
+/// Compute a display-derived reading for a valid `crate::mode::MODES` index.
+/// The row spans [`WF_BAND_HZ`], with the NCO at `len / 2`. SSB uses one
+/// side; AM/FM/NFM use the default bandwidth on each side, clipped to the
+/// display. The floor uses the entire row regardless of mode.
 pub fn compute_for_mode(mags: &[u16], mode_index: usize) -> Smeter {
     let n = mags.len();
 
-    let (lo, hi) = passband_window(n, mode_index);
     if n == 0 {
         return Smeter {
             level_db: -120.0,
@@ -156,52 +96,49 @@ pub fn compute_for_mode(mags: &[u16], mode_index: usize) -> Smeter {
             sunits: 0,
         };
     }
-    // Level: RMS magnitude over the passband window of this mode (its
-    // average power). Sum the *squared* magnitudes then take the root, so
-    // the dB conversion is `20·log10(rms / full-scale)` — this is what lets
-    // an AM carrier blend with its audio-modulated sidebands so the reading
-    // tracks the modulation.
+    let (lo, hi) = passband_window(n, mode_index);
     let mut sum_sq = 0.0f32;
     for &m in &mags[lo..=hi] {
         let v = f32::from(m);
         sum_sq += v * v;
     }
-    let rms = (sum_sq / (hi - lo + 1) as f32).sqrt();
+    let rms = Float::sqrt(sum_sq / (hi - lo + 1) as f32);
     let level_db = if rms <= 1.0 {
         -120.0
     } else {
-        (20.0 * (rms / 65_535.0).log10()).clamp(-120.0, 0.0)
+        (20.0 * Float::log10(rms / 65_535.0)).clamp(-120.0, 0.0)
     };
 
-    // Floor: the `FLOOR_PERCENTILE`-th magnitude of the *whole* display. A
-    // single passband peak sits in a handful of the `n` bins, so the
-    // percentile lands on the noise regardless of where the signal is — the
-    // clean, mode-agnostic "band-noise floor".
-    //
-    // Estimated with a single-pass *histogram* (256 buckets over the whole
-    // `u16` range) rather than a `select_nth_unstable_by` partial-sort: that
-    // sort + its closure comparator inlined per call costs several KiB of
-    // `.text`, which this 192 KiB ITCM-limited build can't afford. A bucket
-    // is 256 in magnitude width (≈ 0.7 dB across the scale) — well below the
-    // 6 dB/units S-scale granularity the render uses — so reporting the
-    // bucket *centre* as the floor doesn't change the S-unit a user reads.
-    // No scratch buffer, no allocation, no sort.
-    let k = n.min(BINS);
-    let mut hist = [0u32; 256];
-    for &m in &mags[..k] {
+    // Radix selection avoids sort code in ITCM. Reuse the histogram for
+    // the low byte of the selected high-byte bucket to retain weak signals.
+    let mut hist = [0usize; 256];
+    for &m in mags {
         hist[m as usize >> 8] += 1;
     }
-    let target = (k as u32 * FLOOR_PERCENTILE as u32 / 100).max(1);
-    let mut acc = 0u32;
-    let mut floor_approx = 0u16;
-    for (b, &cnt) in hist.iter().enumerate() {
-        acc += cnt;
-        if acc >= target {
-            floor_approx = (b * 256 + 128) as u16; // centre of this bucket
+    let mut rank = n * FLOOR_PERCENTILE / 100;
+    let mut high = 0u16;
+    for (byte, &count) in hist.iter().enumerate() {
+        if rank < count {
+            high = byte as u16;
             break;
         }
+        rank -= count;
     }
-    let floor_db = mag_to_db(floor_approx);
+    hist.fill(0);
+    for &m in mags {
+        if m >> 8 == high {
+            hist[(m & 0xff) as usize] += 1;
+        }
+    }
+    let mut floor = high << 8;
+    for (byte, &count) in hist.iter().enumerate() {
+        if rank < count {
+            floor |= byte as u16;
+            break;
+        }
+        rank -= count;
+    }
+    let floor_db = mag_to_db(floor);
 
     let margin_db = (level_db - floor_db).max(0.0);
     let sunits = margin_to_sunits(margin_db);
@@ -213,22 +150,17 @@ pub fn compute_for_mode(mags: &[u16], mode_index: usize) -> Smeter {
     }
 }
 
-/// Display-bin width of a bandwidth, rounded up.
+/// Round the bandwidth/visible-span ratio once, at column precision.
 #[inline]
-fn passband_bins(bw_hz: u32) -> usize {
-    (bw_hz as usize + DISPLAY_BIN_HZ - 1) / DISPLAY_BIN_HZ
+const fn passband_bins(bw_hz: u32, columns: usize) -> usize {
+    (bw_hz as usize * columns).div_ceil(WF_BAND_HZ)
 }
 
-/// The display-bin passband window for `mode_index` centred on `c` over a row
-/// of length `n`:
-///   * SSB — one side of the NCO (upper for USB, lower for LSB)
-///   * AM / FM / NFM — double-sided, the mode's default bandwidth each side.
-/// The NCO sits at `n / 2`, so `lo`/`hi` are relative to the *centre column*
-/// of the (NCO-centred) display row.
+/// Inclusive column bounds; complex-negative frequencies (USB) are right.
 fn passband_window(n: usize, mode_index: usize) -> (usize, usize) {
     let c = n / 2;
     let entry = &crate::mode::MODES[mode_index];
-    let bins = passband_bins(entry.mode.default_bandwidth_hz());
+    let bins = passband_bins(entry.mode.default_bandwidth_hz(), n);
     if matches!(entry.mode, hl2::receiver::Mode::Ssb(_)) {
         match entry
             .mode
@@ -243,10 +175,7 @@ fn passband_window(n: usize, mode_index: usize) -> (usize, usize) {
     }
 }
 
-/// The passband window (in display-bin columns) for the *current display*
-/// length ([`BINS`] == the 320-column waterfall row). Reused by the
-/// waterfall overlay so its grey band is the *same* window the S-meter
-/// integrates — SSB one-sided (USB right / LSB left), AM/FM double-sided.
+/// Inclusive passband bounds shared by the meter and waterfall overlay.
 pub fn passband_columns(mode_index: usize) -> (usize, usize) {
     passband_window(BINS, mode_index)
 }
@@ -255,61 +184,69 @@ pub fn passband_columns(mode_index: usize) -> (usize, usize) {
 mod tests {
     use super::*;
 
-    /// A uniform `mags` row (whole display = a single weak magnitude).
-    fn uniform(n: usize, mag: u16) -> [u16; BINS] {
-        let mut v = [0u16; BINS];
-        for x in v[..n.min(BINS)].iter_mut() {
-            *x = mag;
+    #[test]
+    fn uniform_band_level_matches_floor() {
+        for mag in [0, 1, 2, 10, 100, 200, 255, 256, 257, 65_535] {
+            let s = compute(&[mag; BINS]);
+            assert_eq!(s.floor_db, mag_to_db(mag), "magnitude {mag}");
+            assert!((s.level_db - s.floor_db).abs() < 1e-4);
+            assert!(s.margin_db < 1e-4);
+            assert_eq!(s.sunits, 0);
         }
-        v
     }
 
     #[test]
-    fn quiet_band_reads_near_floor() {
-        let mags = uniform(BINS, 200);
-        let s = compute(&mags);
-        // A uniform display: passband RMS ≈ the single magnitude (level ~ the
-        // band value), and the floor is *also* the band value (all bins equal).
-        // The floor is estimated as a histogram bucket-centre though, so it
-        // can sit a bucket-step (≤ ~3.5 dB across the scale) below the true
-        // value — a quantization that *only ever inflates* the margin and
-        // never below the band. On a flat band the margin must therefore
-        // stay well under the S1 threshold so the meter reads no S-unit; we
-        // assert that (the user-visible result) rather than the over-tight
-        // level == floor the old exact-percentile floor allowed.
-        assert!(
-            s.margin_db < S1_DB_OVER_FLOOR,
-            "quiet band: margin {} dB must stay under S1",
-            s.margin_db
-        );
-        assert_eq!(s.sunits, 0, "quiet band should not read an S-unit");
+    fn floor_matches_sorted_rank() {
+        assert_eq!(FLOOR_PERCENTILE, 25);
+        let mut mags = [0u16; BINS + 17];
+        for pattern in 0..4 {
+            for (i, m) in mags.iter_mut().enumerate() {
+                *m = match pattern {
+                    0 => (i * 197 + 17) as u16,
+                    1 => (i % 256) as u16,
+                    2 => [0, 1, 2, 255, 256, 257, 511, 512, 65_535][i % 9],
+                    _ => (65_535 - i) as u16,
+                };
+            }
+            for n in 1..=mags.len() {
+                let mut sorted = mags;
+                sorted[..n].sort_unstable();
+                let expected = mag_to_db(sorted[n * FLOOR_PERCENTILE / 100]);
+                assert_eq!(
+                    compute(&mags[..n]).floor_db,
+                    expected,
+                    "pattern {pattern}, n={n}"
+                );
+            }
+        }
+        // A bucket boundary exactly at the requested rank must select the
+        // next bucket, not the last value of the preceding one.
+        mags.fill(256);
+        mags[..BINS * 20 / 100].fill(255);
+        assert_eq!(compute(&mags[..BINS]).floor_db, mag_to_db(256));
     }
 
     #[test]
-    fn all_full_scale_reads_full() {
-        let mags = uniform(BINS, 65_535);
-        let s = compute(&mags);
-        // Full-scale: level_db == 0 (the ceiling, rms == full scale), and the
-        // floor (a histogram bucket-centre, ≈ the same full-scale value) puts
-        // the margin at ≈ 0 — a flat all-max display is "all passband, no
-        // contrast", so no S-unit. The floor is the *nearest* bucket-centre
-        // (here a hair below full-scale), so allow a small margin tolerance
-        // and assert the meaningful consequence: below S1.
-        assert!(
-            (s.level_db - 0.0).abs() < 1e-4,
-            "full-scale level: {} dB",
-            s.level_db
-        );
-        assert!(
-            s.margin_db < S1_DB_OVER_FLOOR,
-            "full scale: margin {} dB (all passband, no S-unit)",
-            s.margin_db
-        );
-        assert_eq!(s.sunits, 0, "full scale: no S-unit (flat display)");
+    fn empty_row_is_silent() {
+        let s = compute(&[]);
+        assert_eq!(s.level_db, -120.0);
+        assert_eq!(s.floor_db, -120.0);
+        assert_eq!(s.margin_db, 0.0);
+        assert_eq!(s.sunits, 0);
     }
 
-    /// Raise a contiguous run of bins (a "signal") to `sig`, keep the rest at
-    /// `noise`. Mirrors `api/meter.rs::carrier_at_dc`.
+    #[test]
+    fn weak_inband_signal_retains_margin() {
+        let mut mags = [2; BINS];
+        let (lo, hi) = passband_columns(0);
+        mags[lo..=hi].fill(20);
+        let s = compute(&mags);
+        assert_eq!(s.floor_db, mag_to_db(2));
+        assert!((s.margin_db - 20.0).abs() < 1e-4);
+        assert_eq!(s.sunits, 3);
+    }
+
+    /// Raise a run of columns above uniform noise.
     fn with_signal(m: &mut [u16], start: usize, width: usize, noise: u16, sig: u16) {
         for i in 0..m.len() {
             m[i] = noise;
@@ -323,8 +260,7 @@ mod tests {
 
     #[test]
     fn inband_usb_signal_reads_over_floor() {
-        // A USB line to the RIGHT of the display centre (the complex
-        // negative-frequency / real-upper side) at +100 dB over the noise.
+        // USB is right of the NCO (complex-negative frequencies).
         let mut mags = [0u16; BINS];
         let c = BINS / 2;
         with_signal(&mut mags, c + 4, 6, 100, 60_000);
@@ -343,9 +279,7 @@ mod tests {
 
     #[test]
     fn outofband_lsb_signal_reads_at_floor() {
-        // A line on the LOWER (left) side of the centre is outside the USB
-        // passband window; the upper-passband RMS level does not see it, so
-        // the margin stays ≈ 0.
+        // The USB window excludes the line left of the NCO.
         let mut mags = [0u16; BINS];
         let c = BINS / 2;
         with_signal(&mut mags, c - 12, 6, 100, 60_000);
@@ -360,22 +294,12 @@ mod tests {
 
     #[test]
     fn floor_is_not_pulled_up_by_out_of_passband_signal() {
-        // A strong carrier well away from the passband (adjacent station) sits
-        // in a handful of the 320 bins; the 25th percentile still lands on the
-        // noise, and the passband RMS does not see it.
+        // A few occupied columns do not shift the display percentile.
         let mut m = [0u16; BINS];
         with_signal(&mut m, 80, 4, 100, 60_000); // well left of centre
         let s = compute(&m);
-        assert!(
-            s.floor_db < 0.0,
-            "floor must be near the noise: {} dB",
-            s.floor_db
-        );
-        assert!(
-            s.margin_db < 6.0,
-            "out-of-band adjacent station: margin {} dB",
-            s.margin_db
-        );
+        assert_eq!(s.floor_db, mag_to_db(100));
+        assert!(s.margin_db < 1e-4);
     }
 
     #[test]
@@ -392,29 +316,25 @@ mod tests {
     }
 
     #[test]
-    fn passband_width_is_sane() {
-        let hz_per_bin = DISPLAY_BIN_HZ;
-        let wbins = USB_PASSBAND_BINS;
-        // The USB/LSB passband is *one-sided* (one side of the NCO), so it
-        // must fit on one half of the display, and span roughly the voice
-        // bandwidth. At the default 10 kHz display, 2.6 kHz is ~84 of the
-        // 160 half-display bins.
-        assert!(wbins >= 1 && wbins < BINS / 2, "passband {wbins} bins");
-        assert!(
-            (USB_PASSBAND_HZ as usize / hz_per_bin) <= wbins
-                && wbins <= USB_PASSBAND_HZ as usize / hz_per_bin + 1,
-            "passband {wbins} bins ≈ {USB_PASSBAND_HZ} Hz at {hz_per_bin} Hz/bin"
-        );
+    fn passband_width_rounds_only_at_column_precision() {
+        assert_eq!(WF_BAND_HZ, 24_000);
+        assert_eq!(DISPLAY_BIN_HZ, 75.0);
+        assert_eq!(USB_PASSBAND_BINS, 35);
+        for n in [1, 2, 159, 319, BINS, 321] {
+            let width = passband_bins(USB_PASSBAND_HZ, n);
+            let hz_columns = USB_PASSBAND_HZ as usize * n;
+            assert!(width * WF_BAND_HZ >= hz_columns);
+            assert!((width - 1) * WF_BAND_HZ < hz_columns);
+            assert_eq!(passband_window(n, 0), (n / 2, (n / 2 + width).min(n - 1)));
+        }
     }
 
-    /// `passband_columns` must place the NCO at the band's outer edge for SSB
-    /// (one-sided) and at the middle for the double-sided modes — the exact
-    /// geometry the waterfall overlay draws in screen space.
     #[test]
     fn passband_columns_geometry() {
         let c = BINS / 2;
         // mode.rs order: [0] USB, [1] LSB, [2] AM, [3] FM, [4] NFM.
         let (u_lo, u_hi) = passband_columns(0);
+        assert_eq!((u_lo, u_hi), (160, 195));
         assert_eq!(u_lo, c, "USB lower edge is the NCO column");
         assert!(u_hi > c && u_hi < BINS, "USB extends to the upper side");
 
@@ -423,12 +343,11 @@ mod tests {
         assert!(l_lo < c, "LSB extends to the lower side");
         assert_eq!(c - l_lo, u_hi - c, "LSB/USB bands are mirror-symmetric");
 
-        for idx in [2usize, 3, 4] {
+        for (idx, expected) in [(2, (53, 267)), (3, (0, 319)), (4, (93, 227))] {
             let (lo, hi) = passband_columns(idx);
+            assert_eq!((lo, hi), expected);
             assert!(lo < c && hi > c, "[{idx}] double-sided straddles the NCO");
-            // Symmetric about the NCO — *unless* the band is so wide it
-            // reaches a window edge, in which case one side is clamped by the
-            // display boundary (the band still covers the whole visible side).
+            // Wide FM is clipped to the display edges.
             let left_span = c - lo;
             let right_span = hi - c;
             assert!(

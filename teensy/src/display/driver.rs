@@ -12,6 +12,7 @@ use embedded_hal::spi::{ErrorType, Operation, SpiBus, SpiDevice};
 use static_cell::ConstStaticCell;
 use teensy4_bsp::{board, hal};
 
+use super::overlay;
 use crate::display::glyphs::glyph;
 
 /// LPSPI driver's error type (kept for the `ErrorType` impls below).
@@ -123,29 +124,14 @@ const MEM_COLUMN: u8 = 0x2A;
 const MEM_ROW: u8 = 0x2B;
 const MEM_WRITE: u8 = 0x2C;
 
-/// Largest LPSPI transaction: the HAL caps `Transaction::new_words` at 128
-/// `u32` (4096-bit max frame size, see `lpspi::Transaction`), so one DMA
-/// transfer through this peripheral is bounded to 128 words (256
-/// RGB565 pixels — each `u32` holds two packed RGB565 halves, MSB-first).
-/// Chunk the pixel stream accordingly.
+/// LPSPI's 4096-bit frame limit: 128 words, each holding two RGB565 pixels.
 const MAX_TX_WORDS: usize = 128;
 
-/// Staging buffer for a 128-`u32` DMA transfer. Held in `.uninit` (OC-RAM)
-/// like the framebuffer. One `DmaDisplay` owns the `&'static mut` for its
-/// lifetime; the DMA engine reads it while the LPSPI streams the chunk to
-/// the panel, so it must not be mutated until the transfer's `DONE` bit
-/// clears. A `DmaDisplay` is single-task-owned, so the reference is
-/// uniquely held across the blit's lifetime.
+/// Owned by one `DmaDisplay`; reused only after each DMA write completes.
 static DMA_STAGE: ConstStaticCell<[u32; MAX_TX_WORDS]> = ConstStaticCell::new([0u32; MAX_TX_WORDS]);
 
-/// DMA-accelerated ILI9341 pixel blit.
-///
-/// Holds an LPSPI4 instance bitwise-copied from the blocking `DisplaySpi`
-/// (same register file, same clock settings — the LPSPI is not reconfigured
-/// after `Ili9341::new`, so a second handle on the same `Lpspi` state sees
-/// the same `ccr_cache` / `bit_order` / `mode` / `pcs` the DMA path uses),
-/// the display's CS and DC GPIO pins (bitwise-copied the same way), and a
-/// DMA `Channel` allocated from `resources.dma`.
+/// DMA blitter sharing SPI and GPIO hardware with the blocking display.
+/// Both handles must stay in one task and must not be used concurrently.
 pub struct DmaDisplay {
     spi: board::Lpspi,
     cs: hal::gpio::Output,
@@ -154,32 +140,15 @@ pub struct DmaDisplay {
     stage: &'static mut [u32; MAX_TX_WORDS],
 }
 
-/// Blocking u8 SPI write through `board::Lpspi` (via the embedded-hal
-/// `SpiBus` impl the blocking `DisplaySpi` already depends on). Used for the
-/// ILI9341 header bytes — a small number of command/address tokens that the
-/// DMA engine has no job here (they're interleaved with DC pin toggles).
+/// Send command/address bytes and drain SPI before the next DC change.
 fn lpspi_write_u8(spi: &mut board::Lpspi, bytes: &[u8]) {
     SpiBus::<u8>::write(spi, bytes).expect("lpspi cmd write");
     SpiBus::<u8>::flush(spi).expect("lpspi flush");
 }
 
 impl DmaDisplay {
-    /// Build a `DmaDisplay` by bitwise-copying the LPSPI + CS pin + DC pin
-    /// from their `&` references, and taking ownership of the eDMA channel.
-    ///
-    /// The caller retains ownership of the originals — those get moved into
-    /// the blocking `Display` (via `new_display`) later in the same
-    /// `init()` body. Both handles share the same LPSPI register file and
-    /// the same GPIO bits at the hardware level (the type system just
-    /// doesn't know about the second handle).
-    ///
-    /// # Safety
-    ///
-    /// `board::Lpspi` (`hal::lpspi::Lpspi`) has all-pod fields —
-    /// `NonZeroCell`, `ccr_cache`, `bit_order`, `mode`, `pcs` — none with
-    /// `Drop`. `hal::gpio::Output` is `{gpio: AnyInstance, offset: u32}` —
-    /// same story. `core::ptr::read`-ing each through a shared reference is
-    /// therefore a valid bitwise copy.
+    /// Copy the blocking display's hardware handles and own the DMA channel.
+    /// SPI configuration must remain consistent between the two handles.
     pub fn new(
         spi: &board::Lpspi,
         cs: &hal::gpio::Output,
@@ -187,6 +156,7 @@ impl DmaDisplay {
         chan: hal::dma::channel::Channel,
     ) -> Self {
         Self {
+            // These HAL handles have no Drop; access is serialized by the render task.
             spi: unsafe { core::ptr::read(spi) },
             cs: unsafe { core::ptr::read(cs) },
             dc: unsafe { core::ptr::read(dc) },
@@ -195,15 +165,9 @@ impl DmaDisplay {
         }
     }
 
-    /// Write the ILI9341 memory-window + memory-write header (column, row,
-    /// then the "stream pixels next" command). DC is toggled per segment in
-    /// exactly the byte order the blocking ILI9341 init path used.
+    /// Select an inclusive pixel window and begin a memory write.
     fn send_window(&mut self, x0: u16, y0: u16, x1: u16, y1: u16) {
-        // Assert CS for the whole pixel transfer — the ILI9341 holds its
-        // memory-window latch across CS boundaries only when the memory
-        // write command has been issued, and we don't want CS to deassert
-        // between header bytes because that would split the command stream
-        // the panel is expecting.
+        // Keep CS asserted through the header and all pixel chunks.
         self.cs.set_low();
         self.dc.set_low();
         lpspi_write_u8(&mut self.spi, &[MEM_COLUMN]);
@@ -224,121 +188,64 @@ impl DmaDisplay {
         self.dc.set_high();
     }
 
-    /// DMA-blit `pixels` (RGB565, in the row-major order the ILI9341
-    /// expects for the current memory window) into the window
-    /// `(x0..=x1, y0..=y1)`. This drives the header (memory window + write
-    /// command) synchronously, then hands the pixel stream to the eDMA
-    /// engine in `MAX_TX_WORDS`-sized chunks.
-    ///
-    /// Per chunk:
-    ///   1. Repack 256 u16 pixels → 128 u32s (upper half = left half of
-    ///      the u32 word, matching the LPSPI's MSB-first shift).
-    ///   2. `Lpspi::dma_write` programs the LPSPI TCR for the chunk and
-    ///      enables the LPSPI's DMA-tx bit.
-    ///   3. The returned `Write` future resolves when the eDMA signals the
-    ///      channel's `DONE` bit. The channel is armed with
-    ///      `set_interrupt_on_completion(true)`, so completion fires the
-    ///      `DMA0_DMA16` IRQ; the `dma_irq` handler in `main` calls
-    ///      `hal::dma::DMA.on_interrupt(0)`, which clears the flag and
-    ///      wakes the registered waker. The `.await` below stores that
-    ///      waker, so `render` yields its timeslice back to the RTIC loop
-    ///      and `radio_task` (network demod + spectrum) runs while the
-    ///      eDMA moves bytes — the exact win the DMA path was added for.
-    ///   4. `SpiBus::flush` waits until the panel has actually clocked
-    ///      out the last frame (the LPSPI's `BUSY` flag may still be set
-    ///      when the DMA's `DONE` bit clears) — necessary before the next
-    ///      chunk's TCR is enqueued.
-    pub async fn draw_pixels(&mut self, x0: u16, y0: u16, x1: u16, y1: u16, pixels: &[u16]) {
+    /// Blit undecorated RGB565 history, compositing overlays in DMA staging.
+    /// `passband` is ordered and inclusive, relative to the window's columns;
+    /// the NCO cursor is at its centre. Pixels must exactly fill the inclusive
+    /// window and have even length (two pixels per DMA word).
+    pub async fn draw_pixels(
+        &mut self,
+        x0: u16,
+        y0: u16,
+        x1: u16,
+        y1: u16,
+        pixels: &[u16],
+        passband: (usize, usize),
+    ) {
+        assert!(x0 <= x1 && y0 <= y1, "invalid pixel window");
+        let cols = usize::from(x1) - usize::from(x0) + 1;
+        let rows = usize::from(y1) - usize::from(y0) + 1;
+        assert_eq!(pixels.len() % 2, 0, "DMA requires paired pixels");
+        assert_eq!(
+            Some(pixels.len()),
+            cols.checked_mul(rows),
+            "pixel window size mismatch"
+        );
+        let (pb_lo, pb_hi) = passband;
         self.send_window(x0, y0, x1, y1);
-        // Arm interrupt-on-completion once. `prepare_write` (called inside
-        // `dma_write`) does not touch INTMAJOR, so this stays set across all
-        // chunks in this blit, and also stays set for subsequent blits — the
-        // channel is ours exclusively, so there's no contention to worry
-        // about. The `DMA0_DMA16` IRQ (channel 0) wakes whatever task is
-        // currently `.await`-ing on `self.chan`.
+        // The DMA IRQ wakes the render task between chunks.
         self.chan.set_interrupt_on_completion(true);
         let mut k = 0usize;
-        let mut cyc_setup = 0u64;
         let n = pixels.len();
-        let t0 = cortex_m::peripheral::DWT::cycle_count();
-        // Diagnostic: per-chunk wall time for the first 6 chunks + min/max
-        // across the rest, so we can tell "each of 150 chunks takes 15 ms"
-        // (all samples ~15000) from "one chunk stalls, rest fine" (one
-        // sample in the millions, rest ~124).
-        const SAMPLE_N: usize = 6;
-        let mut sample: [u32; SAMPLE_N] = [0; SAMPLE_N];
-        let mut sample_i: usize = 0;
-        let mut max_wait_us: u64 = 0;
-        let mut min_wait_us: u64 = u64::MAX;
-        // IRQ count across the blit — how many times the ISR actually fired.
-        let irq_start = crate::shared::irq_fires();
         while k < n {
             let chunk_end = (k + MAX_TX_WORDS * 2).min(n);
             let pairs = (chunk_end - k) / 2;
             for i in 0..pairs {
-                // Upper half first so the LPSPI MSB-first shift emits
-                // `pixel[0].hi, pixel[0].lo, pixel[1].hi, pixel[1].lo` —
-                // the exact byte order the ILI9341 samples.
-                self.stage[i] = ((pixels[k + 2 * i] as u32) << 16) | (pixels[k + 2 * i + 1] as u32);
+                let index = k + 2 * i;
+                let first = overlay::pixel(pixels[index], index % cols, pb_lo, pb_hi, cols / 2);
+                let second = overlay::pixel(
+                    pixels[index + 1],
+                    (index + 1) % cols,
+                    pb_lo,
+                    pb_hi,
+                    cols / 2,
+                );
+                // First pixel in the upper half for MSB-first SPI.
+                self.stage[i] = (u32::from(first) << 16) | u32::from(second);
             }
-            let a = cortex_m::peripheral::DWT::cycle_count();
-            let w = self
+            let result = self
                 .spi
                 .dma_write(&mut self.chan, &self.stage[..pairs])
-                .expect("dma_write setup");
-            let setup = cortex_m::peripheral::DWT::cycle_count().wrapping_sub(a);
-            let result = w.await;
-            let b = cortex_m::peripheral::DWT::cycle_count();
-            let wait_us = ((b.wrapping_sub(a)) as u64 * 1_000_000) / (board::ARM_FREQUENCY as u64);
-            if wait_us < min_wait_us {
-                min_wait_us = wait_us;
-            }
-            if wait_us > max_wait_us {
-                max_wait_us = wait_us;
-            }
-            if sample_i < SAMPLE_N {
-                sample[sample_i] = wait_us as u32;
-                sample_i += 1;
-            }
-            cyc_setup += setup as u64;
+                .expect("dma_write setup")
+                .await;
             if let Err(e) = result {
                 self.cs.set_high();
                 panic!("dma transfer error: {e:?}");
             }
             k = chunk_end;
         }
-        let irq_fires = crate::shared::irq_fires().wrapping_sub(irq_start);
-        // One final drain: every chunk's `Write::drop` already waited for
-        // `TDDE` to deassert (LPSPI idle), but belt-and-suspenders before
-        // we release CS so the last frame is on the wire before the panel
-        // latches.
+        // DMA completion need not mean SPI is idle; drain before releasing CS.
         SpiBus::<u8>::flush(&mut self.spi).expect("lpspi blit flush");
         self.cs.set_high();
-        let cycles = cortex_m::peripheral::DWT::cycle_count().wrapping_sub(t0);
-        let ms = cycles as f64 / (board::ARM_FREQUENCY as f64) * 1e3;
-        let fsr = self.spi.fifo_status();
-        let sr = self.spi.status().bits();
-        let cc = self.spi.clock_configs();
-        let sck_mhz = 132_000_000u64 as f64 / ((cc.sckdiv as u64 + 2) as f64) / 1e6;
-        // `info!` (not `debug!`) so the diagnostics survive release builds.
-        let eff_mbit_s = (n as f64 * 32.0) / (ms * 1e6);
-        let setup_us = cyc_setup as f64 / (board::ARM_FREQUENCY as f64) * 1e6;
-        let chunks = n / (MAX_TX_WORDS * 2);
-        /*log::info!(
-            "draw_pixels {n} px: total {ms:.3} ms (setup {setup_us:.1}us); wait_us min={min_wait_us} max={max_wait_us} first=[{s0},{s1},{s2},{s3},{s4},{s5}]; irq_fires={irq_fires} (expect {chunks}); sckdiv={sd} => sck={sck_mhz:.2} MHz; eff={eff_mbit_s:.2} Mbit/s; sr=0x{sr_val:08x} tx={tx}/{tmc} rx={rx}/{rmc}",
-            s0 = sample[0],
-            s1 = sample[1],
-            s2 = sample[2],
-            s3 = sample[3],
-            s4 = sample[4],
-            s5 = sample[5],
-            sd = cc.sckdiv,
-            sr_val = sr,
-            tx = fsr.txcount,
-            tmc = fsr.txcap,
-            rx = fsr.rxcount,
-            rmc = fsr.rxcap,
-        );*/
         if self.chan.is_error() {
             log::error!(
                 "dma channel 0 error end-of-blit: {:?}",
@@ -411,14 +318,12 @@ fn draw_char(display: &mut Display, x: u16, y: u16, scale: u16, ch: char, fg: u1
         .expect("text draw");
 }
 
-/// Cached ASCII text on a cleared background. Position and colors must stay
-/// fixed, and no other drawing may overwrite its cells between updates.
+/// Cached ASCII text. Colors must stay fixed; `update` also requires fixed
+/// placement. No other drawing may overwrite the cached cells.
 pub struct TextLine<const N: usize> {
     text: [u8; N],
-    /// Last text length (chars, NOT the padded buffer size) so the union
-    /// erase knows how wide the previous paint was.
+    /// Last scaled text length and placement (-1 = never painted).
     len: usize,
-    /// Last placement painted by `update_scaled` (−1 = never).
     lx: i32,
     ly: i32,
     ls: i32,
@@ -441,14 +346,8 @@ impl<const N: usize> TextLine<N> {
         });
     }
 
-    /// Paint `text` at (`x`, `y`) with each 5×7 glyph scaled `scale`×.
-    /// Repaints only when content or placement changed; each repaint first
-    /// erases the **bounding box of the *union* of the old and new
-    /// rectangles** — the union, not just the old box, because the line
-    /// re-centres whenever its content length changes (e.g. mode
-    /// "NFM"→"LSB"→"AM"): a *longer* new line starts left of the old, and a
-    /// *shorter* one starts right of it, so the old box alone misses a tail
-    /// of the previous line.
+    /// On content or placement changes, erase the old rectangle and paint
+    /// the new opaque glyph cells.
     pub fn update_scaled(
         &mut self,
         display: &mut Display,
@@ -469,26 +368,11 @@ impl<const N: usize> TextLine<N> {
             return;
         }
         if self.ls >= 0 {
-            // Old rectangle (from the last paint) and the new one,
-            // both at the 6px-per-cell pitch.
-            let old_w = self.len as u32 * 6u32 * (self.ls as u32);
-            let new_w = text.len() as u32 * 6u32 * (scale as u32);
-            let old_h = 7u32 * (self.ls as u32);
-            let new_h = 7u32 * (scale as u32);
-
-            let old = (
-                self.lx.max(0) as u32,
-                self.ly.max(0) as u32,
-                (self.lx.max(0) as u32).saturating_add(old_w).min(320u32),
-                (self.ly.max(0) as u32).saturating_add(old_h).min(240u32),
-            );
-            let new = (
-                x as u32,
-                y as u32,
-                (x as u32).saturating_add(new_w).min(320u32),
-                (y as u32).saturating_add(new_h).min(240u32),
-            );
-            erase_union(display, old, new, bg);
+            let old_x = (self.lx as u16).min(320);
+            let old_y = (self.ly as u16).min(240);
+            let old_w = (self.len as u32 * 6 * self.ls as u32).min(u32::from(320 - old_x));
+            let old_h = (7 * self.ls as u32).min(u32::from(240 - old_y));
+            fill_rect(display, old_x, old_y, old_w as u16, old_h as u16, bg);
         }
         for (i, b) in text.as_bytes().iter().enumerate() {
             draw_char(
@@ -519,56 +403,6 @@ impl<const N: usize> TextLine<N> {
                 *old = new;
             }
         }
-    }
-}
-
-/// Bounding box of the union of two rectangles `(x0, y0, x1, y1)`, each
-/// clamped to the 320×240 panel. (x1/y1 are INCLUSIVE here, to match how
-/// `update_scaled` computes them as "last painted coordinate + 1".)
-///
-/// The union (not just the *old* box) must be wiped before repainting a
-/// centred text line: a shorter new line starts further right (the old
-/// line's right edge then extends past the new one), and a wider new line
-/// starts further left (the old line's left edge sticks out to the left).
-/// Either way, erasing only one side misses the tail of the other.
-///
-/// (Split out of `update_scaled` so the math is unit-testable headless.)
-pub(crate) fn erase_union_bbox(
-    ax0: u32,
-    ay0: u32,
-    ax1: u32,
-    ay1: u32,
-    bx0: u32,
-    by0: u32,
-    bx1: u32,
-    by1: u32,
-) -> (u32, u32, u32, u32) {
-    (
-        ax0.min(bx0).min(320),
-        ay0.min(by0).min(240),
-        ax1.max(bx1).min(320),
-        ay1.max(by1).min(240),
-    )
-}
-
-/// Fill `display` with `bg` over the union bounding box of the *old* and
-/// *new* text-line rectangles. No-op if the box has zero area.
-fn erase_union(
-    display: &mut Display,
-    old: (u32, u32, u32, u32),
-    new: (u32, u32, u32, u32),
-    bg: u16,
-) {
-    let (x0, y0, x1, y1) = erase_union_bbox(old.0, old.1, old.2, old.3, new.0, new.1, new.2, new.3);
-    if x1 > x0 && y1 > y0 {
-        fill_rect(
-            display,
-            x0 as u16,
-            y0 as u16,
-            (x1 - x0) as u16,
-            (y1 - y0) as u16,
-            bg,
-        );
     }
 }
 
@@ -605,59 +439,5 @@ mod tests {
         let mut cells = Vec::new();
         line.update_cells("192.168.1.5 F 100", |col, ch| cells.push((col, ch)));
         assert_eq!(cells, vec![(14, b'1'), (15, b'0'), (16, b'0')]);
-    }
-
-    // The frequency line is centred, so a mode change that *shortens* the
-    // text ("...LSB" 14ch → "...AM" 13ch) shifts its left edge right by
-    // half the width delta. The new (shorter) line therefore starts
-    // further right, and the OLD line's right edge sits PAST the new one —
-    // erasing only the old box would leak a tail of the old longer line.
-    // `erase_union_bbox` must cover both.
-    #[test]
-    fn union_bbox_when_new_is_shorter_starts_further_right() {
-        // scale 6px/char * glyph-scale 1  →  per-char width 6.
-        let old_x0 = 10u32;
-        let old_w = 14 * 6; // "...LSB"
-        let new_x0 = 13; // 1 char (6px) shorter → left edge moves right by
-        // half the 6px delta, rounded → a few px right.
-        let new_w = 13 * 6; // "...AM"
-        let old_x1 = old_x0 + old_w;
-        let new_x1 = new_x0 + new_w;
-        let (x0, _y0, x1, _y1) = erase_union_bbox(old_x0, 0, old_x1, 7, new_x0, 0, new_x1, 7);
-        assert!(x0 <= old_x0, "union must contain old left edge: {x0}");
-        assert!(
-            x1 >= old_x1,
-            "union must cover the old (longer) right edge: {x1}"
-        );
-        assert!(
-            x0 <= new_x0 && x1 >= new_x1,
-            "union must contain the new line too"
-        );
-    }
-
-    // The other direction: new line is WIDER (e.g. "...NFM"). The old left
-    // edge sticks out to the LEFT of the new one, so the union must extend
-    // left of the new.
-    #[test]
-    fn union_bbox_when_new_is_wider_starts_further_left() {
-        let old_x0 = 20u32;
-        let old_w = 13 * 6; // "...AM"
-        let new_x0 = 14; // wider → left edge further left.
-        let new_w = 14 * 6; // "...NFM-ish"
-        let old_x1 = old_x0 + old_w;
-        let new_x1 = new_x0 + new_w;
-        let (x0, _y0, x1, _y1) = erase_union_bbox(old_x0, 0, old_x1, 7, new_x0, 0, new_x1, 7);
-        assert!(x0 <= new_x0, "union must extend left of the new line: {x0}");
-        assert!(
-            x1 >= old_x1.max(new_x1),
-            "union right edge = further of either: {x1}"
-        );
-    }
-
-    // Clamping: an erase extending past the glass stops at the panel edges.
-    #[test]
-    fn union_bbox_clamps_to_panel() {
-        let (x0, y0, x1, y1) = erase_union_bbox(100, 50, 400, 300, 200, 60, 500, 400);
-        assert_eq!((x0, y0, x1, y1), (100, 50, 320, 240));
     }
 }

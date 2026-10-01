@@ -368,59 +368,30 @@ impl VirtualReceiver {
         self.demod.set_gain_db(gain_db);
     }
 
-    /// Change the receiver's demod mode **in place** (no full receiver
-    /// rebuild): tear down the current demodulator and build a new one from
-    /// the same `source_rate_hz` / `source_center_hz` / `audio` (only `mode`
-    /// changes; the band-select width resolves from `cfg.bandwidth_hz` if
-    /// set, otherwise from the new mode's default — matching `new`). The
-    /// `sink` is unchanged, so the downstream audio path (e.g. an I2S sink
-    /// feeding a codec) sees only a one-block transition on the first
-    /// `process` call after the swap.
-    ///
-    /// The new demodulator's DSP state (AGC, DC-blocker, channel-select
-    /// filter) is seeded fresh; the old state is dropped. Any block the old
-    /// demodulator was accumulating for its next `demod()` call is lost —
-    /// this is acceptable for a hardware-button mode toggle (a fraction of
-    /// a second of audio, bounded by the sink's block size).
-    ///
-    /// On success [`Self::config`] reports the new `mode`. On error
-    /// (e.g. a core's `new()` sanity check failed) the receiver is left
-    /// running with its **previous** demodulator.
+    /// Rebuild the demodulator for `mode`, preserving source, audio, tap and sink.
+    /// An explicit bandwidth override is retained; `None` uses each mode's default.
+    /// Success discards old DSP state and buffered audio; errors leave it unchanged.
     pub fn set_mode(&mut self, mode: Mode) -> Result<(), ReceiverError> {
         let bw = self
             .cfg
             .bandwidth_hz
             .unwrap_or_else(|| mode.default_bandwidth_hz());
-        let new_demod = make_demod(
+        let new_demod = make_demod_tap(
             mode,
             self.cfg.source_rate_hz,
             self.cfg.source_center_hz,
             bw,
             self.cfg.audio,
+            self.cfg.tap.clone(),
         )?;
         self.demod = new_demod;
         self.cfg.mode = mode;
-        // Keep `bandwidth_hz` (the *override*) in sync with what we actually
-        // built: if `cfg` carried no override, the new demod uses the mode
-        // default — record it so `config().bandwidth()` reports the truth.
-        if self.cfg.bandwidth_hz.is_none() {
-            self.cfg.bandwidth_hz = Some(bw);
-        }
         Ok(())
     }
 
-    /// Swap the running demodulator for `incoming` **in place, with no
-    /// allocation**: the caller built `incoming` ahead of time (e.g. from a
-    /// pre-built per-mode pool) and hands it over; this returns the
-    /// demodulator that was running so the caller can stash it for a later
-    /// swap back. Zero heap traffic per swap — the `Box` is just a pointer
-    /// move — which matters on a never-freed bump allocator.
-    ///
-    /// [`Self::config`] reports `mode` + (when the config carried no
-    /// `bandwidth_hz` override) `bandwidth_hz` as the *effective* width the
-    /// caller built `incoming` with — the same recording rule as
-    /// [`Self::set_mode`]. The `sink` is untouched, so the downstream audio
-    /// path sees only a one-block transition on the next `process`.
+    /// Swap demodulators without allocation, returning the old one and keeping the sink.
+    /// The caller must match the receiver's source, audio and tap configuration,
+    /// and supply the incoming mode and bandwidth. The width becomes an explicit override.
     pub fn swap_demod(
         &mut self,
         incoming: Box<dyn Demodulator>,
@@ -428,9 +399,7 @@ impl VirtualReceiver {
         bandwidth_hz: u32,
     ) -> Box<dyn Demodulator> {
         self.cfg.mode = mode;
-        if self.cfg.bandwidth_hz.is_none() {
-            self.cfg.bandwidth_hz = Some(bandwidth_hz);
-        }
+        self.cfg.bandwidth_hz = Some(bandwidth_hz);
         core::mem::replace(&mut self.demod, incoming)
     }
 
@@ -511,6 +480,98 @@ mod tests {
             Mode::FmNarrow,
         ] {
             VirtualReceiver::new(cfg(m), Box::new(VecSink::new())).expect("receiver build");
+        }
+    }
+
+    #[test]
+    fn repeated_mode_switches_preserve_bandwidth_policy() {
+        for bandwidth_hz in [None, Some(4_000)] {
+            let mut rx = VirtualReceiver::new(
+                ReceiverConfig {
+                    bandwidth_hz,
+                    ..Default::default()
+                },
+                Box::new(VecSink::new()),
+            )
+            .unwrap();
+            for mode in [
+                Mode::Am,
+                Mode::Fm,
+                Mode::FmNarrow,
+                Mode::Ssb(Sideband::Usb),
+                Mode::Am,
+            ] {
+                rx.set_mode(mode).unwrap();
+                assert_eq!(rx.config().mode, mode);
+                assert_eq!(rx.config().bandwidth_hz, bandwidth_hz);
+                assert_eq!(
+                    rx.config().bandwidth(),
+                    bandwidth_hz.unwrap_or(mode.default_bandwidth_hz())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mode_switches_preserve_raw_tap() {
+        #[derive(Debug, Default)]
+        struct Tap(AtomicUsize);
+        impl RawSampleTap for Tap {
+            fn append(&self, samples: &[f32]) {
+                self.0.fetch_add(samples.len(), Ordering::Relaxed);
+            }
+        }
+
+        let tap = Arc::new(Tap::default());
+        let mut rx = VirtualReceiver::new(
+            ReceiverConfig {
+                tap: Some(tap.clone()),
+                ..Default::default()
+            },
+            Box::new(VecSink::new()),
+        )
+        .unwrap();
+        let iq = tone(rx.config().source_rate_hz, 1_500.0, 12_000, 0.5);
+        for mode in [Mode::Am, Mode::Fm, Mode::Ssb(Sideband::Usb)] {
+            rx.set_mode(mode).unwrap();
+            let before = tap.0.load(Ordering::Relaxed);
+            rx.process(&iq).unwrap();
+            rx.flush().unwrap();
+            assert!(tap.0.load(Ordering::Relaxed) > before);
+        }
+    }
+
+    #[test]
+    fn swaps_report_each_incoming_bandwidth() {
+        for bandwidth_hz in [None, Some(4_000)] {
+            let mut rx = VirtualReceiver::new(
+                ReceiverConfig {
+                    bandwidth_hz,
+                    ..Default::default()
+                },
+                Box::new(VecSink::new()),
+            )
+            .unwrap();
+            for (mode, width) in [
+                (Mode::Am, 8_000),
+                (Mode::Fm, 12_000),
+                (Mode::FmNarrow, 5_000),
+            ] {
+                let cfg = rx.config();
+                let incoming = make_demod_tap(
+                    mode,
+                    cfg.source_rate_hz,
+                    cfg.source_center_hz,
+                    width,
+                    cfg.audio,
+                    cfg.tap.clone(),
+                )
+                .unwrap();
+                let _retired = rx.swap_demod(incoming, mode, width);
+                assert_eq!(rx.config().mode, mode);
+                assert_eq!(rx.config().bandwidth_hz, Some(width));
+                assert_eq!(rx.config().bandwidth(), width);
+            }
         }
     }
 

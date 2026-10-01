@@ -169,54 +169,25 @@ mod app {
         }
     }
 
-    /// GPIO3 **upper-half** (bits 16..=31) IRQ handler. The RT1060 routes
-    /// each 16-bit half of a GPIO port through a separate vector — A
-    /// (p28, bit 18) **and** the button (p30, bit 23) both land on *this*
-    /// vector (see `encoder::isr_gpio3_upper_active`). Priority 1 — above
-    /// priority-0 radio/render/audio tasks, below priority-3 DMA IRQs.
-    ///
-    /// The encoder module owns its quadrature state and the shared counters,
-    /// so the handler body is tiny (bit inspect, table-lookup, W1C-clear)
-    /// and never blocks. We must clear *every* pending bit that fired us,
-    /// or the vector will re-fire forever (bit 23 re-fires at priority 1
-    /// and starves all the priority-0 tasks — the mode-toggle freeze).
+    /// A and the button share GPIO3's upper-half interrupt.
     #[task(binds = GPIO3_COMBINED_16_31, priority = 1)]
     fn enc_a_irq(_cx: enc_a_irq::Context) {
         let active = encoder::isr_gpio3_upper_active();
         if active & (1u32 << 18) != 0 {
-            // A pin fired: advance the quadrature state machine.
             encoder::handle_edge();
             encoder::clear_isr_gpio3_pin18();
         }
         if active & (1u32 << 23) != 0 {
-            // Button fired: latch the pending mode-toggle request. Do NOT
-            // call `handle_edge` for the button — bit 23 is not part of
-            // the quadrature phase (that's bits 18 + 31 on GPIO3/GPIO4).
             encoder::handle_button_press();
             encoder::clear_isr_gpio3_pin23();
         }
     }
 
-    /// Rotary-encoder B channel (p29, GPIO4_IO31) edge handler — same
-    /// contract as the A channel; both call into the same state machine.
+    /// Encoder B channel (p29, GPIO4_IO31).
     #[task(binds = GPIO4_COMBINED_16_31, priority = 1)]
     fn enc_b_irq(_cx: enc_b_irq::Context) {
         encoder::handle_edge();
         encoder::clear_isr_gpio4_pin31();
-    }
-
-    /// Rotary-encoder push button (p30, GPIO3_IO23) — RX1 mode toggle.
-    /// Falling-edge only (the pad has a pull-up, so a press is always a
-    /// LOW-going transition); the ISR body is two calls: latch the pending
-    /// request, then W1C-clear the GPIO3 bit so the ISR doesn't re-fire.
-    /// Bounce is tolerated — the radio task's debounce (it only commits
-    /// the toggle if the pad is *still* low after `take_mode_request`
-    /// returns true) means a few extra falling edges in the 100 µs
-    /// debounce window collapse to one.
-    #[task(binds = GPIO3_COMBINED_0_15, priority = 1)]
-    fn enc_btn_irq(_cx: enc_btn_irq::Context) {
-        encoder::handle_button_press();
-        encoder::clear_isr_gpio3_pin23();
     }
 
     /// Task-local type alias for the ILI9341 panel.
@@ -293,14 +264,7 @@ mod app {
             rtic_monotonics::create_systick_token!(),
         );
 
-        // Rotary quadrature encoder on p28 (A, GPIO3_IO18) / p29 (B,
-        // GPIO4_IO31), plus its push button on p30 (GPIO3_IO23 — the
-        // encoder's RX1 mode-toggle key): pull-up + hysteresis on all three
-        // pads, A/B both-edge + button falling-edge GPIO interrupts, and the
-        // NVIC vectors enabled/prioritized (see `encoder::init`). Must run
-        // before the first `radio_task` loop iteration (which drains
-        // `take_steps()` + `take_mode_request()`) and before any edge can
-        // fire into the enc_a/enc_b/enc_btn ISR tasks.
+        // Configure GPIOs before RTIC enables the encoder interrupts.
         encoder::init(gpio3, gpio4, pins.p28, pins.p29, pins.p30);
         shared::set_nco_hz(radio::control::TUNE_HZ);
 
@@ -812,11 +776,7 @@ mod app {
             if cur_seq != last_row_pub {
                 last_row_pub = cur_seq;
                 shared::publish(pipeline.mags());
-                // The S-meter is a spectrum consumer (PROTOCOL.md §16.3e) — the
-                // same 320-bin row the render task blits. Compute it here, off
-                // the render path, so the render task just paints. Its
-                // passband follows the running RX1 mode (USB/LSB = one
-                // sideband, AM/FM/NFM = the centred double-sideband window).
+                // Meter the visible passband for the running mode.
                 let m =
                     hl2_teensy::smeter::compute_for_mode(pipeline.mags(), shared::rx1_mode_index());
                 shared::set_slevel(m.sunits, m.margin_db);
@@ -858,11 +818,7 @@ mod app {
                 handle.send_keepalive();
             }
 
-            // Encoder retune: drain signed quadrature steps accumulated by the
-            // enc_a/enc_b ISR tasks and step the RX1 NCO by ±`step_hz()` per
-            // detent. `take_steps` swaps the pending counter to 0 under
-            // AcqRel, so any steps that arrived mid-`send_tune` are picked up
-            // next iteration.
+            // Apply the signed edges accumulated since the last iteration.
             let steps = encoder::take_steps();
             if steps != 0 {
                 let new_nco = (nco_hz + (steps as i64) * (encoder::step_hz() as i64))
@@ -872,29 +828,15 @@ mod app {
                 handle.send_tune(new_nco);
             }
 
-            // Encoder push button (p30) → RX1 mode toggle. The falling-edge
-            // ISR latched a pending request (`encoder::handle_button_press`);
-            // drain it here in the same drain step as the steps above. On a
-            // true press, advance the shared mode index (USB → LSB → AM → FM
-            // → NFM → USB …) and rebuild the virtual receiver's demod in
-            // place (`Rx::set_mode` reuses the I2S sink, so the audio path is
-            // uninterrupted). The render task notices the new index and
-            // repaints the mode label on the next status redraw.
-            //
-            // The shared index is advanced *before* the rebuild (via
-            // `next_rx1_mode`) so that if two presses land before the first
-            // rebuild completes, the rebuild is still for *the next entry*,
-            // not the same one — and if the rebuild fails we walk the index
-            // back so the label matches the receiver's actual mode.
+            // Publish only successful mode changes so the display follows RX1.
             if encoder::take_mode_request() {
-                let new_idx = shared::next_rx1_mode();
+                let new_idx = (rx.mode_index() + 1) % hl2_teensy::mode::len();
                 match rx.set_mode(new_idx) {
                     Ok(()) => {
+                        shared::set_rx1_mode_index(new_idx);
                         log::info!("RX1 mode → {}", hl2_teensy::mode::label_at(new_idx));
                     }
                     Err(e) => {
-                        let n = hl2_teensy::mode::len();
-                        shared::set_rx1_mode_index((new_idx + n - 1) % n);
                         log::warn!(
                             "RX1 mode → {} failed: {}",
                             hl2_teensy::mode::label_at(new_idx),
@@ -938,6 +880,7 @@ mod app {
         let mut status_meter = display::driver::TextLine::<16>::new();
 
         let mut painted_seq: u32 = 0;
+        let mut painted_mode = usize::MAX;
         let mut last_state: u32 = u32::MAX;
         let mut last_peer: u32 = u32::MAX;
         let mut last_nco: u32 = u32::MAX;
@@ -997,8 +940,8 @@ mod app {
                 })
                 .unwrap_or(u32::MAX);
 
-            // Shift in RAM, then repaint the band because every row has moved.
-            if seq != painted_seq {
+            let mode_idx = shared::rx1_mode_index();
+            if seq != painted_seq || mode_idx != painted_mode {
                 let cols = display::WF_COLS;
                 let rows = display::WF_ROWS;
                 let total = cols * rows;
@@ -1014,25 +957,16 @@ mod app {
                 //    (same shared wall as demod / fft). The eDMA blit below is
                 //    offloaded to the engine and is *not* counted as CPU.
                 let c0 = DWT::cycle_count();
-                fb.copy_within(..total - cols, cols);
-                // 2. new row at the top, ramped by the auto floor/ceil window.
-                for (i, px) in fb[..cols].iter_mut().enumerate() {
-                    *px = display::palette::bin_color(
-                        row.get(i).copied().unwrap_or(0u16),
-                        floor,
-                        ceil,
-                    );
-                }
-                // 2b. NCO line (centred column) + the mode's passband band,
-                //     composited onto the *whole* frame. The NCO is always
-                //     `BINS / 2` and the passband is a fixed offset from it
-                //     (USB/LSB one-sided, AM/FM double-sided), so both are
-                //     static in screen space and never distort as the user
-                //     tunes — only the trace scrolling underneath shifts. Same
-                //     window the S-meter integrates (see `smeter::passband_columns`).
-                {
-                    let (pb_lo, pb_hi) = smeter::passband_columns(shared::rx1_mode_index());
-                    display::overlay::apply(fb, pb_lo, pb_hi, cols / 2);
+                if seq != painted_seq {
+                    fb.copy_within(..total - cols, cols);
+                    // 2. new row at the top, ramped by the auto floor/ceil window.
+                    for (i, px) in fb[..cols].iter_mut().enumerate() {
+                        *px = display::palette::bin_color(
+                            row.get(i).copied().unwrap_or(0u16),
+                            floor,
+                            ceil,
+                        );
+                    }
                 }
                 shared::add_lcd_cycles(u64::from(DWT::cycle_count().wrapping_sub(c0)));
                 // 3. Blit the band via eDMA. This hands the pixel work over
@@ -1048,14 +982,16 @@ mod app {
                     (cols as u16) - 1,
                     wf_top + (rows as u16) - 1,
                     &fb[..total],
+                    smeter::passband_columns(mode_idx),
                 )
                 .await;
                 painted_seq = seq;
+                painted_mode = mode_idx;
                 // Let the radio drain its MAC ring before further SPI work.
                 Systick::delay(1.millis()).await;
             }
 
-            // Refresh status on changes and keep the RX counter live at 2 Hz.
+            // Refresh status on changes and the meter at 2 Hz.
             let now_ms = now_millis();
             let nco = shared::nco_hz();
             let mode_idx = shared::rx1_mode_index() as u32;
@@ -1083,15 +1019,7 @@ mod app {
         }
     }
 
-    /// Layout of the top half (y 0..`display::WF_TOP`):
-    ///   * row 0 (y 6):   IP address / "NO IP" on the left, radio state
-    ///                    (WAIT IP / STREAMING / ...) on the right.
-    ///   * centre (y 16): the current NCO as MHz.kHz.Hz + mode, scaled up
-    ///                    to fill the remaining height (e.g. "07.074.000 USB").
-    ///   * y 106:         the S-meter (bar + "S{n} +{N} dB"), the last row
-    ///                    before the waterfall at y 120.
-    /// The frame-count and per-stage CPU shares are still computed and
-    /// published to `shared` but no longer painted, in case they come back.
+    /// Draw IP/state, centred frequency/mode, and the meter above the waterfall.
     fn status_redraw(
         panel: &mut Panel,
         status_ip: &mut display::driver::TextLine<16>,
@@ -1128,11 +1056,7 @@ mod app {
         let ip_s = core::str::from_utf8(&w.target[..w.pos]).unwrap();
         status_ip.update(panel, 6, 6, ip_s, 0xF800, 0x0000);
 
-        // Large frequency + mode, centred: NCO in MHz.kHz.Hz with 2-group
-        // separators (e.g. "07.074.000 USB"). Scale to the largest that
-        // still fits the panel width (8px margins) — the band height below
-        // the header is plenty wide, so width is the binding constraint —
-        // and vertically centre it in the band above the S-meter.
+        // Fit and centre the MHz.kHz.Hz readout between the header and meter.
         const FREQ_TOP: u16 = 16;
         const FREQ_BOTTOM: u16 = 106;
         let hz = shared::nco_hz();

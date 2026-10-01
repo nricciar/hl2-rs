@@ -10,8 +10,6 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use num_complex::Complex;
 
-use cortex_m::peripheral::DWT;
-
 use hl2::protocol::data::{
     BasebandChunk, HEADER_SIZE, parse_baseband_chunk_into, parse_data_header,
 };
@@ -21,32 +19,28 @@ use hl2::receiver::{Demodulator, Mode, VirtualReceiver, make_demod};
 use crate::mode::len as mode_len;
 use crate::spectrum::Pipeline;
 
+#[inline]
+fn cycle_count() -> u32 {
+    #[cfg(target_arch = "arm")]
+    {
+        cortex_m::peripheral::DWT::cycle_count()
+    }
+    #[cfg(not(target_arch = "arm"))]
+    {
+        0
+    }
+}
+
 /// The receive-side state the radio task owns (task-local; no sync needed).
 pub struct Rx {
     /// Fixed slots prevent malformed frames from dropping bump-allocated buffers.
     baseband: [BasebandChunk; 2],
-    /// The virtual-RX1 receiver (offset 0) — the *same* demod pipeline the
-    /// UI runs. Built on [`hl2::ReceiverConfig::default()`] (USB, 2.6 kHz)
-    /// so it mirrors the UI receiver byte-for-byte; its audio is routed
-    /// through the `crate::audio::sink::Sink` → SAI1 → WM8731 path. The
-    /// running demodulator is always `active`'s entry — the other
-    /// `crate::mode::len() - 1` live in [`pool`](Self::pool).
+    /// RX1 at offset 0, feeding the I2S audio sink.
     vrx: VirtualReceiver,
-    /// The index into `crate::mode::MODES` the *running* demodulator is
-    /// (0 = USB at boot — must agree with `ReceiverConfig::default()`).
+    /// Running mode index; starts at 0 to match `ReceiverConfig::default()`.
     active: usize,
-    /// The *other* demodulators: index `i` holds `MODES[i]`'s demod (for
-    /// `i != self.active`), and `pool[self.active]` is `None` (that
-    /// demodulator is the one the `vrx` is running). Entries start `None`
-    /// and are built **once**, on first switch to them ([`set_mode`]), then
-    /// cached forever — so the *live* demod count is always ≤
-    /// `crate::mode::len()` (each slot only ever goes `None → Some` in the
-    /// one direction, back to `Some` holding its *own previous occupant*,
-    /// never rebuilt on top of a live one). That cap is what keeps the
-    /// no-free bump heap alive across a long button-tournament: a per-press
-    /// *rebuild* would leak a whole demod's DSP state every toggle and the
-    /// 160 KiB arena would run out. Once built, a switch is a pure
-    /// `mem::replace` pointer swap — zero heap traffic.
+    /// Inactive demodulators, built once and retained for the no-free bump heap.
+    /// The active slot and modes not yet visited are `None`.
     pool: [Option<Box<dyn Demodulator>>; mode_len()],
     /// Reused I/Q block handed to the virtual receiver each frame. Held as a
     /// field (not a per-call local) because the heap is a no_std bump arena
@@ -65,25 +59,9 @@ pub struct Rx {
 
 impl Rx {
     pub fn new() -> Self {
-        // USB-SSB, offset 0, 96 kSps, 2.6 kHz, 4.8 kHz audio — the `hl2`
-        // crate's default receiver config, so the Teensy's virtual receiver is
-        // byte-for-byte the same DSP the UI drives. Audio is routed through
-        // the I2S path (`audio::sink::Sink`) → WM8731; the S-meter is a
-        // spectrum consumer (see `crate::smeter`).
         let sink = Box::new(crate::audio::sink::Sink::new());
-        let vrx = VirtualReceiver::new(Default::default(), sink)
-            .expect("virtual USB receiver at offset 0");
-        // The running demod is MODES[0]' (USB — `ReceiverConfig::default()`);
-        // the other entries start unbuilt ([`pool`](Self::pool) = all-`None`)
-        // and are **built once, on first switch, then cached for the life of
-        // the machine** (see `activate` below). Building is deferred out of
-        // `new` so the boot path stays light, and because each entry's `Some(..)`
-        // is written exactly once (the slot is never rebuilt back from `Some`
-        // — `activate` only ever writes `pool[old]=Some(..)` and
-        // `pool[old]` was `None` at that moment) the *live* demod count is
-        // always ≤ `crate::mode::len()`. That bound is what keeps the no-free
-        // bump heap alive across a long press-tournament: a per-press rebuild
-        // would allocate-and-leak a whole demod's DSP state every toggle.
+        let vrx =
+            VirtualReceiver::new(Default::default(), sink).expect("virtual receiver at offset 0");
         Self {
             baseband: core::array::from_fn(|_| BasebandChunk {
                 per_rx: alloc::vec::Vec::new(),
@@ -114,29 +92,14 @@ impl Rx {
         self.fft_cycles
     }
 
-    /// Switch the running demodulator to `index` (into
-    /// `crate::mode::MODES`). On success the receiver runs `MODES[index]`;
-    /// on error it is left exactly as it was (callers can walk the shared
-    /// index back).
-    ///
-    /// The [`pool`](Self::pool) entry for `index` is either already built
-    /// (a pure pointer swap — zero heap traffic) or `None` on the *very
-    /// first* switch to that mode, in which case it is built now (a one-time
-    /// allocation; the pool's `None → Some`-only invariant means a mode is
-    /// never built twice, so a long button-tournament cannot exhaust the
-    /// no-free bump heap). The I2S sink is reused (the 10× upsample → SAI1 →
-    /// WM8731 path is unchanged), so no audio re-wiring — only the new demod's
-    /// fresh DSP state (AGC / DC-blocker / channel-select) is a one-block
-    /// transition on its first `process`.
+    /// Select a mode index, building it on first use and reusing its DSP state later.
+    /// The sink is unchanged; build errors leave the current mode running.
     pub fn set_mode(&mut self, index: usize) -> Result<(), hl2::receiver::ReceiverError> {
         if index == self.active {
             return Ok(());
         }
         let mode = crate::mode::mode_at(index);
         let bw = mode.default_bandwidth_hz();
-        // Lazily build this mode's demod once (first switch to it); `None` is
-        // only ever reached for a slot that was never built, so `make_demod`
-        // runs at most once per entry — repeated toggles cost no heap.
         let cfg = self.vrx.config();
         let incoming = match self.pool[index].take() {
             Some(d) => d,
@@ -154,13 +117,12 @@ impl Rx {
         Ok(())
     }
 
-    /// The index the *running* demodulator is (into `crate::mode::MODES`).
+    /// Running index into `crate::mode::MODES`.
     pub fn mode_index(&self) -> usize {
         self.active
     }
 
-    /// The virtual receiver's current demod mode (the one at `mode_index()`
-    /// — `MODES[0]` = USB at boot, the most recent [`set_mode`] after that).
+    /// The virtual receiver's current demod mode.
     pub fn mode(&self) -> Mode {
         crate::mode::mode_at(self.active)
     }
@@ -200,10 +162,10 @@ impl Rx {
             for rx in chunk.per_rx.iter().take(1) {
                 for c in rx.iter() {
                     let seq_before = pipeline.frame_seq();
-                    let t0 = DWT::cycle_count();
+                    let t0 = cycle_count();
                     // Waterfall spectrum (unchanged path).
                     pipeline.push(c.re, c.im);
-                    let t1 = DWT::cycle_count();
+                    let t1 = cycle_count();
                     let delta = u64::from(t1.wrapping_sub(t0));
                     if pipeline.frame_seq() != seq_before {
                         self.fft_cycles += delta;
@@ -211,17 +173,16 @@ impl Rx {
                         self.demod_cycles += delta;
                     }
                     pushed += 1;
-                    // …and the virtual USB-SSB receiver (offset 0), accumulated
-                    // per chunk and fed below.
+                    // Accumulate RX1 samples for demodulation below.
                     self.iq_acc.push(*c);
                 }
             }
             // Drive the virtual receiver with this chunk's I/Q (its audio is
             // pushed to the I2S sink; the S-meter itself reads the spectrum,
             // not this demod output).
-            let vr0 = DWT::cycle_count();
+            let vr0 = cycle_count();
             let _ = self.vrx.process(&self.iq_acc);
-            self.demod_cycles += u64::from(DWT::cycle_count().wrapping_sub(vr0));
+            self.demod_cycles += u64::from(cycle_count().wrapping_sub(vr0));
         }
         pushed
     }
@@ -328,18 +289,60 @@ mod tests {
     }
 
     #[test]
+    fn mode_pool_reuses_demodulators_across_full_cycles() {
+        let mut rx = Rx::new();
+        let mut pointers = [None; mode_len()];
+        assert!(rx.pool.iter().all(Option::is_none));
+        for _ in 0..3 {
+            for step in 1..=mode_len() {
+                let previous = rx.mode_index();
+                let index = step % mode_len();
+                rx.set_mode(index).unwrap();
+                rx.set_mode(index).unwrap();
+                let retired =
+                    rx.pool[previous].as_deref().unwrap() as *const dyn Demodulator as *const ();
+                if let Some(expected) = pointers[previous] {
+                    assert_eq!(retired, expected);
+                } else {
+                    pointers[previous] = Some(retired);
+                }
+                assert!(rx.pool[index].is_none());
+                assert_eq!(rx.mode_index(), index);
+                let mode = crate::mode::mode_at(index);
+                assert_eq!(rx.mode(), mode);
+                let cfg = rx.vrx.config();
+                assert_eq!(cfg.mode, mode);
+                assert_eq!(cfg.bandwidth(), mode.default_bandwidth_hz());
+                assert_eq!(cfg.source_rate_hz, 96_000);
+                assert_eq!(cfg.source_center_hz, 0.0);
+                assert_eq!(cfg.audio.rate_hz, 4_800);
+                assert_eq!(cfg.audio.gain_db, 0.0);
+                assert!(cfg.tap.is_none());
+            }
+            assert_eq!(rx.mode_index(), 0);
+            assert_eq!(
+                rx.pool.iter().filter(|slot| slot.is_some()).count(),
+                mode_len() - 1
+            );
+        }
+    }
+
+    #[test]
     fn feed_matches_direct_pipeline_across_windows() {
         let mut rx = Rx::new();
         let mut received = Pipeline::new().unwrap();
         let mut direct = Pipeline::new().unwrap();
         let mut sample = 0;
-        // A low-amplitude, exactly representable quarter-rate complex tone.
+        // Integer I/Q for a coherent 6 kHz tone inside the 24 kHz view.
         // Comparing rows catches scaling, I/Q order, and dropped chunks.
+        let sine = [
+            0, 392, 724, 946, 1024, 946, 724, 392, 0, -392, -724, -946, -1024, -946, -724, -392,
+        ];
         for _ in 0..34 {
             let mut buf = make_frame(ENDPOINT_DATA_TX);
             for off in [HEADER_SIZE, HEADER_SIZE + CHUNK_SIZE] {
                 for r in 0..63 {
-                    let (re, im) = [(1024, 0), (0, 1024), (-1024, 0), (0, -1024)][sample % 4];
+                    let (re, im) = (sine[(sample + 4) % 16], sine[sample % 16]);
                     sample += 1;
                     let base = off + EP6_SYNC_LEN + 5 + r * 8;
                     put_24be(&mut buf, base, re);

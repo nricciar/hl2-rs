@@ -1296,73 +1296,45 @@ BasebandSource               Demodulator                      AudioSink
   `FmCore::new(…, "fm"|"nfm").demodulator(…)` in
   [`make_demod_tap`](hl2/src/receiver/demod/mod.rs:167).
 
-### 16.3e S-meter (mode-aware)
+### 16.3e S-meter and Teensy controls
 
-   The S-meter reads **signal over band-noise** — *not* the demod output —
-   from the *displayed* spectrum (`mags`, the same row the waterfall shows).
-   The canonical implementation is the server-side
-   [`compute_s_meter`](api/src/meter.rs:233) /
-   [`PassbandShape`](api/src/meter.rs:157) (`api/src/meter.rs:18`), and the
-   `no_std` port is
-   [`smeter::compute_for_mode`](teensy/src/smeter.rs:146). The two share one
-   method and one invariant:
+The server's `compute_s_meter` ([api/src/meter.rs](api/src/meter.rs)) and
+Teensy's `compute_for_mode` ([teensy/src/smeter.rs](teensy/src/smeter.rs))
+compare passband RMS magnitude with a display-wide noise percentile. The
+Teensy maps the nonnegative dB margin to S0..S9, with S1 at 6 dB and 6 dB
+per additional unit. This is a relative display estimate, not calibrated
+RF strength.
 
-   * **level** = the **RMS** spectral energy over the running receiver's
-     channel-select passband (smeter.rs:179 / meter.rs:258) — the window's
-     *average power*, not a peak bin. Measuring energy (not the carrier line)
-     is what lets an AM DC carrier blend with its audio-sidebands so the
-     reading follows the *modulation* rather than latching onto the carrier.
-   * **floor** = a robust *band-noise* estimate over the whole display
-     (smeter.rs:204 / meter.rs:283): a single passband peak sits in a
-     handful of the `n` bins, so a low percentile lands on the noise
-     regardless of where the signal is.
-   * **margin** = `level − floor`, mapped to an **S0..S9** index via
-     [`margin_to_sunits`](teensy/src/smeter.rs:104) — S1 at
-     [`S1_DB_OVER_FLOOR`](teensy/src/smeter.rs:57) (6 dB over floor),
-     [`DB_PER_UNIT`](teensy/src/smeter.rs:59) (6 dB) per step, clamped at
-     S9. Both constants are the calibration knobs once LNA / sensitivity is
-     nailed down.
+The passband follows `Mode::sideband` and `Mode::default_bandwidth_hz`:
+USB lies right of the NCO, LSB left, and AM/FM/NFM extend to both sides.
+`smeter::passband_columns` supplies the same clipped bounds to the
+waterfall overlay. The Teensy display spans 24 kHz at 75 Hz/column;
+FM's +/-15 kHz passband therefore extends beyond the visible measurement.
+DC removal suppresses a carrier exactly at the NCO. Zoom, max-pooling,
+and magnitude saturation also affect the reading.
 
-   **Passband orientation** is mode-dependent and is the *single* source of
-   truth in the running receiver's channel-select:
+The Teensy floor is the exact 25th percentile (zero-based rank `n * 25 / 100`).
+Two radix passes reuse a 256-counter histogram to select its high and low
+bytes without allocation or sorting. See `smeter::compute_for_mode`.
 
-   ```text
-   Upper    (USB, and the digital FT8/FT4/JS8 modes) → [c, c + w]
-   Lower    (LSB)                                       → [c − w, c]
-   Centered (AM / FM / NFM — both sidebands)            → [c − w, c + w]
-   ```
+The encoder uses p28 (GPIO3_IO18) and p29 (GPIO4_IO31), tuning RX1 by
+25 Hz per quadrature edge. Its hardware-debounced button on p30
+(GPIO3_IO23) shares GPIO3's upper-half interrupt with p28 and requests a
+mode change. RTIC owns the interrupt priorities. See
+[teensy/src/encoder/mod.rs](teensy/src/encoder/mod.rs).
 
-   `smeter::compute_for_mode` resolves the shape from
-   `crate::mode::MODES[index]` (sideband via
-   `Mode::sideband`, width via `Mode::default_bandwidth_hz`, smeter.rs:154–165);
-   the server side uses [`shape_for_mode`](api/src/meter.rs:195). Passing the
-   wrong orientation is what used to make USB and LSB read identically (the
-   meter latched onto the *other* sideband's carrier, which the receiver
-   never passes).
+`mode::MODES` orders the cycle as USB, LSB, AM, FM, NFM. `Rx::set_mode`
+([teensy/src/radio/rx.rs](teensy/src/radio/rx.rs)) builds each demodulator
+once and retains it for allocation-free reuse; the audio sink is unchanged.
+The radio task publishes the mode only after a successful switch.
+`VirtualReceiver::set_mode` preserves bandwidth overrides and raw taps;
+`swap_demod` records the supplied demodulator's mode and bandwidth.
+See [hl2/src/receiver/mod.rs](hl2/src/receiver/mod.rs).
 
-   **Teensy floor estimate.** The 192 KiB ITCM budget can't afford the
-   server's sort (`mags.to_vec(); sort_unstable`, meter.rs:284 — and its
-   `select_nth_unstable_by` closure variant). `smeter` instead runs a
-   single-pass **256-bucket u8 histogram** over the whole `u16` range
-   (smeter.rs:205) and reports the *bucket centre* as the floor. A bucket is
-   256 magnitude-wide, quantising the floor by ≤ ~3.5 dB *only ever in the
-   direction of inflating the margin* (it stays under the 6-dB S1 threshold),
-   so the user-visible S-unit read is unchanged. No scratch copy, no sort,
-   no allocation.
-
-   **Mode cycle (Teensy).** The `crate::mode::MODES` const
-   (`teensy/src/mode.rs:33`) is the ordered list `[USB, LSB, AM, FM, NFM]`
-   (index 0 = USB, the default). The encoder's physical push button
-   (`PIN 30` → `GPIO3_IO23`, falling-edge ISR,
-   `teensy/src/encoder/mod.rs:270`) latches a pending mode toggle that the
-   radio task drains; each press advances the shared
-   [`RX1_MODE_INDEX`](teensy/src/shared.rs:197) (`next_rx1_mode`,
-   `shared.rs:214`), which both the render task (label) and the S-meter
-   (window) read. The mode is also a **runtime demod switch**:
-   [`Rx::set_mode`](teensy/src/radio/rx.rs) builds the requested
-   `Demodulator` on first use (lazy pool — each mode's demod is created once
-   and reused) and swaps it into the pipeline, so the active USB RX1
-   receiver re-demodulates in the selected mode.
+The render task retains undecorated waterfall history and composites the
+current NCO/passband into DMA staging, so a mode change repaints the whole
+overlay without accumulating tint. See `overlay::pixel` and
+`Dma::draw_pixels` in [teensy/src/display](teensy/src/display).
 
 ### 16.4 Sinks
 
