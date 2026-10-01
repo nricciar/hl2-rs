@@ -21,6 +21,11 @@ pub const STATE_STARTING: u32 = 3;
 pub const STATE_TUNING: u32 = 4;
 pub const STATE_STREAMING: u32 = 5;
 pub const STATE_ERROR: u32 = 6;
+/// Direct-connection mode: the Teensy is up and acting as a bare-bones DHCP
+/// server, handing out the next client IP from its pool to any Hermes Lite 2
+/// (or other device) that sends a DHCP discover/request. Set on button press
+/// while waiting for an IP, cleared when the first lease is handed out.
+pub const STATE_DHCP_SERVER: u32 = 7;
 
 static SNAPSHOT: Mutex<RefCell<(u32, [u16; BINS])>> = Mutex::new(RefCell::new((0, [0; BINS])));
 

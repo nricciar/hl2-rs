@@ -560,6 +560,7 @@ mod app {
         );
 
         let mut wait_iter: u32 = 0;
+        let mut got_peer_from_dhcp = false;
         loop {
             wait_iter += 1;
             // Diagnostic: count the loop iterations so we can tell "loop
@@ -586,122 +587,165 @@ mod app {
                     Err(e) => log::error!("link check: {e}"),
                 }
             }
-            if link_up && ms_since(last_dhcp, now_c) >= 500 {
-                last_dhcp = now_c;
-                handle.set_now(smoltcp::time::Instant::from_millis(now_millis()));
-                let _configured = handle.poll_dhcp();
-                poll_log();
+            // ─── Direct-connection path: button arms the bare-bones DHCP
+            // server. The encoder's button pin is reused for this; we drain
+            // one request per iteration, so repeated presses are ignored
+            // until the pending_dhcp flag is cleared by `handle_dhcp`.
+            if link_up && !handle.dhcp_server_active() && !got_peer_from_dhcp {
+                if encoder::take_mode_request() {
+                    handle.activate_dhcp_server();
+                    shared::set_state(shared::STATE_DHCP_SERVER);
+                    log::info!(
+                        "Button pressed: DHCP server armed, our IP = {}",
+                        radio::control::OUR_IP
+                    );
+                }
             }
-            if handle.is_configured() {
-                if let Some(ip) = handle.our_ip() {
-                    log::info!("IP acquired: {ip}");
+            // Drain one DHCP request if the server is armed. `handle_dhcp`
+            // consumes the first valid DISCOVER/REQUEST, allocates the next
+            // lease, and clears the pending flag. Returns the peer IP if we
+            // responded.
+            if handle.dhcp_server_active() {
+                handle.set_now(smoltcp::time::Instant::from_millis(now_millis()));
+                if let Some(peer_ip) = handle.handle_dhcp() {
+                    log::info!("HL2 acquired {peer_ip} via DHCP server; skipping discovery");
+                    handle.set_peer(peer_ip);
+                    shared::set_peer(peer_ip);
+                    got_peer_from_dhcp = true;
                     break;
+                }
+            }
+            // ─── Normal path: DHCP client (external network) ─────────────
+            // Skipped while the DHCP server is armed (we installed our static
+            // IP, which would make `is_configured()` true but leave us with no
+            // peer yet — the server path's `handle_dhcp` break is authoritative).
+            if !got_peer_from_dhcp && !handle.dhcp_server_active() {
+                if link_up && ms_since(last_dhcp, now_c) >= 500 {
+                    last_dhcp = now_c;
+                    handle.set_now(smoltcp::time::Instant::from_millis(now_millis()));
+                    let _configured = handle.poll_dhcp();
+                    poll_log();
+                }
+                if handle.is_configured() {
+                    if let Some(ip) = handle.our_ip() {
+                        log::info!("IP acquired (DHCP client): {ip}");
+                        break;
+                    }
                 }
             }
             Systick::delay(10.millis()).await;
             poll_log();
         }
 
-        // 5. Discovery (500 ms cadence until a valid reply).
-        shared::set_state(shared::STATE_DISCOVERING);
-        let mut last_disc = cycles_now();
-        // Liveness diagnostics: the discovery loop is silent by design (it
-        // only logs when it *receives* a reply), so "broadcasting forever"
-        // looks identical to "hung in a sync call" from the USB log alone.
-        // These counters + the render-task tick echo a heartbeat at ~2 Hz
-        // that tells us which:
-        //   * iter grows, sent grows, rc flat, rtk grows  → alive, waiting
-        //                                                       for HL2 reply
-        //   * iter grows, sent flat                        → 500 ms gate not
-        //                                                     firing (clock?)
-        //   * iter flat / rtk flat                         → scheduler or
-        //                                                     render starved
-        let mut disc_iter: u32 = 0;
-        let mut disc_sent: u32 = 0;
-        let mut disc_recv: u32 = 0;
-        let mut disc_last_hb = cycles_now();
-        'discovery: loop {
-            disc_iter += 1;
-            handle.set_now(smoltcp::time::Instant::from_millis(now_millis()));
-            handle.pump();
-            let mut dgram = [0u8; hl2::protocol::DISCOVERY_RESPONSE_SIZE + 16];
-            // Drain until empty; a valid reply ends the loop.
-            while let Some((n, src)) = handle.recv(&mut dgram) {
-                disc_recv += 1;
-                if n >= hl2::protocol::DISCOVERY_RESPONSE_SIZE {
-                    if let Some(info) = handle.try_discovery(&dgram[..n]) {
-                        // Discovery's stored IP can differ from its current DHCP lease.
-                        let ip = src;
-                        log::info!(
-                            "HL2 FOUND ip={} mac={:02x?} rx={} 16bit={} sending={}",
-                            ip,
-                            info.mac,
-                            info.rx_count,
-                            info.sample_16bit,
-                            info.is_sending,
-                        );
-                        handle.set_peer(ip);
-                        shared::set_peer(ip);
-                        break 'discovery;
+        // A button press latched in the small window between the last
+        // `take_mode_request` check and the `break` would otherwise leak into
+        // the streaming loop as an accidental mode-cycle. Drain it now.
+        let _ = encoder::take_mode_request();
+
+        // 5. Discovery (500 ms cadence until a valid reply) — skipped when
+        // the peer learned its address from our DHCP server (no need to
+        // broadcast; we already know where it is).
+        let did_discovery = !got_peer_from_dhcp;
+        if did_discovery {
+            let mut last_disc = cycles_now();
+            // Liveness diagnostics: the discovery loop is silent by design (it
+            // only logs when it *receives* a reply), so "broadcasting forever"
+            // looks identical to "hung in a sync call" from the USB log alone.
+            // These counters + the render-task tick echo a heartbeat at ~2 Hz
+            // that tells us which:
+            //   * iter grows, sent grows, rc flat, rtk grows  → alive, waiting
+            //                                                       for HL2 reply
+            //   * iter grows, sent flat                        → 500 ms gate not
+            //                                                     firing (clock?)
+            //   * iter flat / rtk flat                         → scheduler or
+            //                                                     render starved
+            let mut disc_iter: u32 = 0;
+            let mut disc_sent: u32 = 0;
+            let mut disc_recv: u32 = 0;
+            let mut disc_last_hb = cycles_now();
+            'discovery: loop {
+                disc_iter += 1;
+                handle.set_now(smoltcp::time::Instant::from_millis(now_millis()));
+                handle.pump();
+                let mut dgram = [0u8; hl2::protocol::DISCOVERY_RESPONSE_SIZE + 16];
+                // Drain until empty; a valid reply ends the loop.
+                while let Some((n, src)) = handle.recv(&mut dgram) {
+                    disc_recv += 1;
+                    if n >= hl2::protocol::DISCOVERY_RESPONSE_SIZE {
+                        if let Some(info) = handle.try_discovery(&dgram[..n]) {
+                            // Discovery's stored IP can differ from its current DHCP lease.
+                            let ip = src;
+                            log::info!(
+                                "HL2 FOUND ip={} mac={:02x?} rx={} 16bit={} sending={}",
+                                ip,
+                                info.mac,
+                                info.rx_count,
+                                info.sample_16bit,
+                                info.is_sending,
+                            );
+                            handle.set_peer(ip);
+                            shared::set_peer(ip);
+                            break 'discovery;
+                        }
                     }
+                    log::info!("discovery: {n} B from {src}; not HL2");
                 }
-                log::info!("discovery: {n} B from {src}; not HL2");
+                let now_c = cycles_now();
+                if ms_since(last_disc, now_c) >= 500 {
+                    last_disc = now_c;
+                    disc_sent += 1;
+                    handle.send_discovery();
+                }
+                // ~2 Hz liveness heartbeat (see the counters declared above).
+                // Also carries the audio path state:
+                //   aud_wr = demod `Sink::write` calls so far (0 → no demod
+                //            output; > 0 → virtual receiver is producing)
+                //   in     = `process_chunk` calls = eDMA transfers attempted
+                //   done   = `process_chunk` calls that *completed* (the eDMA
+                //            IRQ fired and imxrt-dma reported success)
+                //   in-flight = in - done (should be ≤ 1: one single in-flight
+                //             in the single-channel DMA; > 1 = eDMA hung)
+                //   tcsr   = SAI TCSR status after the last DMA (bits: 0x800
+                //            = FIFO_REQUEST, 0x1000 = FIFO_WARNING, 0x2000
+                //            = FIFO_ERROR,   0x4000 = SYNC_ERROR,  0x8000 =
+                //            WORD_START). A slave SAI that is clocking should
+                //            show FIFO_REQUEST or FIFO_WARNING. A slave SAI
+                //            that is not clocking can show all-clear (FIFO
+                //            never filled enough to warn) or FIFO_ERROR
+                //            (underrun — the SAI tried to shift with an empty
+                //            FIFO).
+                //   wfp/rfp = SAI TX FIFO write / read positions at the instant
+                //            of the last DMA completion (32=full). wfp=32 rfp=0
+                //            = data is *in* the FIFO but not shifting; wfp≈rfp
+                //            = steady drain (chain is healthy end-to-end).
+                //   chunk_ms = wall milliseconds for the last completed eDMA
+                //            transfer (~20 ms = 1920 TDR words ÷ 48 kHz wire
+                //            rate; > 20 ms = SAI isn't shifting fast enough,
+                //            < 20 ms = it IS clocking and the eDMA just runs
+                //            at source rate).
+                if ms_since(disc_last_hb, cycles_now()) >= 500 {
+                    disc_last_hb = cycles_now();
+                    let in_c = hl2_teensy::audio::sink::chunks_entered() as u32;
+                    let done_c = hl2_teensy::audio::sink::chunks_completed() as u32;
+                    log::info!(
+                        "disc iter={} sent={} rec={} rtk={} | aud={} in={} done={} unfinished={} | sai_tcsr={:x} wfp={} rfp={} ms={}",
+                        disc_iter,
+                        disc_sent,
+                        disc_recv,
+                        shared::render_ticks(),
+                        shared::audio_writes(),
+                        in_c,
+                        done_c,
+                        in_c.saturating_sub(done_c),
+                        shared::sai_tcsr(),
+                        (shared::sai_tfr() >> 16) as u32,
+                        (shared::sai_tfr() & 0xFFFF) as u32,
+                        shared::sai_chunk_ms(),
+                    );
+                }
+                Systick::delay(5.millis()).await;
+                poll_log();
             }
-            let now_c = cycles_now();
-            if ms_since(last_disc, now_c) >= 500 {
-                last_disc = now_c;
-                disc_sent += 1;
-                handle.send_discovery();
-            }
-            // ~2 Hz liveness heartbeat (see the counters declared above).
-            // Also carries the audio path state:
-            //   aud_wr = demod `Sink::write` calls so far (0 → no demod
-            //            output; > 0 → virtual receiver is producing)
-            //   in     = `process_chunk` calls = eDMA transfers attempted
-            //   done   = `process_chunk` calls that *completed* (the eDMA
-            //            IRQ fired and imxrt-dma reported success)
-            //   in-flight = in - done (should be ≤ 1: one single in-flight
-            //             in the single-channel DMA; > 1 = eDMA hung)
-            //   tcsr   = SAI TCSR status after the last DMA (bits: 0x800
-            //            = FIFO_REQUEST, 0x1000 = FIFO_WARNING, 0x2000
-            //            = FIFO_ERROR,   0x4000 = SYNC_ERROR,  0x8000 =
-            //            WORD_START). A slave SAI that is clocking should
-            //            show FIFO_REQUEST or FIFO_WARNING. A slave SAI
-            //            that is not clocking can show all-clear (FIFO
-            //            never filled enough to warn) or FIFO_ERROR
-            //            (underrun — the SAI tried to shift with an empty
-            //            FIFO).
-            //   wfp/rfp = SAI TX FIFO write / read positions at the instant
-            //            of the last DMA completion (32=full). wfp=32 rfp=0
-            //            = data is *in* the FIFO but not shifting; wfp≈rfp
-            //            = steady drain (chain is healthy end-to-end).
-            //   chunk_ms = wall milliseconds for the last completed eDMA
-            //            transfer (~20 ms = 1920 TDR words ÷ 48 kHz wire
-            //            rate; > 20 ms = SAI isn't shifting fast enough,
-            //            < 20 ms = it IS clocking and the eDMA just runs
-            //            at source rate).
-            if ms_since(disc_last_hb, cycles_now()) >= 500 {
-                disc_last_hb = cycles_now();
-                let in_c = hl2_teensy::audio::sink::chunks_entered() as u32;
-                let done_c = hl2_teensy::audio::sink::chunks_completed() as u32;
-                log::info!(
-                    "disc iter={} sent={} rec={} rtk={} | aud={} in={} done={} unfinished={} | sai_tcsr={:x} wfp={} rfp={} ms={}",
-                    disc_iter,
-                    disc_sent,
-                    disc_recv,
-                    shared::render_ticks(),
-                    shared::audio_writes(),
-                    in_c,
-                    done_c,
-                    in_c.saturating_sub(done_c),
-                    shared::sai_tcsr(),
-                    (shared::sai_tfr() >> 16) as u32,
-                    (shared::sai_tfr() & 0xFFFF) as u32,
-                    shared::sai_chunk_ms(),
-                );
-            }
-            Systick::delay(5.millis()).await;
-            poll_log();
         }
 
         // 6. START.
@@ -1035,6 +1079,7 @@ mod app {
             shared::STATE_STARTING => "STARTING",
             shared::STATE_TUNING => "TUNING",
             shared::STATE_STREAMING => "STREAMING",
+            shared::STATE_DHCP_SERVER => "DHCP SRV",
             shared::STATE_ERROR => "ERROR",
             _ => "?",
         };
