@@ -33,9 +33,7 @@ use static_cell::ConstStaticCell;
 
 use hl2::protocol::discovery::{DiscoveryInfo, discovery_request};
 use hl2::protocol::session::Session;
-use hl2::protocol::{
-    C1_SPEED_96K, DATA_PACKET_SIZE, DEFAULT_LNA_GAIN_DB, HL2_PORT, OC_MASK_RX, START_REQUEST_SIZE,
-};
+use hl2::protocol::{C1_SPEED_96K, DATA_PACKET_SIZE, HL2_PORT, OC_MASK_RX, START_REQUEST_SIZE};
 
 /// OC filter bank relay mask.
 /// LSB-first: bit 0 = relay 1 … bit 6 = relay 7 (see `hl2::protocol::OC_MASK_RX`).
@@ -76,8 +74,8 @@ const HL2_SLOTS: usize = 8;
 /// link, IP and UDP headers are not part of this payload buffer.
 const HL2_SLOT: usize = 1280;
 
-static SOCKET_STORAGE: ConstStaticCell<[smoltcp::iface::SocketStorage<'static>; 2]> =
-    ConstStaticCell::new([smoltcp::iface::SocketStorage::EMPTY; 2]);
+static SOCKET_STORAGE: ConstStaticCell<[smoltcp::iface::SocketStorage<'static>; 3]> =
+    ConstStaticCell::new([smoltcp::iface::SocketStorage::EMPTY; 3]);
 static UDP_RX_META: ConstStaticCell<[udp::PacketMetadata; HL2_SLOTS]> =
     ConstStaticCell::new([udp::PacketMetadata::EMPTY; HL2_SLOTS]);
 static UDP_TX_META: ConstStaticCell<[udp::PacketMetadata; HL2_SLOTS]> =
@@ -87,6 +85,137 @@ static UDP_RX: ConstStaticCell<[u8; HL2_SLOTS * HL2_SLOT]> =
 static UDP_TX: ConstStaticCell<[u8; HL2_SLOTS * HL2_SLOT]> =
     ConstStaticCell::new([0; HL2_SLOTS * HL2_SLOT]);
 
+/// ── Bare-bones DHCP server (direct-connection, no real network) ────────────
+///
+/// Primary use case: the Teensy and a single Hermes Lite 2 wired straight
+/// together with no router/DHCP behind it. The HL2's own DHCP client will
+/// broadcast a DISCOVER/REQUEST; we answer by handing out the next address
+/// from a fixed pool. Deliberately dumb — no lease tracking, no renewals, no
+/// DNS, no routing: just enough for the two radios to talk.
+///
+///   Teensy        192.168.1.1   (gateway / DHCP server)
+///   leases        192.168.1.150 .. 192.168.1.(150+POOL_SIZE)  (auto-increment, wraps)
+///   subnet        192.168.1.0/24
+pub const OUR_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 1);
+pub const SUBNET_PREFIX_LEN: u8 = 24;
+pub const FIRST_LEASE: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 150);
+const DHCP_SERVER_PORT: u16 = 67;
+const DHCP_CLIENT_PORT: u16 = 68;
+/// DHCP option kinds we honour / emit.
+const OPT_SUBNET: u8 = 1;
+const OPT_ROUTER: u8 = 3;
+const OPT_LEASE_TIME: u8 = 51;
+const OPT_MSG_TYPE: u8 = 53;
+const OPT_SERVER_ID: u8 = 54;
+const DHCP_MAGIC: [u8; 4] = [0x63, 0x82, 0x53, 0x63];
+const MSG_REQUEST: u8 = 3;
+const MSG_ACK: u8 = 5;
+/// Grace timeout (ms) after arming the DHCP server: if the client never
+/// sends a REQUEST (i.e. it only DISCOVERs), treat the first granted
+/// address as final and proceed. Chosen long enough that a strict 4-way
+/// client's REQUEST — which follows its DISCOVER immediately — lands first,
+/// short enough that we don't stall the radio forever on a non-standard
+/// client that skips the REQUEST.
+const DHCP_SERVER_GRACE_MS: u64 = 8_000;
+
+/// Monotonic pointer into the lease pool. No bookkeeping beyond this single
+/// counter: the next address is always `192.168.1.(150 + counter % POOL_SIZE)`.
+/// POOL_SIZE is kept ≤ 105 so `150 + offset` never wraps past the /24.
+const POOL_BASE_LAST: u8 = 150;
+const POOL_SIZE: u32 = 100;
+static DHCP_LEASE_OFFSET: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The next lease to hand out, then advance the pointer.
+fn next_lease() -> Ipv4Addr {
+    let off = DHCP_LEASE_OFFSET.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % POOL_SIZE;
+    Ipv4Addr::new(192, 168, 1, POOL_BASE_LAST.wrapping_add(off as u8))
+}
+
+/// Copy a DHCP option (`kind`, `len`, `data`) into `out` at offset `p`.
+fn emit_opt(out: &mut [u8], p: &mut usize, kind: u8, data: &[u8]) {
+    out[*p] = kind;
+    out[*p + 1] = data.len() as u8;
+    out.get_mut((*p + 2)..(*p + 2 + data.len()))
+        .unwrap()
+        .copy_from_slice(data);
+    *p += 2 + data.len();
+}
+
+/// Human name for a DHCP message type byte (option 53's single-byte value),
+/// for logging the type of each request we see.
+fn dhcp_msg_name(t: u8) -> &'static str {
+    match t {
+        1 => "DISCOVER",
+        2 => "OFFER",
+        3 => "REQUEST",
+        4 => "DECLINE",
+        5 => "ACK",
+        6 => "NAK",
+        7 => "RELEASE",
+        8 => "INFORM",
+        _ => "UNKNOWN",
+    }
+}
+
+/// Scan options in `buf` for the DHCP message type (option 53). Returns 0 if
+/// absent (logged as UNKNOWN; we ACK anyway).
+fn scan_dhcp_msg_type(buf: &[u8]) -> u8 {
+    if buf.len() < 241 {
+        return 0;
+    }
+    let mut i = 240usize;
+    while i + 1 < buf.len() {
+        match buf[i] {
+            0 => i += 1,
+            255 => break,
+            kind => {
+                if kind == OPT_MSG_TYPE {
+                    let l = buf[i + 1] as usize;
+                    if i + 2 + l <= buf.len() {
+                        return buf[i + 2];
+                    }
+                    break;
+                }
+                let l = buf[i + 1] as usize;
+                i += 2 + l;
+            }
+        }
+    }
+    0
+}
+
+/// Build a DHCP reply (BOOTREPLY: OFFER or ACK) in `out`, returning length.
+/// The client is pre-IP, so we set the broadcast flag (0x8000) and a non-zero
+/// `yiaddr`; smoltcp L2-broadcasts the frame, which the not-yet-configured
+/// HL2 must accept. `xid` and `chaddr` echo the client's request so it can
+/// match our reply to its own DISCOVER/REQUEST.
+fn build_dhcp_reply(
+    out: &mut [u8],
+    xid: u32,
+    chaddr: &[u8; 6],
+    yiaddr: Ipv4Addr,
+    msg_type: u8,
+) -> usize {
+    out.fill(0);
+    out[0] = 2; // op = BOOTREPLY
+    out[1] = 1; // htype = Ethernet
+    out[2] = 6; // hlen
+    out[4..8].copy_from_slice(&xid.to_be_bytes()); // xid @4
+    out[10] = 0x80; // flags = broadcast (0x8000) @10..12; low byte stays 0
+    out[16..20].copy_from_slice(&yiaddr.octets()); // yiaddr @16
+    out[20..24].copy_from_slice(&OUR_IP.octets()); // siaddr
+    out[28..34].copy_from_slice(chaddr); // chaddr
+    out[236..240].copy_from_slice(&DHCP_MAGIC); // magic
+    let mut o = 240;
+    emit_opt(out, &mut o, OPT_MSG_TYPE, &[msg_type]);
+    emit_opt(out, &mut o, OPT_SERVER_ID, &OUR_IP.octets());
+    emit_opt(out, &mut o, OPT_SUBNET, &[255, 255, 255, 0]);
+    emit_opt(out, &mut o, OPT_ROUTER, &OUR_IP.octets());
+    emit_opt(out, &mut o, OPT_LEASE_TIME, &3600u32.to_be_bytes());
+    out[o] = 255;
+    o + 1
+}
+
 /// Build the HL2 UDP socket, taking its separate RX/TX storage once.
 /// Panics if called a second time.
 pub fn make_udp_socket() -> udp::Socket<'static> {
@@ -94,6 +223,24 @@ pub fn make_udp_socket() -> udp::Socket<'static> {
     let tx = udp::PacketBuffer::new(&mut UDP_TX_META.take()[..], &mut UDP_TX.take()[..]);
     let mut s = udp::Socket::new(rx, tx);
     s.bind(IpListenEndpoint::from(LOCAL_PORT))
+        .expect("nonzero local port on a new socket");
+    s
+}
+
+/// DHCP-server socket storage (bound to port 67).
+static DHCP_RX_META: ConstStaticCell<[udp::PacketMetadata; 2]> =
+    ConstStaticCell::new([udp::PacketMetadata::EMPTY; 2]);
+static DHCP_TX_META: ConstStaticCell<[udp::PacketMetadata; 2]> =
+    ConstStaticCell::new([udp::PacketMetadata::EMPTY; 2]);
+static DHCP_RX: ConstStaticCell<[u8; 2 * 512]> = ConstStaticCell::new([0; 2 * 512]);
+static DHCP_TX: ConstStaticCell<[u8; 2 * 512]> = ConstStaticCell::new([0; 2 * 512]);
+
+/// Build the DHCP-server socket (bound to UDP port 67). Panics if called twice.
+pub fn make_dhcp_server_socket() -> udp::Socket<'static> {
+    let rx = udp::PacketBuffer::new(&mut DHCP_RX_META.take()[..], &mut DHCP_RX.take()[..]);
+    let tx = udp::PacketBuffer::new(&mut DHCP_TX_META.take()[..], &mut DHCP_TX.take()[..]);
+    let mut s = udp::Socket::new(rx, tx);
+    s.bind(IpListenEndpoint::from(DHCP_SERVER_PORT))
         .expect("nonzero local port on a new socket");
     s
 }
@@ -153,9 +300,13 @@ impl Radio {
 pub struct SocketHandles {
     pub dhcp: SocketHandle,
     pub hl2: SocketHandle,
+    /// Bare-bones DHCP server (bound to port 67), used in direct-connection
+    /// mode (button-activated while waiting for an IP).
+    pub dhcp_server: SocketHandle,
 }
 
-/// Build the smoltcp `Interface` + a two-socket `SocketSet` (DHCP + HL2 UDP).
+/// Build the smoltcp `Interface` + a three-socket `SocketSet`
+/// (DHCP client + HL2 UDP + DHCP server).
 ///
 /// Takes static socket storage once; panics if called a second time.
 pub fn build_iface_and_sockets(
@@ -167,7 +318,16 @@ pub fn build_iface_and_sockets(
     let mut set = SocketSet::new(&mut SOCKET_STORAGE.take()[..]);
     let dhcp = set.add(dhcpv4::Socket::new());
     let hl2 = set.add(make_udp_socket());
-    (iface, set, SocketHandles { dhcp, hl2 })
+    let dhcp_server = set.add(make_dhcp_server_socket());
+    (
+        iface,
+        set,
+        SocketHandles {
+            dhcp,
+            hl2,
+            dhcp_server,
+        },
+    )
 }
 
 /// `Radio` + the smoltcp surfaces the `radio` task needs to drive
@@ -184,6 +344,17 @@ pub struct RadioHandle<'a, D: smoltcp::phy::Device + ?Sized> {
     pub sockets: &'a mut SocketSet<'static>,
     pub handles: &'a SocketHandles,
     now: Instant,
+    /// True while the button-armed DHCP server is active (waiting to hand
+    /// our client its lease and confirm the client accepted it).
+    dhcp_server: bool,
+    /// The lease to hand out, allocated once at button-press and kept for
+    /// the whole DHCP exchange so DISCOVER and REQUEST both get the same IP.
+    lease: Option<Ipv4Addr>,
+    /// First time (smoltcp microseconds) we sent an ACK to the client.
+    /// The grace window is measured from this moment, so a non-standard
+    /// DISCOVER-only client gets `DHCP_SERVER_GRACE_MS` to configure before
+    /// we proceed to streaming.
+    first_ack_at: Option<i64>,
 }
 
 impl<'a, D: smoltcp::phy::Device + ?Sized> RadioHandle<'a, D> {
@@ -201,6 +372,9 @@ impl<'a, D: smoltcp::phy::Device + ?Sized> RadioHandle<'a, D> {
             sockets,
             handles,
             now: Instant::from_millis(0),
+            dhcp_server: false,
+            lease: None,
+            first_ack_at: None,
         }
     }
 
@@ -214,6 +388,131 @@ impl<'a, D: smoltcp::phy::Device + ?Sized> RadioHandle<'a, D> {
         self.iface
             .poll_ingress_single(self.now, self.dev, self.sockets);
         self.iface.poll_egress(self.now, self.dev, self.sockets);
+    }
+
+    /// Activate the bare-bones DHCP server: install our static `OUR_IP`,
+    /// allocate the (single) lease we'll hand out, and arm the flag so the
+    /// [`handle_dhcp`] drain keeps replying to the client until it's
+    /// configured (REQUEST ACKed, or the grace window elapsed).
+    pub fn activate_dhcp_server(&mut self) {
+        self.iface.update_ip_addrs(|addrs| {
+            addrs.clear();
+            let _ = addrs
+                .push(smoltcp::wire::IpCidr::new(
+                    IpAddress::Ipv4(OUR_IP),
+                    SUBNET_PREFIX_LEN,
+                ))
+                .map_err(|e| log::error!("activate dhcp: push {e}"));
+        });
+        self.dhcp_server = true;
+        self.lease = Some(next_lease());
+        self.first_ack_at = None;
+    }
+
+    /// True if the button was pressed and we are waiting to hand out a lease
+    /// (the server is armed, regardless of whether it has finished).
+    pub fn dhcp_server_active(&self) -> bool {
+        self.dhcp_server
+    }
+
+    /// The lease to hand out, allocated at arming and stable for the whole
+    /// DHCP exchange (so DISCOVER and REQUEST both get the same IP).
+    pub fn lease(&self) -> Option<Ipv4Addr> {
+        self.lease
+    }
+
+    /// Drain pending DHCP traffic on the server socket, replying ACK to every
+    /// valid DHCP packet the client sends. We reply with the *stable* lease
+    /// (allocated at arm time) so DISCOVER and REQUEST both get the same IP —
+    /// a strictly-conformant client binds to the server's reply and will send
+    /// a REQUEST for exactly that address, which we also ACK, completing its
+    /// configuration.
+    ///
+    /// Returns the lease IP once it's *safe to build on* — i.e. we have ACKed
+    /// the client's REQUEST (the RFC 2131 moment a client considers itself
+    /// configured), or the grace window has elapsed since our first ACK
+    /// (covers a non-standard client that only DISCOVERs and never REQUESTs).
+    /// `None` otherwise — the caller should keep polling.
+    pub fn handle_dhcp(&mut self) -> Option<Ipv4Addr> {
+        if !self.dhcp_server {
+            return None;
+        }
+        let Some(lease) = self.lease else {
+            return None;
+        };
+        // Ingress: let queued DHCP packets land on the server socket first.
+        self.pump();
+        // Drain DHCP packets, queuing an ACK reply for each. `send_slice` only
+        // enqueues the datagram into the UDP TX buffer — the Ethernet frame
+        // goes out on the *next* [`pump`], so we flush below after dropping
+        // the socket borrow (which would conflict with `pump`'s `&mut self`).
+        let mut chaddr = [0u8; 6];
+        let mut last_req_type: u8 = 0;
+        let mut is_request = false;
+        let mut saw_dhcp = false;
+        {
+            let s = self
+                .sockets
+                .get_mut::<udp::Socket>(self.handles.dhcp_server);
+            while s.can_recv() {
+                let mut buf = [0u8; 512];
+                let Ok((n, _meta)) = s.recv_slice(&mut buf) else {
+                    break;
+                };
+                let req = smoltcp::wire::DhcpPacket::new_unchecked(&buf[..n]);
+                if req.magic_number() != 0x63825363 {
+                    continue; // not a DHCP packet; keep draining
+                }
+                saw_dhcp = true;
+                last_req_type = scan_dhcp_msg_type(&buf[..n]);
+                let this_is_request = last_req_type == MSG_REQUEST;
+                let xid = req.transaction_id();
+                chaddr = req.client_hardware_address().0;
+                let mut out = [0u8; 300];
+                let len = build_dhcp_reply(&mut out, xid, &chaddr, lease, MSG_ACK);
+                let dst = IpEndpoint {
+                    addr: IpAddress::Ipv4(Ipv4Addr::BROADCAST),
+                    port: DHCP_CLIENT_PORT,
+                };
+                if let Err(e) = s.send_slice(&out[..len], dst) {
+                    log::error!("dhcp send: {e}");
+                }
+                // A REQUEST + ACK is the canonical "client is now configured"
+                // moment; stop here so the borrow is released before we return.
+                if this_is_request {
+                    is_request = true;
+                    break;
+                }
+            }
+        }
+        // Egress: flush the queued ACK reply onto the wire now that the
+        // socket borrow is gone.
+        self.pump();
+        if saw_dhcp {
+            if self.first_ack_at.is_none() {
+                self.first_ack_at = Some(self.now.total_micros());
+            }
+            log::info!(
+                "DHCP server: got {}, sent ACK → {lease} (client {chaddr:02x?})",
+                dhcp_msg_name(last_req_type)
+            );
+            if is_request {
+                return Some(lease);
+            }
+        }
+        // No REQUEST yet. If we've ACKed at least one packet and the grace
+        // window has elapsed since that first ACK, a DISCOVER-only client
+        // cannot configure any further — proceed.
+        if let Some(t0) = self.first_ack_at {
+            let elapsed_ms = (self.now.total_micros().wrapping_sub(t0) / 1_000) as u64;
+            if elapsed_ms >= DHCP_SERVER_GRACE_MS {
+                log::info!(
+                    "DHCP server: grace ({elapsed_ms} ms) elapsed without REQUEST; assuming {lease} is configured"
+                );
+                return Some(lease);
+            }
+        }
+        None
     }
 
     /// Poll the socket set for DHCP state transitions and return the
@@ -419,6 +718,46 @@ mod tests {
     /// `OC_RELAY` (currently relay 7 = 0x40) encodes to the C2 wire byte
     /// expected by `build_keepalive_packet`: bits 7:1 ← `oc_bits & 0x7F`,
     /// so 0x40 → (0x40 & 0x7F) << 1 = 0x80.
+    /// The DHCP reply's fixed header must land fields in their RFC 2131
+    /// offsets: op=BOOTREPLY, xid echoed, the *broadcast* flag at 10..12
+    /// (a not-yet-IP'd client can only be reached that way), yiaddr set, and
+    /// the magic cookie at 236..240. Also the message-type option (53) is the
+    /// first option and carries the reply type.
+    #[test]
+    fn build_dhcp_reply_layout() {
+        let mut out = [0u8; 300];
+        let chaddr = [0x02, 0x02, 0x02, 0x03, 0x03, 0x03];
+        let yi = Ipv4Addr::new(192, 168, 1, 150);
+        let len = build_dhcp_reply(&mut out, 0xdeadbeef, &chaddr, yi, MSG_ACK);
+        assert_eq!(out[0], 2); // op = BOOTREPLY
+        assert_eq!(out[4..8], 0xdeadbeef.to_be_bytes().as_slice()); // xid
+        assert_eq!(out[10], 0x80); // broadcast flag set (0x8000)
+        assert_eq!(out[11], 0x00);
+        assert_eq!(out[16..20], yi.octets().as_slice()); // yiaddr
+        assert_eq!(out[20..24], OUR_IP.octets().as_slice()); // siaddr
+        assert_eq!(out[28..34], chaddr.as_slice()); // chaddr
+        assert_eq!(out[236..240], DHCP_MAGIC.as_slice()); // magic
+        assert!((340..=len).contains(&len) || (240..=300).contains(&len));
+        // Options start at 240: first is the message type (53), value ACK (5).
+        assert_eq!(out[240], OPT_MSG_TYPE);
+        assert_eq!(out[241], 1);
+        assert_eq!(out[242], MSG_ACK);
+    }
+
+    /// The lease pool hands out consecutive, in-range octets and wraps within
+    /// the /24 (POOL_SIZE is capped so 150 + offset never exceeds 249).
+    #[test]
+    fn lease_pool_in_range_and_increments() {
+        let a = next_lease();
+        let b = next_lease();
+        assert_eq!(a.octets()[0], 192);
+        assert_eq!(a.octets()[1], 168);
+        assert_eq!(a.octets()[2], 1);
+        assert_eq!(b.octets()[3], a.octets()[3].wrapping_add(1));
+        assert!((150..=249).contains(&a.octets()[3]));
+        assert!((150..=249).contains(&b.octets()[3]));
+    }
+
     #[test]
     fn oc_relay_wire_value() {
         let mut radio = Radio::new();

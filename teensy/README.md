@@ -50,7 +50,9 @@ Audio Output
 
 ### Rotary Encoder
 
-Used for tuning and mode switching
+Used for tuning and mode switching. Before IP is assigned pressing Btn will activate
+static ip (192.168.1.1/24) as well as a simple dhcp server allowing a hermes lite
+radio to be directly connected without any special configuration.
 
 ```
 //   Encoder  Teensy 4
