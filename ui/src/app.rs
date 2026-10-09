@@ -199,6 +199,9 @@ struct Shared {
     /// `SharedState.tuning`. A missing slot = not yet tuned.
     tuning: RefCell<std::collections::BTreeMap<u8, u32>>,
     lna: RefCell<i8>,
+    /// Per-receiver DDC decode speed (Hz) — one of 48000 / 96000 / 192000 /
+    /// 384000, mirrored from `SharedState.speed_hz`.
+    speed_hz: RefCell<u32>,
     /// RX open-collector filter-bank relay mask (LSB-first: bit 0 = relay/F1 …
     /// bit 6 = relay/F7).
     oc_bits: RefCell<u8>,
@@ -279,6 +282,7 @@ impl Shared {
             history: RefCell::new(Vec::new()),
             tuning: RefCell::new(std::collections::BTreeMap::new()),
             lna: RefCell::new(6),
+            speed_hz: RefCell::new(hl2_common::SharedState::DEFAULT_SPEED_HZ),
             oc_bits: RefCell::new(0),
             floor: RefCell::new(-85.0),
             ceil: RefCell::new(-15.0),
@@ -387,6 +391,7 @@ impl Shared {
             }
 
             *sh.lna.borrow_mut() = resp.state.lna_gain_db;
+            *sh.speed_hz.borrow_mut() = resp.state.speed_hz;
             *sh.oc_bits.borrow_mut() = resp.state.oc_bits;
             // Mirror the per-slot NCO map so the frequency heading can show
             // the currently selected source's tune (see `freq_for`).
@@ -611,6 +616,17 @@ impl Shared {
 
     fn send_lna(sh: &Rc<Self>, gain_db: i8) {
         let msg = format!(r#"{{"id":5,"cmd":"setlnagain","data":{{"gain_db":{gain_db}}}}}"#);
+        if let Some(c) = sh.client.borrow().as_ref() {
+            let _ = c.send_text(&msg);
+        }
+    }
+
+    /// Set the per-receiver DDC decode speed on the radio (C1 SPEED). The
+    /// server tears down and re-spawns every live virtual receiver and
+    /// auto-decoder at the new rate, so this takes effect in the next
+    /// pipeline cycle — audio on unmuted slots dips briefly.
+    fn send_speed(sh: &Rc<Self>, speed_hz: u32) {
+        let msg = format!(r#"{{"id":16,"cmd":"setspeed","data":{{"speed_hz":{speed_hz}}}}}"#);
         if let Some(c) = sh.client.borrow().as_ref() {
             let _ = c.send_text(&msg);
         }
@@ -1431,6 +1447,7 @@ pub fn app() -> Html {
     let sh16 = sh.clone();
     let sh17 = sh.clone();
     let sh18 = sh.clone();
+    let sh30 = sh.clone();
     let sh19 = sh.clone();
     let sh21 = sh.clone();
     let sh29 = sh.clone();
@@ -1634,6 +1651,8 @@ pub fn app() -> Html {
     let lna_cur: i8 = *sh10.lna.borrow();
     // LNA slider fill position (−12…48 → 0…100 %) for the gradient track.
     let lna_pct = ((lna_cur as f32) + 12.0) / 60.0 * 100.0;
+    // Per-receiver DDC decode speed (Hz), mirrored from the server
+    let speed_cur: u32 = *sh10.speed_hz.borrow();
 
     // The EP4 (raw wideband) source tab — added after the last RX tab.
     let ep4_active = sh.spectrum_source.borrow().is_none();
@@ -1931,9 +1950,31 @@ pub fn app() -> Html {
                                           }
                                           sh10.notify();
                                       })}/>
-                                  <span class="lna-val">{format!("{:+} dB", lna_cur)}</span>
-                              </div>
-                          </div>
+                                   <span class="lna-val">{format!("{:+} dB", lna_cur)}</span>
+                               </div>
+                               <div class="fpanel-sep"></div>
+                               <div class="fpanel-block">
+                                   <span class="fpanel-label">{"DDC speed"}</span>
+                                   <select
+                                       aria-label="Per-receiver DDC decode speed"
+                                       value={speed_cur.to_string()}
+                                       onchange={Callback::from(move |e: web_sys::Event| {
+                                           if let Some(sel) = e.target_dyn_into::<HtmlSelectElement>() {
+                                               let v: u32 = sel.value().parse::<u32>().unwrap_or(192000);
+                                               *sh30.speed_hz.borrow_mut() = v;
+                                               if *sh30.started.borrow() {
+                                                   Shared::send_speed(&sh30, v);
+                                               }
+                                               sh30.notify();
+                                           }
+                                       })}>
+                                       <option value="48000">{"48 kHz"}</option>
+                                       <option value="96000">{"96 kHz"}</option>
+                                       <option value="192000">{"192 kHz"}</option>
+                                       <option value="384000">{"384 kHz"}</option>
+                                   </select>
+                               </div>
+                           </div>
 
                             // S-meter / SWR gauge — driven by the *virtual
                             // receiver's* signal level + noise floor, so it has

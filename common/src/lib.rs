@@ -76,6 +76,14 @@ pub struct SharedState {
     pub tuning: BTreeMap<u8, u32>,
     pub sample_format: SampleFormat,
     pub adc_sample_rate_hz: u32,
+    /// Per-receiver DDC decode speed, in Hz for the *full* C1 option value
+    /// (one of 48 000 / 96 000 / 192 000 / 384 000). This is the baseband
+    /// sample rate the radio is currently handing out on each EP6 per-slot
+    /// stream, and the `source_rate_hz` every virtual receiver / auto-decoder
+    /// rebuilds against. Reported back to the UI so the operator's speed
+    /// dropdown mirrors the live setting.
+    #[serde(default = "SharedState::default_speed_hz")]
+    pub speed_hz: u32,
     /// RX low-noise-amplifier gain, in dB (register range −12…+48).
     /// Reported back to clients so the UI can mirror the current setting.
     pub lna_gain_db: i8,
@@ -144,6 +152,12 @@ pub struct SharedState {
 }
 
 impl SharedState {
+    /// The default per-receiver DDC speed (192 kHz C1 SPEED).
+    pub const DEFAULT_SPEED_HZ: u32 = 192_000;
+    fn default_speed_hz() -> u32 {
+        Self::DEFAULT_SPEED_HZ
+    }
+
     pub fn new(rx_count: u8) -> Self {
         Self {
             started: false,
@@ -151,6 +165,7 @@ impl SharedState {
             tuning: BTreeMap::new(),
             sample_format: SampleFormat::Sample16,
             adc_sample_rate_hz: 76_800_000,
+            speed_hz: Self::DEFAULT_SPEED_HZ,
             lna_gain_db: 6,
             oc_bits: 0,
             spectrum_source: SpectrumSource::default(),
@@ -480,6 +495,13 @@ pub enum ClientCmd {
     /// Switch which stream feeds the panadapter/waterfall spectrum pipeline:
     /// `Ep4` (raw wideband) or `Ep6 { slot }` (per-slot baseband).
     SetSpectrumSource { source: SpectrumSource },
+    /// Set the per-receiver DDC decode speed (C1 SPEED): the baseband rate the
+    /// radio hands out on each per-slot EP6 stream. `speed_hz` is one of the
+    /// legal C1 option values in Hz (48 000 / 96 000 / 192 000 / 384 000); the
+    /// server snaps it to the nearest legal rate, re-asserts the C1 bits on the
+    /// keepalive, and rebuilds every active virtual receiver + auto-decoder
+    /// (their DSP is bound to the rate at spawn time).
+    SetSpeed { speed_hz: u32 },
     /// Create / update / destroy the virtual receiver for one RX slot
     /// (audio channel).
     SetVrx { cfg: Option<VrxCfg> },
@@ -686,6 +708,28 @@ mod tests {
         assert!(j.contains(r#""oc_bits":44"#), "got: {j}");
         let p: SharedState = serde_json::from_str(&j).unwrap();
         assert_eq!(p.oc_bits, 0b0101100);
+    }
+
+    #[test]
+    fn set_speed_cmd_shape() {
+        // The UI emits `{"id":N,"cmd":"setspeed","data":{"speed_hz":384000}}` —
+        // the inner-tag + content `ClientCmd::SetSpeed` must decode exactly that
+        // (wire name `setspeed`, `speed_hz` in the `data` object).
+        let c: ClientCmd =
+            serde_json::from_str(r#"{"cmd":"setspeed","data":{"speed_hz":384000}}"#).unwrap();
+        assert_eq!(c, ClientCmd::SetSpeed { speed_hz: 384_000 });
+
+        // And the shared-state field round-trips, defaulting to 192 kHz for
+        // older payloads that predate the field.
+        let s = SharedState::new(4);
+        assert_eq!(s.speed_hz, 192_000);
+        let j = serde_json::to_string(&s).unwrap();
+        assert!(j.contains(r#""speed_hz":192000"#), "got: {j}");
+        let p: SharedState = serde_json::from_str(&j).unwrap();
+        assert_eq!(p.speed_hz, 192_000);
+        let legacy = r#"{"started":true,"rx_count":4,"tuning":{},"sample_format":"sample16","adc_sample_rate_hz":76800000,"lna_gain_db":6,"oc_bits":0,"spectrum_source":"ep4","state_at":0}"#;
+        let p: SharedState = serde_json::from_str(legacy).unwrap();
+        assert_eq!(p.speed_hz, 192_000, "legacy payload defaults to 192 kHz");
     }
 
     #[test]

@@ -584,6 +584,30 @@ impl Hl2 {
         self.inner.session.lock().await.oc_bits() & crate::protocol::OC_MASK_RX
     }
 
+    /// Set the per-receiver DDC decode speed (C1 SPEED) at runtime.
+    ///
+    /// `c1_speed_hz` is the *requested* per-receiver DDC rate in Hz — the hub
+    /// passes the option value it wants (48 000 / 96 000 / 192 000 / 384
+    /// 000). It is snapped to the nearest legal C1 option (`speed_bits_for_khz`)
+    /// and stored in the session; the pump re-asserts the C1 bits in the
+    /// baseline chunk of **every** keepalive/C&C frame (see
+    /// `build_baseline_chunk` and the ~40 ms keepalive tick in
+    /// [`Hl2::run_loop`]), so the new rate takes effect on the next tick
+    /// without a Stop/Start. Downstream `VirtualReceiver`s / mode decoders
+    /// that bound a specific `source_rate_hz` must be rebuilt against the new
+    /// value — the hub does that.
+    pub async fn set_speed(&self, c1_speed_hz: u32) {
+        let bits = speed_bits_for_khz(c1_speed_hz / 1000);
+        let mut s = self.inner.session.lock().await;
+        s.set_c1_speed(bits);
+    }
+
+    /// The C1 SPEED bits this session currently drives frames with (one of
+    /// `crate::protocol::C1_SPEED_48K / _96K / _192K / _384K`).
+    pub async fn c1_speed_bits(&self) -> u8 {
+        self.inner.session.lock().await.c1_speed()
+    }
+
     /// The local port the hardware streams wideband data to.
     pub fn local_port(&self) -> u16 {
         self.inner.local_port

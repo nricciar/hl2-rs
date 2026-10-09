@@ -935,6 +935,24 @@ The owned `parse_receive_packet` output and wire layout are unchanged.
 The radio's **C1 SPEED option** (`48/96/192/384` kHz) is the **per-receiver**
 baseband rate.
 
+**WS control.** `ClientCmd::SetSpeed { speed_hz }` (wire name `setspeed`) →
+`RadioHub::set_speed_cmd`. The hub stores `speed_hz` in its own `Arc<AtomicU64>`
+(so new spawns + the spectrum span always agree), tells the radio via
+`Hl2::set_speed(c1_speed_hz → C1 SPEED bits)`, then tears down and re-spawns
+every live virtual receiver and auto-decoder at the new `source_rate_hz` (the
+full C1 option value — 48k→48000, 96k→96000, 192k→192000, 384k→384000 — is
+what the hub feeds as `source_rate_hz` to `spawn_vrx` / `spawn_auto`). The
+current value is mirrored back in `SharedState.speed_hz` and the UI exposes a
+"DDC speed" dropdown (48/96/192/384 kHz, default 192 kHz,
+`SharedState::DEFAULT_SPEED_HZ`). Changing the speed re-asserts the C1 SPEED
+bits in the 40 ms keepalive, so no Stop/Start is needed — but every live
+pipeline is rebuilt, so audio on unmuted slots dips briefly.
+→ `Hl2::set_speed` / `Hl2::c1_speed_bits` in `hl2/src/hl2.rs`;
+`Session::set_c1_speed` in `hl2/src/protocol/session.rs`;
+`speed_bits_for_khz` + `C1_SPEED_48K/96K/192K/384K` in
+`hl2/src/protocol/mod.rs`; `RadioHub::set_speed_cmd` + `hz_for_speed_bits`
+in `api/src/hub.rs`.
+
 #### Panadapter / waterfall frequency axis (hl2-api)
 
 The `hl2-api` spectrum pipeline (→ `api/src/hub.rs::run_spectral`) computes
