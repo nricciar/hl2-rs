@@ -76,12 +76,8 @@ pub struct SharedState {
     pub tuning: BTreeMap<u8, u32>,
     pub sample_format: SampleFormat,
     pub adc_sample_rate_hz: u32,
-    /// Per-receiver DDC decode speed, in Hz for the *full* C1 option value
-    /// (one of 48 000 / 96 000 / 192 000 / 384 000). This is the baseband
-    /// sample rate the radio is currently handing out on each EP6 per-slot
-    /// stream, and the `source_rate_hz` every virtual receiver / auto-decoder
-    /// rebuilds against. Reported back to the UI so the operator's speed
-    /// dropdown mirrors the live setting.
+    /// Per-receiver DDC rate in Hz (48 000 / 96 000 / 192 000 / 384 000):
+    /// the EP6 per-slot baseband rate the server runs (or will run) at.
     #[serde(default = "SharedState::default_speed_hz")]
     pub speed_hz: u32,
     /// RX low-noise-amplifier gain, in dB (register range −12…+48).
@@ -149,6 +145,15 @@ pub struct SharedState {
     /// carrier and `level − floor → 0`).
     #[serde(default)]
     pub vrx_floors: BTreeMap<u8, f64>,
+    /// Board temperature (°C) from the radio's status stream. `None` while
+    /// stopped or before the first reading.
+    #[serde(default)]
+    pub temperature_c: Option<f32>,
+    /// RF ADC overload events since this radio session started (monotonic,
+    /// wrapping; resets on Start). Clients compare counts to show "clipped
+    /// since X". Republished by the ~100 ms state heartbeat.
+    #[serde(default)]
+    pub adc_overload_events: u32,
 }
 
 impl SharedState {
@@ -176,6 +181,8 @@ impl SharedState {
             auto_monitors: BTreeMap::new(),
             vrx_levels: BTreeMap::new(),
             vrx_floors: BTreeMap::new(),
+            temperature_c: None,
+            adc_overload_events: 0,
         }
     }
 }
@@ -495,12 +502,8 @@ pub enum ClientCmd {
     /// Switch which stream feeds the panadapter/waterfall spectrum pipeline:
     /// `Ep4` (raw wideband) or `Ep6 { slot }` (per-slot baseband).
     SetSpectrumSource { source: SpectrumSource },
-    /// Set the per-receiver DDC decode speed (C1 SPEED): the baseband rate the
-    /// radio hands out on each per-slot EP6 stream. `speed_hz` is one of the
-    /// legal C1 option values in Hz (48 000 / 96 000 / 192 000 / 384 000); the
-    /// server snaps it to the nearest legal rate, re-asserts the C1 bits on the
-    /// keepalive, and rebuilds every active virtual receiver + auto-decoder
-    /// (their DSP is bound to the rate at spawn time).
+    /// Set the per-receiver DDC rate (C1 SPEED) in Hz; the server snaps it to
+    /// the nearest legal option. Accepted while stopped (used at next Start).
     SetSpeed { speed_hz: u32 },
     /// Create / update / destroy the virtual receiver for one RX slot
     /// (audio channel).

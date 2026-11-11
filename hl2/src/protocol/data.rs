@@ -504,8 +504,8 @@ pub enum Item {
 /// Parse a received 1032-byte data packet into its components.
 ///
 /// *   EP4 frames: `iq_samples` is populated.
-/// *   EP6 frames: either `chunk1_command` or `chunk2_command` may hold a
-///     `CommandData` (PTT / state / ACK).
+/// *   EP6 frames: `chunk1_command` / `chunk2_command` hold each chunk's
+///     C0–C4 response (status or ACK).
 #[derive(Debug)]
 pub struct ParsedPacket {
     pub header: DataHeader,
@@ -535,9 +535,10 @@ pub fn parse_receive_packet(buf: &[u8; DATA_PACKET_SIZE], n_recv: u8) -> Option<
         None
     };
 
-    // Command/ACK chunks only appear on EP2 (control). EP6 is the baseband
-    // data stream; parsing its C0s as commands would falsely trigger CmdAck.
-    let is_cc = header.endpoint == ENDPOINT_CONTROL;
+    // Every radio→host EP6 chunk starts with the 3×0x7F sync + C0–C4: a
+    // classic status response (ACK=0) or a reply to an RQST command (ACK=1).
+    // See PROTOCOL.md §9.
+    let is_cc = header.endpoint == ENDPOINT_DATA_TX;
     let chunk1_command = if is_cc {
         parse_chunk_command(&chunk1)
     } else {
@@ -606,8 +607,10 @@ pub fn parse_receive_packet_into<'a>(
         extract_iq_into_chunk(&chunk2, &mut iq[SAMPLES_PER_CHUNK..SAMPLES_PER_CHUNK * 2]);
     }
 
-    // Command/ACK chunks only appear on EP2 (control).
-    let is_cc = header.endpoint == ENDPOINT_CONTROL;
+    // Every radio→host EP6 chunk starts with the 3×0x7F sync + C0–C4: a
+    // classic status response (ACK=0) or a reply to an RQST command (ACK=1).
+    // See PROTOCOL.md §9.
+    let is_cc = header.endpoint == ENDPOINT_DATA_TX;
     let chunk1_command = if is_cc {
         parse_chunk_command(&chunk1)
     } else {
@@ -1193,6 +1196,43 @@ mod tests {
         // Only the second chunk remains.
         assert_eq!(out.len(), 1);
         assert!(!out[0].per_rx[0].is_empty());
+    }
+
+    /// Each EP6 chunk carries its own C0–C4 status, and both parse paths
+    /// surface them alongside the baseband samples.
+    #[test]
+    fn ep6_frame_carries_both_chunk_responses() {
+        use crate::protocol::ENDPOINT_DATA_TX;
+        let mut pkt = [0u8; DATA_PACKET_SIZE];
+        pkt[..4].copy_from_slice(&[0xEF, 0xFE, 0x01, ENDPOINT_DATA_TX]);
+        // chunk 1: classic RADDR 0x01 (temperature); chunk 2: RADDR 0x02.
+        for (off, c0, data) in [
+            (HEADER_SIZE, 0x01u8 << 3, 0x03ED_0123u32),
+            (HEADER_SIZE + CHUNK_SIZE, 0x02 << 3, 0x0456_0789),
+        ] {
+            pkt[off..off + 3].copy_from_slice(&[C_SYNC; 3]);
+            pkt[off + 3] = c0;
+            pkt[off + 4..off + 8].copy_from_slice(&data.to_be_bytes());
+        }
+
+        let owned = parse_receive_packet(&pkt, 1).unwrap();
+        let (mut iq, mut bb) = (Vec::new(), Vec::new());
+        let into = parse_receive_packet_into(&pkt, 1, &mut iq, &mut bb).unwrap();
+        for (c1, c2) in [
+            (owned.chunk1_command, owned.chunk2_command),
+            (into.chunk1_command, into.chunk2_command),
+        ] {
+            let (c1, c2) = (c1.unwrap(), c2.unwrap());
+            assert_eq!(
+                (c1.header.ack, c1.header.raddr, c1.data),
+                (false, 1, 0x03ED_0123)
+            );
+            assert_eq!(
+                (c2.header.ack, c2.header.raddr, c2.data),
+                (false, 2, 0x0456_0789)
+            );
+        }
+        assert_eq!(into.baseband.len(), 2);
     }
 
     #[test]
