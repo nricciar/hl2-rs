@@ -847,6 +847,21 @@ input[type=number]:disabled {
     text-align: right;
     white-space: nowrap;
 }
+/* Radio status readouts in the front panel (ADC overload badge, temp). */
+.hw-badge {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.06em;
+    padding: 0.1rem 0.45rem;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    background: transparent;
+    white-space: nowrap;
+    cursor: pointer;
+}
+.hw-badge.ok  { color: var(--ok);  border-color: rgba(76, 175, 125, 0.4); }
+.hw-badge.err { color: #fff; background: var(--err); border-color: var(--err); }
+.hw-warn { color: var(--warn); }
 .fstep-digit {
     position: relative;
     display: inline-flex;

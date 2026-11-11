@@ -4,6 +4,7 @@ pub mod command;
 pub mod data;
 pub mod discovery;
 pub mod session;
+pub mod status;
 
 /// Metis protocol marker bytes (frame type byte == 0x01).
 pub const METIS_MARKER: [u8; 2] = [0xEF, 0xFE];

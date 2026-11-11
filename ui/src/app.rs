@@ -199,6 +199,16 @@ struct Shared {
     /// `SharedState.tuning`. A missing slot = not yet tuned.
     tuning: RefCell<std::collections::BTreeMap<u8, u32>>,
     lna: RefCell<i8>,
+    /// Per-receiver DDC rate (Hz), mirrored from `SharedState.speed_hz`.
+    speed_hz: RefCell<u32>,
+    /// Board temperature (°C), mirrored from `SharedState`.
+    temperature_c: RefCell<Option<f32>>,
+    /// ADC overload events this radio session (`SharedState`), and the count
+    /// at the start of the operator's current "clip hold" window. The badge
+    /// shows `events − base`; clicking it or moving the LNA starts a new
+    /// window (see `reset_clip_hold`).
+    adc_overload_events: RefCell<u32>,
+    clip_base: RefCell<u32>,
     /// RX open-collector filter-bank relay mask (LSB-first: bit 0 = relay/F1 …
     /// bit 6 = relay/F7).
     oc_bits: RefCell<u8>,
@@ -279,6 +289,10 @@ impl Shared {
             history: RefCell::new(Vec::new()),
             tuning: RefCell::new(std::collections::BTreeMap::new()),
             lna: RefCell::new(6),
+            speed_hz: RefCell::new(hl2_common::SharedState::DEFAULT_SPEED_HZ),
+            temperature_c: RefCell::new(None),
+            adc_overload_events: RefCell::new(0),
+            clip_base: RefCell::new(0),
             oc_bits: RefCell::new(0),
             floor: RefCell::new(-85.0),
             ceil: RefCell::new(-15.0),
@@ -387,6 +401,14 @@ impl Shared {
             }
 
             *sh.lna.borrow_mut() = resp.state.lna_gain_db;
+            *sh.speed_hz.borrow_mut() = resp.state.speed_hz;
+            *sh.temperature_c.borrow_mut() = resp.state.temperature_c;
+            let events = resp.state.adc_overload_events;
+            if events < *sh.clip_base.borrow() {
+                // The count restarted (new radio session) — so does the window.
+                *sh.clip_base.borrow_mut() = 0;
+            }
+            *sh.adc_overload_events.borrow_mut() = events;
             *sh.oc_bits.borrow_mut() = resp.state.oc_bits;
             // Mirror the per-slot NCO map so the frequency heading can show
             // the currently selected source's tune (see `freq_for`).
@@ -611,6 +633,21 @@ impl Shared {
 
     fn send_lna(sh: &Rc<Self>, gain_db: i8) {
         let msg = format!(r#"{{"id":5,"cmd":"setlnagain","data":{{"gain_db":{gain_db}}}}}"#);
+        if let Some(c) = sh.client.borrow().as_ref() {
+            let _ = c.send_text(&msg);
+        }
+    }
+
+    /// Start a new ADC clip-hold window: the badge clears and counts clips
+    /// from now on.
+    fn reset_clip_hold(sh: &Rc<Self>) {
+        *sh.clip_base.borrow_mut() = *sh.adc_overload_events.borrow();
+    }
+
+    /// Set the per-receiver DDC rate (C1 SPEED). Live receivers follow it in
+    /// place; expect a brief audio blip.
+    fn send_speed(sh: &Rc<Self>, speed_hz: u32) {
+        let msg = format!(r#"{{"id":16,"cmd":"setspeed","data":{{"speed_hz":{speed_hz}}}}}"#);
         if let Some(c) = sh.client.borrow().as_ref() {
             let _ = c.send_text(&msg);
         }
@@ -1385,12 +1422,40 @@ fn vrx_mode_label(m: &hl2_common::VrxMode) -> String {
     }
 }
 
+/// Set a rendered `<select>`'s value on the live DOM element (no-op if it
+/// isn't mounted or already shows `want`). See the `use_effect` in [`app`]
+/// for why selects aren't driven through `value=` / `selected=`.
+fn sync_select(node: &NodeRef, want: &str) {
+    if let Some(sel) = node.cast::<HtmlSelectElement>() {
+        if sel.value() != want {
+            sel.set_value(want);
+        }
+    }
+}
+
 #[function_component(App)]
 pub fn app() -> Html {
     let sh = use_state(|| Shared::new());
     let sh = (*sh).clone();
     let force = use_force_update();
     *sh.force.borrow_mut() = Some(force.clone());
+
+    // <select>s are synced imperatively after every render. Yew's `value=`
+    // is applied before the <option>s exist, and browsers ignore `selected`
+    // changes once the user has touched a select, so neither reliably shows
+    // the current state. New selects: add a node ref + a `sync_select` line.
+    let speed_sel = use_node_ref();
+    let mode_sel = use_node_ref();
+    {
+        let speed_sel = speed_sel.clone();
+        let mode_sel = mode_sel.clone();
+        let sh = sh.clone();
+        use_effect(move || {
+            sync_select(&speed_sel, &sh.speed_hz.borrow().to_string());
+            let slot = *sh.vrx_slot.borrow();
+            sync_select(&mode_sel, sh.cfg_for(slot).mode.as_str());
+        });
+    }
 
     {
         let sh = sh.clone();
@@ -1431,6 +1496,7 @@ pub fn app() -> Html {
     let sh16 = sh.clone();
     let sh17 = sh.clone();
     let sh18 = sh.clone();
+    let sh30 = sh.clone();
     let sh19 = sh.clone();
     let sh21 = sh.clone();
     let sh29 = sh.clone();
@@ -1542,7 +1608,6 @@ pub fn app() -> Html {
     // the panel shows the remembered settings for *this* tab. `cfg_for`
     // inserts a default on first access, so the `.clone()` is always
     // `Some` after.
-    let vrx_sideband_cur: VrxModeChoice = sh14.cfg_for(vrx_slot).mode;
     let vrx_bw_cur: u32 = sh15.cfg_for(vrx_slot).bw_hz;
     let vrx_gain_cur: f32 = sh16.cfg_for(vrx_slot).gain_db;
     let vrx_play_gain_cur: f32 = *sh17.vrx_play_gain.borrow();
@@ -1634,6 +1699,12 @@ pub fn app() -> Html {
     let lna_cur: i8 = *sh10.lna.borrow();
     // LNA slider fill position (−12…48 → 0…100 %) for the gradient track.
     let lna_pct = ((lna_cur as f32) + 12.0) / 60.0 * 100.0;
+    let clips = sh10
+        .adc_overload_events
+        .borrow()
+        .wrapping_sub(*sh10.clip_base.borrow());
+    let sh_clip = sh.clone();
+    let temperature_c = *sh10.temperature_c.borrow();
 
     // The EP4 (raw wideband) source tab — added after the last RX tab.
     let ep4_active = sh.spectrum_source.borrow().is_none();
@@ -1783,6 +1854,7 @@ pub fn app() -> Html {
                            <div class={if ep4_active { "cfg-row cfg-disabled" } else { "cfg-row" }}>
                       <div class="cfg-block">
                           <select
+                              ref={mode_sel.clone()}
                               class="cfg-select"
                                onchange={Callback::from(move |e: web_sys::Event| {
                                   if let Some(dom) = e.target() {
@@ -1817,14 +1889,14 @@ pub fn app() -> Html {
                                       }
                                   }
                               })}>
-                               <option value="usb" selected={vrx_sideband_cur == VrxModeChoice::Usb}>{"USB"}</option>
-                               <option value="lsb" selected={vrx_sideband_cur == VrxModeChoice::Lsb}>{"LSB"}</option>
-                               <option value="am" selected={vrx_sideband_cur == VrxModeChoice::Am}>{"AM"}</option>
-                               <option value="fm" selected={vrx_sideband_cur == VrxModeChoice::Fm}>{"FM"}</option>
-                               <option value="nfm" selected={vrx_sideband_cur == VrxModeChoice::FmNarrow}>{"NFM"}</option>
-                               <option value="ft8" selected={vrx_sideband_cur == VrxModeChoice::Ft8}>{"FT8"}</option>
-                              <option value="js8" selected={vrx_sideband_cur == VrxModeChoice::Js8}>{"JS8"}</option>
-                              <option value="ft4" selected={vrx_sideband_cur == VrxModeChoice::Ft4}>{"FT4"}</option>
+                               <option value="usb">{"USB"}</option>
+                               <option value="lsb">{"LSB"}</option>
+                               <option value="am">{"AM"}</option>
+                               <option value="fm">{"FM"}</option>
+                               <option value="nfm">{"NFM"}</option>
+                               <option value="ft8">{"FT8"}</option>
+                              <option value="js8">{"JS8"}</option>
+                              <option value="ft4">{"FT4"}</option>
                           </select>
                      </div>
                      <div class="cfg-block">
@@ -1925,15 +1997,69 @@ pub fn app() -> Html {
                                           if let Some(inp) = e.target_dyn_into::<HtmlInputElement>() {
                                               let v: i8 = inp.value().parse::<i8>().unwrap_or(6).clamp(-12, 48);
                                               *sh10.lna.borrow_mut() = v;
+                                              // New gain → new clip-hold window.
+                                              Shared::reset_clip_hold(&sh10);
                                               if *sh10.started.borrow() {
                                                   Shared::send_lna(&sh10, v);
                                               }
                                           }
                                           sh10.notify();
                                       })}/>
-                                  <span class="lna-val">{format!("{:+} dB", lna_cur)}</span>
-                              </div>
-                          </div>
+                                   <span class="lna-val">{format!("{:+} dB", lna_cur)}</span>
+                               </div>
+                               <div class="fpanel-sep"></div>
+                               <div class="fpanel-block">
+                                   <span class="fpanel-label">{"DDC speed"}</span>
+                                   // Value set after each render by `sync_select`
+                                   // (see the top of `app`), not `value=`/`selected=`.
+                                   <select
+                                       ref={speed_sel.clone()}
+                                       aria-label="Per-receiver DDC decode speed"
+                                       onchange={Callback::from(move |e: web_sys::Event| {
+                                           if let Some(sel) = e.target_dyn_into::<HtmlSelectElement>() {
+                                               let v: u32 = sel.value().parse::<u32>().unwrap_or(192000);
+                                               // Sent even while stopped; the server
+                                               // stores it for the next Start.
+                                               *sh30.speed_hz.borrow_mut() = v;
+                                               Shared::send_speed(&sh30, v);
+                                               sh30.notify();
+                                           }
+                                       })}>
+                                       <option value="48000">{"48 kHz"}</option>
+                                       <option value="96000">{"96 kHz"}</option>
+                                       <option value="192000">{"192 kHz"}</option>
+                                       <option value="384000">{"384 kHz"}</option>
+                                   </select>
+                               </div>
+                               <div class="fpanel-sep"></div>
+                               <div class="fpanel-block">
+                                   <span class="fpanel-label">{"Radio"}</span>
+                                   // Clip hold: latches red with a count of ADC
+                                   // overload events until clicked or the LNA
+                                   // gain changes.
+                                   <button type="button"
+                                       class={if clips > 0 { "hw-badge err" } else { "hw-badge ok" }}
+                                       title="ADC overloads since you last cleared this (click) or changed the LNA gain"
+                                       onclick={Callback::from(move |_| {
+                                           Shared::reset_clip_hold(&sh_clip);
+                                           sh_clip.notify();
+                                       })}>
+                                       {if clips > 0 { format!("CLIP ×{clips}") } else { "ADC OK".to_string() }}
+                                   </button>
+                                   // 55 °C is a soft "running warm" threshold, not
+                                   // a hardware limit.
+                                   <span class={match temperature_c {
+                                           Some(t) if t >= 55.0 => "lna-val hw-warn",
+                                           _ => "lna-val",
+                                       }}
+                                       title="Board temperature">
+                                       {match temperature_c {
+                                           Some(t) => format!("{t:.0} °C"),
+                                           None => "-- °C".to_string(),
+                                       }}
+                                   </span>
+                               </div>
+                           </div>
 
                             // S-meter / SWR gauge — driven by the *virtual
                             // receiver's* signal level + noise floor, so it has

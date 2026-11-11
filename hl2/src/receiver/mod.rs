@@ -389,6 +389,27 @@ impl VirtualReceiver {
         Ok(())
     }
 
+    /// Rebuild the demodulator for a new source rate **in place**, keeping
+    /// mode, offset, bandwidth, audio, tap and sink (the tap's decoder window
+    /// is at the fixed audio rate, so it survives). For runtime C1 SPEED
+    /// changes. No-op if unchanged; errors leave the receiver unchanged.
+    pub fn set_source_rate(&mut self, source_rate_hz: u32) -> Result<(), ReceiverError> {
+        if source_rate_hz == self.cfg.source_rate_hz {
+            return Ok(());
+        }
+        let new_demod = make_demod_tap(
+            self.cfg.mode,
+            source_rate_hz,
+            self.cfg.source_center_hz,
+            self.cfg.bandwidth(),
+            self.cfg.audio,
+            self.cfg.tap.clone(),
+        )?;
+        self.demod = new_demod;
+        self.cfg.source_rate_hz = source_rate_hz;
+        Ok(())
+    }
+
     /// Swap demodulators without allocation, returning the old one and keeping the sink.
     /// The caller must match the receiver's source, audio and tap configuration,
     /// and supply the incoming mode and bandwidth. The width becomes an explicit override.
@@ -480,6 +501,35 @@ mod tests {
             Mode::FmNarrow,
         ] {
             VirtualReceiver::new(cfg(m), Box::new(VecSink::new())).expect("receiver build");
+        }
+    }
+
+    #[test]
+    fn set_source_rate_rebinds_in_place_and_keeps_config() {
+        let mut rx = VirtualReceiver::new(
+            ReceiverConfig {
+                mode: Mode::Ssb(Sideband::Lsb),
+                source_rate_hz: 192_000,
+                source_center_hz: -1_000.0,
+                bandwidth_hz: Some(2_700),
+                ..Default::default()
+            },
+            Box::new(VecSink::new()),
+        )
+        .unwrap();
+        for rate in [48_000u32, 96_000, 384_000, 192_000, 192_000] {
+            rx.set_source_rate(rate).expect("rebind");
+            let c = rx.config();
+            assert_eq!(c.source_rate_hz, rate);
+            assert_eq!(c.mode, Mode::Ssb(Sideband::Lsb));
+            assert_eq!(c.source_center_hz, -1_000.0);
+            assert_eq!(c.bandwidth_hz, Some(2_700));
+            // The rebuilt demod actually runs at the new rate.
+            let iq = tone(rate, 1_500.0, (rate / 10) as usize, 0.5);
+            assert!(
+                rx.process(&iq).expect("process") > 0,
+                "no audio at {rate} Hz"
+            );
         }
     }
 

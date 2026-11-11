@@ -334,13 +334,14 @@ impl std::ops::Drop for VrxTask {
 }
 
 impl Session {
-    fn shared_state(&self, state_at: u64, src: &SpectrumSource) -> SharedState {
+    fn shared_state(&self, state_at: u64, src: &SpectrumSource, speed_hz: u32) -> SharedState {
         // The S-meter (signal level + noise floor, both in dB relative to
         // full-scale) for the currently-displayed EP6 slot, written by the
         // `run_spectral` band-FFT loop and read here into the shared
         // contract's `vrx_levels` / `vrx_floors`. A slot of `0` (EP4 wideband
         // or no vrx running) means "no reading" — the UI parks the gauge at
         // its bottom.
+        let status = self.ctrl.status();
         let (slot, lev, fl) = self.meter.read();
         let mut vrx_levels = std::collections::BTreeMap::new();
         let mut vrx_floors = std::collections::BTreeMap::new();
@@ -354,15 +355,18 @@ impl Session {
             tuning: self.tuning.clone(),
             sample_format: self.sample_format,
             adc_sample_rate_hz: 76_800_000,
+            speed_hz,
             lna_gain_db: self.lna_gain_db,
             oc_bits: self.oc_bits,
             spectrum_source: src.clone(),
             state_at,
             spectrum_center_hz: spectrum_center(&self.tuning, src),
-            spectrum_span_hz: spectrum_span(src),
+            spectrum_span_hz: spectrum_span(src, speed_hz),
             vrx: self.vrx.values().map(|t| (t.state.slot, t.state)).collect(),
             vrx_levels,
             vrx_floors,
+            temperature_c: status.temperature_c(),
+            adc_overload_events: status.adc_overload_events,
             auto_monitors: self
                 .auto
                 .iter()
@@ -391,10 +395,11 @@ fn spectrum_center(tuning: &BTreeMap<u8, u32>, src: &SpectrumSource) -> Option<u
     }
 }
 
-/// Total displayed baseband bandwidth (Hz) for the current source.
-fn spectrum_span(src: &SpectrumSource) -> u32 {
+/// Total displayed baseband bandwidth (Hz) for the current source: the DDC
+/// rate (`speed_hz`) for EP6, the ADC clock for EP4.
+fn spectrum_span(src: &SpectrumSource, speed_hz: u32) -> u32 {
     match src {
-        SpectrumSource::Ep6 { .. } => VRX_SOURCE_RATE_HZ,
+        SpectrumSource::Ep6 { .. } => speed_hz,
         SpectrumSource::Ep4 => ADC_CLOCK_HZ,
     }
 }
@@ -448,6 +453,11 @@ pub struct RadioHub {
     /// `spawn_js8_decode`) and the
     /// send task drains + transmits; both live for the whole process.
     pskrep: crate::pskrep_hook::SharedPsk,
+    /// Per-receiver DDC rate in Hz (48k/96k/192k/384k) — the single source of
+    /// truth for the radio's C1 SPEED, every demod's `source_rate_hz` (demod
+    /// threads hold a clone and follow it, see `follow_speed`) and the EP6
+    /// spectrum span. Settable while stopped; used at the next Start.
+    speed_hz: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl RadioHub {
@@ -474,6 +484,9 @@ impl RadioHub {
                 crate::meter::PassbandShape::Centered.as_u32(),
             )),
             pskrep,
+            speed_hz: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                SharedState::DEFAULT_SPEED_HZ as u64,
+            )),
         }
     }
 
@@ -527,6 +540,7 @@ impl RadioHub {
             ClientCmd::SetLnaGain { gain_db } => self.set_lna_gain_cmd(id, *gain_db).await,
             ClientCmd::SetOcBits { oc_bits } => self.set_oc_bits_cmd(id, *oc_bits).await,
             ClientCmd::SetSpectrumSource { source } => self.set_spectrum_source(id, source).await,
+            ClientCmd::SetSpeed { speed_hz } => self.set_speed_cmd(id, *speed_hz).await,
             ClientCmd::SetVrx { cfg } => self.set_vrx_cmd(id, cfg).await,
             ClientCmd::SetVrxMute { slot, muted } => self.set_vrx_mute_cmd(id, *slot, *muted).await,
             ClientCmd::SetVrxOff { slot } => self.set_vrx_off_cmd(id, *slot).await,
@@ -552,6 +566,9 @@ impl RadioHub {
     /// but slow enough to be negligible CPU (a single snapshot + one
     /// `BroadcastChannel::send` per tick).
     ///
+    /// It also carries the radio status (board temperature, ADC overload
+    /// event count) and broadcasts whenever either changes, even with no vrx.
+    ///
     /// We skip the broadcast when there is no vrx (nothing to show) and when
     /// the level map hasn't changed since the last tick (no point re-sending
     /// an identical snapshot — the UI would re-apply the same numbers). The
@@ -566,17 +583,25 @@ impl RadioHub {
         let mut tick = tokio::time::interval(tokio::time::Duration::from_millis(100));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last: BTreeMap<u8, f64> = BTreeMap::new();
+        // Radio status as last broadcast: (whole °C, overload events). Whole
+        // degrees so sensor jitter doesn't force a broadcast every tick.
+        let mut last_status: (Option<i32>, u32) = (None, 0);
         loop {
             let _ = tick.tick().await;
             let (state, _) = self.snapshot().await;
+            let status_key = (
+                state.temperature_c.map(|t| t.round() as i32),
+                state.adc_overload_events,
+            );
             if state.vrx.is_empty() {
                 last.clear();
-                continue;
             }
-            if state.vrx_levels == last {
+            let levels_changed = !state.vrx.is_empty() && state.vrx_levels != last;
+            if !levels_changed && status_key == last_status {
                 continue;
             }
             last = state.vrx_levels.clone();
+            last_status = status_key;
             let resp = ServerResponse::welcome(&state);
             let _ = self.fanout.send(WsEvent::Json(resp));
         }
@@ -590,10 +615,11 @@ impl RadioHub {
     async fn snapshot(&self) -> (SharedState, Option<Hl2>) {
         let rev = self.state_rev.load(std::sync::atomic::Ordering::Relaxed);
         let src = self.spectrum_source.lock().unwrap().clone();
-        let span_hz = spectrum_span(&src);
+        let speed_hz = self.speed_hz.load(std::sync::atomic::Ordering::Relaxed) as u32;
+        let span_hz = spectrum_span(&src, speed_hz);
         let guard = self.session.lock().await;
         match guard.as_ref() {
-            Some(s) => (s.shared_state(rev, &src), Some(s.ctrl.clone())),
+            Some(s) => (s.shared_state(rev, &src, speed_hz), Some(s.ctrl.clone())),
             None => (
                 SharedState {
                     started: false,
@@ -601,6 +627,7 @@ impl RadioHub {
                     tuning: BTreeMap::new(),
                     sample_format: SampleFormat::Sample16,
                     adc_sample_rate_hz: 76_800_000,
+                    speed_hz,
                     lna_gain_db: DEFAULT_LNA_GAIN_DB,
                     oc_bits: 0,
                     spectrum_source: src,
@@ -611,6 +638,8 @@ impl RadioHub {
                     auto_monitors: std::collections::BTreeMap::new(),
                     vrx_levels: std::collections::BTreeMap::new(),
                     vrx_floors: std::collections::BTreeMap::new(),
+                    temperature_c: None,
+                    adc_overload_events: 0,
                 },
                 None,
             ),
@@ -653,7 +682,9 @@ impl RadioHub {
                 if s.started {
                     let rev = self.state_rev.load(std::sync::atomic::Ordering::Relaxed);
                     let src = self.spectrum_source.lock().unwrap().clone();
-                    return ServerResponse::ok(id, &s.shared_state(rev, &src));
+                    let speed_hz = self.speed_hz.load(std::sync::atomic::Ordering::Relaxed) as u32;
+                    let state = s.shared_state(rev, &src, speed_hz);
+                    return ServerResponse::ok(id, &state);
                 }
             }
         }
@@ -689,7 +720,8 @@ impl RadioHub {
             }
         };
 
-        match Hl2::start(addr).await {
+        let speed_hz = self.speed_hz.load(std::sync::atomic::Ordering::Relaxed) as u32;
+        match Hl2::start_with_speed(addr, speed_hz).await {
             Ok((ctrl, ev_rx, info)) => {
                 let sample_format = match info.sample_format {
                     hl2::protocol::data::SampleFormat::Sample12 => SampleFormat::Sample12,
@@ -750,6 +782,7 @@ impl RadioHub {
                 let meter = self.meter.clone();
                 let passband_bw = self.passband_bw.clone();
                 let passband_mode = self.passband_mode.clone();
+                let speed_hz = self.speed_hz.clone();
                 let handle = tokio::spawn(async move {
                     run_spectral(
                         cfg,
@@ -760,6 +793,7 @@ impl RadioHub {
                         meter,
                         passband_bw,
                         passband_mode,
+                        speed_hz,
                     )
                     .await
                 });
@@ -1142,6 +1176,7 @@ impl RadioHub {
                         c,
                         self.session.clone(),
                         self.pskrep.clone(),
+                        self.speed_hz.clone(),
                     )
                     .await
                     {
@@ -1308,6 +1343,7 @@ impl RadioHub {
             &cfg,
             self.session.clone(),
             self.pskrep.clone(),
+            self.speed_hz.clone(),
         )
         .await
         {
@@ -1390,8 +1426,10 @@ impl RadioHub {
         }
 
         // The slot's EP6 half-span (Hz): in-window targets are within
-        // `half_span` of the NCO. `spectrum_span` is the full window.
-        let half_span = spectrum_span(&self.spectrum_source.lock().unwrap()) / 2;
+        // `half_span` of the NCO. The full window is the per-receiver DDC
+        // rate — independent of which source the panadapter is showing (an
+        // EP4 display would otherwise widen the window to the ADC clock).
+        let half_span = self.speed_hz.load(std::sync::atomic::Ordering::Relaxed) as u32 / 2;
 
         // Tear down the slot's existing auto pipelines (if any), so the
         // rebuilt set is exactly the in-window set. Extract-under-lock,
@@ -1431,6 +1469,7 @@ impl RadioHub {
                         freq,
                         m,
                         self.pskrep.clone(),
+                        self.speed_hz.clone(),
                     )
                     .await
                     {
@@ -1467,6 +1506,148 @@ impl RadioHub {
         }
         let (state, _) = self.snapshot().await;
         ServerResponse::ok(id, &state)
+    }
+
+    /// Set the per-receiver DDC speed (C1 SPEED), snapped to a legal option.
+    ///
+    /// Running pipelines are not torn down: each demod thread notices the new
+    /// value and rebuilds its own DSP in place (`follow_speed`). Only the
+    /// auto-decode set is adjusted to the new window (`reconcile_auto_window`).
+    /// While stopped the rate is just stored for the next Start.
+    async fn set_speed_cmd(&self, id: u64, req_hz: u32) -> ServerResponse {
+        let bits = hl2::protocol::speed_bits_for_khz(req_hz / 1000);
+        let speed_hz = hz_for_speed_bits(bits);
+        if std::env::var("HL2_DEBUG").is_ok() {
+            eprintln!("[HUB] set speed → requested {req_hz} Hz, canonical {speed_hz} Hz");
+        }
+
+        // Under the session lock so concurrent `setspeed`s can't leave the
+        // atomic and the radio disagreeing. The radio picks the new C1 bits
+        // up on its next (≤ 40 ms) keepalive.
+        let prev = {
+            let guard = self.session.lock().await;
+            let prev = self
+                .speed_hz
+                .swap(speed_hz as u64, std::sync::atomic::Ordering::Relaxed)
+                as u32;
+            if let Some(s) = guard.as_ref() {
+                s.ctrl.set_speed(speed_hz).await;
+            }
+            prev
+        };
+
+        if prev != speed_hz {
+            self.reconcile_auto_window(speed_hz).await;
+        }
+
+        let (state, _) = self.snapshot().await;
+        ServerResponse::ok(id, &state)
+    }
+
+    /// After a speed change, make each auto-enabled slot's decoders exactly
+    /// the known frequencies within ±speed/2 of its NCO: keep the ones still
+    /// in window, stop the ones that fell out, spawn the ones that came in.
+    ///
+    /// Stops run on the blocking pool and aren't awaited — `AutoTask::stop`
+    /// joins a decode thread that can be mid-burst for 1–3 s, and doing many
+    /// of those on a runtime worker stalls the whole server.
+    async fn reconcile_auto_window(&self, speed_hz: u32) {
+        let half_span = (speed_hz / 2) as u64;
+        let in_window = |nco: u32, f: u32| (f as i64 - nco as i64).unsigned_abs() <= half_span;
+
+        // Under the lock: split off out-of-window tasks, list missing ones.
+        let mut removed: Vec<AutoTask> = Vec::new();
+        let mut missing: Vec<(u8, u32, AutoMode, u32)> = Vec::new();
+        {
+            let mut guard = self.session.lock().await;
+            let Some(s) = guard.as_mut() else { return };
+            let tuning = s.tuning.clone();
+            for (slot, list) in s.auto.iter_mut() {
+                let Some(nco) = tuning.get(slot).copied() else {
+                    continue;
+                };
+                let (keep, drop): (Vec<AutoTask>, Vec<AutoTask>) = std::mem::take(list)
+                    .into_iter()
+                    .partition(|t| in_window(nco, t.freq_hz));
+                *list = keep;
+                removed.extend(drop);
+                for &m in AUTO_MODES {
+                    for &f in m.known_freqs() {
+                        if in_window(nco, f) && !list.iter().any(|t| t.mode == m && t.freq_hz == f)
+                        {
+                            missing.push((*slot, nco, m, f));
+                        }
+                    }
+                }
+            }
+        }
+        if std::env::var("HL2_DEBUG").is_ok() {
+            eprintln!(
+                "[HUB] set_speed: {} auto pipeline(s) out of window, {} new in window",
+                removed.len(),
+                missing.len()
+            );
+        }
+        if !removed.is_empty() {
+            tokio::task::spawn_blocking(move || {
+                for mut t in removed {
+                    t.stop();
+                }
+            });
+        }
+
+        // Spawn the missing ones, then insert unless the slot's auto was
+        // disabled or retuned in the meantime.
+        let mut spawned: Vec<(u8, u32, AutoTask)> = Vec::new();
+        for (slot, nco, m, f) in missing {
+            let ring = {
+                let guard = self.session.lock().await;
+                guard.as_ref().map(|s| s.ctrl.baseband_ring(slot))
+            };
+            let Some(ring) = ring else { continue };
+            match spawn_auto(
+                ring,
+                self.fanout.clone(),
+                self.session.clone(),
+                slot,
+                nco,
+                f,
+                m,
+                self.pskrep.clone(),
+                self.speed_hz.clone(),
+            )
+            .await
+            {
+                Ok(t) => spawned.push((slot, nco, t)),
+                Err(e) => eprintln!(
+                    "[HUB] set_speed: spawn auto slot={slot} {} freq={f} failed: {e}",
+                    m.wire()
+                ),
+            }
+        }
+        let mut stale: Vec<AutoTask> = Vec::new();
+        {
+            let mut guard = self.session.lock().await;
+            match guard.as_mut() {
+                Some(s) => {
+                    for (slot, nco, t) in spawned {
+                        let still_valid = s.tuning.get(&slot).copied() == Some(nco);
+                        match s.auto.get_mut(&slot) {
+                            Some(list) if still_valid => list.push(t),
+                            _ => stale.push(t),
+                        }
+                    }
+                }
+                None => stale.extend(spawned.into_iter().map(|(_, _, t)| t)),
+            }
+        }
+        if !stale.is_empty() {
+            tokio::task::spawn_blocking(move || {
+                for mut t in stale {
+                    t.stop();
+                }
+            });
+        }
     }
 }
 
@@ -1569,9 +1750,15 @@ async fn current_in_service(hub: &RadioHub) -> Option<DiscoveryInfo> {
         .and_then(|s| s.started.then(|| s.device.clone()))
 }
 
-/// Per-receiver DDC baseband rate the server programs at Start (Hz).
-const VRX_SOURCE_RATE_HZ: u32 = 192_000;
-//const VRX_SOURCE_RATE_HZ: u32 = 96_000;
+/// Reverse of `hl2::protocol::speed_bits_for_khz`: C1 SPEED bits → Hz.
+fn hz_for_speed_bits(bits: u8) -> u32 {
+    match bits & hl2::protocol::C1_SPEED_MASK {
+        hl2::protocol::C1_SPEED_48K => 48_000,
+        hl2::protocol::C1_SPEED_96K => 96_000,
+        hl2::protocol::C1_SPEED_192K => 192_000,
+        _ => 384_000,
+    }
+}
 
 /// Audio sample rate (Hz) the virtual receiver outputs for SSB voice.
 const VRX_AUDIO_RATE_HZ: u32 = 4_800;
@@ -1590,7 +1777,10 @@ async fn spawn_vrx(
     cfg: &VrxCfg,
     session: std::sync::Arc<Mutex<Option<Session>>>,
     pskrep: crate::pskrep_hook::SharedPsk,
+    speed_hz: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<VrxTask, String> {
+    // Initial rate; the demod thread follows later changes (`follow_speed`).
+    let source_rate_hz = speed_hz.load(std::sync::atomic::Ordering::Relaxed) as u32;
     let (mode, rate_hz, ft8_dec, js8_dec, ft4_dec) = match cfg.mode {
         VrxMode::Usb => (
             Mode::Ssb(Sideband::Usb),
@@ -1676,7 +1866,7 @@ async fn spawn_vrx(
         };
     let rx_cfg = ReceiverConfig {
         mode,
-        source_rate_hz: VRX_SOURCE_RATE_HZ,
+        source_rate_hz,
         // `cfg.offset_hz` is "target − NCO" (Hz), positive for an FT8 at 7.074
         // with NCO at 7.050. Pass the ***negated*** value as `source_center_hz`:
         // the demod's own unit test (`ft8_path_passes_signal_at_nonzero_nco_offset`)
@@ -1712,11 +1902,13 @@ async fn spawn_vrx(
             let mut rx = rx;
             let mut iq_buf: Vec<num_complex::Complex<f32>> = Vec::with_capacity(1024);
             let mut cursor: u64 = 0; // (first peek sees base_seq=0 → reads from head)
+            let mut bound_rate = source_rate_hz;
             loop {
                 if stop2.load(std::sync::atomic::Ordering::Relaxed) {
                     let _ = rx.flush();
                     return;
                 }
+                follow_speed(&mut rx, &speed_hz, &mut bound_rate, "vrx");
                 // Drain any pending live retune (channel NCO / channel-select
                 // BW / gain) before the next block, so the new DSP is applied
                 // as early as possible without a thread restart. `None` in the
@@ -1839,7 +2031,10 @@ async fn spawn_auto(
     freq_hz: u32,
     auto_mode: AutoMode,
     pskrep: crate::pskrep_hook::SharedPsk,
+    speed_hz: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<AutoTask, String> {
+    // Initial rate; the demod thread follows later changes (`follow_speed`).
+    let source_rate_hz = speed_hz.load(std::sync::atomic::Ordering::Relaxed) as u32;
     // The concrete decoder + tap + spawner, keyed on the auto mode. Both
     // arms end up at 12 kHz output via `Mode::{Ft8,Js8}`.
     let (mode, tap, decode_task) = match auto_mode {
@@ -1898,7 +2093,7 @@ async fn spawn_auto(
 
     let rx_cfg = ReceiverConfig {
         mode,
-        source_rate_hz: VRX_SOURCE_RATE_HZ,
+        source_rate_hz,
         // Same sign fix as `spawn_vrx`: "above-NCO" targets sit at
         // **negative** baseband frequency per the firmware DDC, so
         // `source_center_hz = −(target − nco)`. The old `freq_hz − nco_hz`
@@ -1926,11 +2121,13 @@ async fn spawn_auto(
             let mut rx = rx;
             let mut iq_buf: Vec<num_complex::Complex<f32>> = Vec::with_capacity(1024);
             let mut cursor: u64 = 0;
+            let mut bound_rate = source_rate_hz;
             loop {
                 if stop2.load(std::sync::atomic::Ordering::Relaxed) {
                     let _ = rx.flush();
                     return;
                 }
+                follow_speed(&mut rx, &speed_hz, &mut bound_rate, "auto");
                 let got = {
                     let mut g = ring2.lock().unwrap();
                     let base = g.base_seq();
@@ -1978,6 +2175,30 @@ enum DecodeTaskOrNone {
     Ft8(DecodeTask),
     Js8(DecodeTask),
     Ft4(DecodeTask),
+}
+
+/// Run once per demod-loop iteration: if the hub's DDC rate changed, rebuild
+/// this receiver's DSP in place for it (thread, sink and decoder survive).
+/// `bound_rate` is updated even on failure so a bad rate is logged once.
+fn follow_speed(
+    rx: &mut VirtualReceiver,
+    speed_hz: &std::sync::atomic::AtomicU64,
+    bound_rate: &mut u32,
+    what: &str,
+) {
+    let want = speed_hz.load(std::sync::atomic::Ordering::Relaxed) as u32;
+    if want == *bound_rate {
+        return;
+    }
+    *bound_rate = want;
+    match rx.set_source_rate(want) {
+        Ok(()) => {
+            if std::env::var("HL2_DEBUG").is_ok() {
+                eprintln!("[HUB] {what} demod rebound to {want} Hz");
+            }
+        }
+        Err(e) => eprintln!("[HUB] {what} demod rebind to {want} Hz failed: {e}"),
+    }
 }
 
 /// The synthetic [`VrxState`] stamped onto auto-decode rows (see
@@ -2354,6 +2575,7 @@ async fn run_spectral(
     meter: std::sync::Arc<crate::meter::MeterState>,
     passband_bw: std::sync::Arc<std::sync::atomic::AtomicU64>,
     passband_mode: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    speed_hz: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
     let n_fft = cfg.accumulate_blocks * IQ_PAIRS_PER_BLOCK;
     use num_complex::Complex;
@@ -2468,8 +2690,10 @@ async fn run_spectral(
                             }
                         }
                     }
-                    Hl2Event::CmdAck { ack, raddr, data, .. } => {
-                        eprintln!("EP6 ack={} raddr=0x{:02x} data=0x{:08x}", ack, raddr, data);
+                    Hl2Event::CmdAck { raddr, data, .. } => {
+                        if std::env::var("HL2_DEBUG").is_ok() {
+                            eprintln!("[HUB] EP6 ack raddr=0x{raddr:02x} data=0x{data:08x}");
+                        }
                     }
                     _ => {}
                 }
@@ -2492,7 +2716,10 @@ async fn run_spectral(
                                 // (full-bandwidth baseband, `span` ≈ source
                                 // rate). The passband in display bins =
                                 // bw / bin_span.
-                                let span_hz = spectrum_span(&SpectrumSource::Ep6 { slot }) as f64;
+                                let span_hz = spectrum_span(
+                                    &SpectrumSource::Ep6 { slot },
+                                    speed_hz.load(std::sync::atomic::Ordering::Relaxed) as u32,
+                                ) as f64;
                                 let bin_span = span_hz / mags.len() as f64;
                                 let width = if bin_span > 0.0 {
                                     ((bw_hz as f64 / bin_span) as usize).max(1)

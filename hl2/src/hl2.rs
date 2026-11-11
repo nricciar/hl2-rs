@@ -25,6 +25,7 @@ use crate::protocol::data::{
 };
 use crate::protocol::discovery::{DiscoveryInfo, discovery_request, parse_discovery_response};
 use crate::protocol::session::Session;
+pub use crate::protocol::status::RadioStatus;
 use crate::protocol::{
     BOARD_ID_HL2, DATA_PACKET_SIZE, DEFAULT_LNA_GAIN_DB, DISCOVERY_RESPONSE_SIZE, HL2_PORT,
     KEEPALIVE_INTERVAL_MS, speed_bits_for_khz,
@@ -61,7 +62,8 @@ pub struct StartInfo {
 pub enum Hl2Event {
     /// A complete wideband block from the EP4 stream (`IQ_PAIRS_PER_BLOCK`).
     Block(IQBlock),
-    /// A C&C (EP6) response from the hardware.
+    /// A reply (ACK=1) to an RQST command. Classic status responses are not
+    /// emitted as events — they are folded into [`Hl2::status`].
     CmdAck {
         ack: bool,
         raddr: u8,
@@ -126,6 +128,9 @@ struct Shared {
     /// Cumulative complex samples pushed by the pump (all slots, per chunk),
     /// for the `[pump] pair_rate` diagnostic. Reset by the log line.
     delivered: AtomicUsize,
+    /// Latest classic status (overload, temperature, …) from the EP6 C0–C4
+    /// responses; written by the pump per chunk, read via [`Hl2::status`].
+    status: std::sync::Mutex<RadioStatus>,
 }
 
 impl Shared {
@@ -208,6 +213,7 @@ impl Hl2 {
             lna_gain_db: Mutex::new(DEFAULT_LNA_GAIN_DB),
             fanout: Arc::new(BasebandFanout::new()),
             delivered: AtomicUsize::new(0),
+            status: std::sync::Mutex::new(RadioStatus::default()),
         });
 
         let self_ = Self {
@@ -584,6 +590,22 @@ impl Hl2 {
         self.inner.session.lock().await.oc_bits() & crate::protocol::OC_MASK_RX
     }
 
+    /// Set the per-receiver DDC rate (C1 SPEED) at runtime; `c1_speed_hz` is
+    /// snapped to the nearest legal option. Every keepalive / C&C frame
+    /// carries the C1 bits (`build_baseline_chunk`), so the radio switches on
+    /// the next ~40 ms tick without a Stop/Start. Receivers bound to the old
+    /// rate must follow (`VirtualReceiver::set_source_rate`).
+    pub async fn set_speed(&self, c1_speed_hz: u32) {
+        let bits = speed_bits_for_khz(c1_speed_hz / 1000);
+        self.inner.session.lock().await.set_c1_speed(bits);
+    }
+
+    /// Latest radio status (ADC overload, temperature, …) from the classic
+    /// EP6 responses. Defaults until the first frames arrive.
+    pub fn status(&self) -> RadioStatus {
+        *self.inner.status.lock().unwrap()
+    }
+
     /// The local port the hardware streams wideband data to.
     pub fn local_port(&self) -> u16 {
         self.inner.local_port
@@ -725,6 +747,60 @@ pub async fn discover_single(hl2_addr: IpAddr) -> Option<(SocketAddr, DiscoveryI
 /// [`crate::receiver::baseband_ring::BasebandRing`]. The cumulative
 /// `delivered` counter tracks all slots combined. A 1 Hz diagnostic
 /// (`HL2_DEBUG`) prints the total pair rate.
+/// `HL2_DEBUG` diagnostic for the EP6 C0–C4 status stream: per RADDR, how
+/// many responses arrived in the last second and which data bits changed
+/// (`or ^ and` of every word seen). Used to locate status bits on real
+/// hardware, e.g. which bit tracks ADC clipping.
+#[derive(Default)]
+struct StatusDiag {
+    /// Indexed by classic RADDR (0..16); slot 16 counts ACK=1 replies.
+    count: [u32; 17],
+    or: [u32; 17],
+    and: [u32; 17],
+    c0_or: u8,
+}
+
+impl StatusDiag {
+    fn record(&mut self, cmd: &crate::protocol::command::CommandData) {
+        let i = if cmd.header.ack {
+            16
+        } else {
+            (cmd.header.raddr & 0x0F) as usize
+        };
+        if self.count[i] == 0 {
+            self.and[i] = u32::MAX;
+        }
+        self.count[i] += 1;
+        self.or[i] |= cmd.data;
+        self.and[i] &= cmd.data;
+        self.c0_or |=
+            (cmd.header.raddr << 3) | ((cmd.header.cw_dot as u8) << 2) | cmd.header.ptt as u8;
+    }
+
+    fn report_and_reset(&mut self) {
+        let mut line = String::from("[pump] status");
+        for i in 0..17 {
+            if self.count[i] == 0 {
+                continue;
+            }
+            let name = if i == 16 {
+                "ack".to_string()
+            } else {
+                format!("r{i:x}")
+            };
+            line.push_str(&format!(
+                " {name}:n={} and=0x{:08x} toggled=0x{:08x}",
+                self.count[i],
+                self.and[i],
+                self.or[i] ^ self.and[i],
+            ));
+        }
+        line.push_str(&format!(" c0_or=0x{:02x}", self.c0_or));
+        eprintln!("{line}");
+        *self = Self::default();
+    }
+}
+
 async fn run_loop(hl2: Hl2, tx: mpsc::UnboundedSender<Hl2Event>) {
     let socket = hl2.inner.socket.clone();
     let mut assembler = BlockAssembler::new();
@@ -737,6 +813,7 @@ async fn run_loop(hl2: Hl2, tx: mpsc::UnboundedSender<Hl2Event>) {
     let mut baseband: Vec<BasebandChunk> = Vec::new();
     let dbg = std::env::var("HL2_DEBUG").is_ok();
     let mut rate_start = time::Instant::now();
+    let mut status_diag = StatusDiag::default();
     let delivered = &hl2.inner.delivered;
     let fanout = &hl2.inner.fanout;
 
@@ -774,6 +851,7 @@ async fn run_loop(hl2: Hl2, tx: mpsc::UnboundedSender<Hl2Event>) {
                             fanout.rx_count(),
                             dt,
                         );
+                        status_diag.report_and_reset();
                         rate_start = now;
                     }
                 }
@@ -798,15 +876,24 @@ async fn run_loop(hl2: Hl2, tx: mpsc::UnboundedSender<Hl2Event>) {
                         continue;
                     };
 
-                    if let Some(cmd) = parsed.chunk1_command.or(parsed.chunk2_command) {
-                        if tx.send(Hl2Event::CmdAck {
-                            ack: cmd.header.ack,
-                            raddr: cmd.header.raddr,
-                            ptt: cmd.header.ptt,
-                            data: cmd.data,
-                        }).is_err() {
-                            break;
+                    let mut closed = false;
+                    for cmd in [parsed.chunk1_command, parsed.chunk2_command].into_iter().flatten() {
+                        if dbg {
+                            status_diag.record(&cmd);
                         }
+                        if cmd.header.ack {
+                            closed |= tx.send(Hl2Event::CmdAck {
+                                ack: true,
+                                raddr: cmd.header.raddr,
+                                ptt: cmd.header.ptt,
+                                data: cmd.data,
+                            }).is_err();
+                        } else {
+                            hl2.inner.status.lock().unwrap().apply(&cmd);
+                        }
+                    }
+                    if closed {
+                        break;
                     }
 
                     if !parsed.iq.is_empty() {

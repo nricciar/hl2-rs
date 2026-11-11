@@ -46,6 +46,7 @@ The fastest way into the code, by protocol concept:
 | Metis discovery request / reply           | `hl2/src/protocol/discovery.rs` → `discovery_request`, `parse_discovery_response` |
 | Start / Stop command byte                 | `hl2/src/protocol/command.rs` → `StartCommand`; `hl2/src/protocol/data.rs` → `build_start_stop_frame` |
 | C0–C4 build / parse (RQST, MOX, ACK, PTT)| `hl2/src/protocol/command.rs` → `CommandHeader`, `CommandData`, `ResponseHeader` |
+| Classic status responses (overload, temp, power) | `hl2/src/protocol/status.rs` → `RadioStatus`; `Hl2::status` |
 | 1032-byte frame build/parse, IQ, assembler| `hl2/src/protocol/data.rs` → `build_keepalive_packet`, `build_nco_packet`, `parse_receive_packet`, `BlockAssembler` |
 | Send-sequence counter + persistent C&C config (SPEED/OC/N) + frame drivers + RX datagram classify | `hl2/src/protocol/session.rs` → `Session`, `SessionConfig`, `classify` |
 | High-level `Hl2` handle + receive pump    | `hl2/src/hl2.rs` → `Hl2::start/stop/tune`, `run_loop`, `discover`    |
@@ -398,10 +399,38 @@ A radio→host C&C frame (EP6) carries C0–C4 with C0[7]=`ACK`.
   echoes `RADDR=ADDR, RDATA=DATA`; for I2C reads it returns 4 bytes of I2C
   data. `RADDR=0x3F` signals an error.
 
+Every radio→host EP6 chunk (both halves of each frame) starts with the 3×0x7F
+sync followed by one such C0–C4 word, ahead of its samples.
+
+Classic (ACK=0) data words, `data` = C1..C4 big-endian:
+
+| RADDR | Bits | Field |
+|------:|------|-------|
+| `0x00` | `[24]` | RF ADC overload |
+| `0x00` | `[15]` | TX under/overflow recovery |
+| `0x00` | `[14:8]` | TX IQ FIFO count MSBs |
+| `0x00` | `[7:0]` | Gateware version |
+| `0x01` | `[31:16]` | Temperature, 12-bit ADC: °C = (3.26 · raw/4096 − 0.5) / 0.01 |
+| `0x01` | `[15:0]` | Forward power (raw ADC) |
+| `0x02` | `[31:16]` | Reverse power (raw ADC) |
+| `0x02` | `[15:0]` | PA bias current (raw ADC) |
+
 → the whole response word (ACK, RADDR, PTT, CW dot, 32-bit data) is parsed by
-  `CommandData::parse` into `ResponseHeader`, `command.rs:49-97`.
-→ `run_loop` lifts these into `Hl2Event::CmdAck { ack, raddr, ptt, data }`
-  (`hl2/src/hl2.rs:54-65`, emitted at `hl2.rs:442-451`).
+  `CommandData::parse` into `ResponseHeader` (`hl2/src/protocol/command.rs`);
+  `parse_receive_packet[_into]` returns each chunk's word as
+  `chunk1_command` / `chunk2_command` on EP6 frames
+  (`hl2/src/protocol/data.rs`).
+→ `run_loop` (`hl2/src/hl2.rs`) folds classic responses into a shared
+  `RadioStatus` (`hl2/src/protocol/status.rs`, read via `Hl2::status`) and
+  emits only ACK=1 replies as `Hl2Event::CmdAck { ack, raddr, ptt, data }`.
+→ `hl2-api` publishes `SharedState.temperature_c` and `adc_overload_events`
+  (count of overload-bit rising edges this session) via the
+  `RadioHub::run_levels` heartbeat (`api/src/hub.rs`). The UI's "Radio" row
+  shows the temperature and a clip-hold badge: red with the number of events
+  since it was last clicked or the LNA gain last changed.
+→ With `HL2_DEBUG`, the pump logs a 1 Hz `[pump] status` line per RADDR:
+  response count, AND of all words, and the bits that toggled — for locating
+  status bits on real hardware.
 
 > **[full spec]** To avoid starving the classic responses, software should send
 > a `RQST`-set command only periodically (e.g. every other write) and never more
@@ -934,6 +963,30 @@ The owned `parse_receive_packet` output and wire layout are unchanged.
 
 The radio's **C1 SPEED option** (`48/96/192/384` kHz) is the **per-receiver**
 baseband rate.
+
+**WS control.** `ClientCmd::SetSpeed { speed_hz }` (wire name `setspeed`) →
+`RadioHub::set_speed_cmd`. The hub snaps the request to a legal C1 option
+(48k→48000, 96k→96000, 192k→192000, 384k→384000), stores it in its own
+`Arc<AtomicU64>` and tells the radio via `Hl2::set_speed` (C1 SPEED bits,
+re-asserted on the next 40 ms keepalive — no Stop/Start). Accepted while
+stopped too: the stored value is what `start_cmd` passes to
+`Hl2::start_with_speed`, so `SharedState.speed_hz` always reports the rate
+the API runs (or will run) at; the UI's "DDC speed" dropdown mirrors it
+(default 192 kHz, `SharedState::DEFAULT_SPEED_HZ`).
+
+Live pipelines are **not** torn down: every vrx / auto demod thread holds the
+same atomic and, when it changes, rebuilds its DSP in place for the new
+`source_rate_hz` (`follow_speed` → `VirtualReceiver::set_source_rate`),
+keeping its thread, sink, tap and decoder window. Only the auto-decode set is
+reconciled to the new ±speed/2 window (`reconcile_auto_window`: out-of-window
+decoders stopped on the blocking pool, newly in-window ones spawned).
+→ `Hl2::set_speed` in `hl2/src/hl2.rs`;
+`Session::set_c1_speed` in `hl2/src/protocol/session.rs`;
+`speed_bits_for_khz` + `C1_SPEED_48K/96K/192K/384K` in
+`hl2/src/protocol/mod.rs`; `VirtualReceiver::set_source_rate` in
+`hl2/src/receiver/mod.rs`; `RadioHub::set_speed_cmd`,
+`RadioHub::reconcile_auto_window`, `follow_speed`, `hz_for_speed_bits` in
+`api/src/hub.rs`.
 
 #### Panadapter / waterfall frequency axis (hl2-api)
 
